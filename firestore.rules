@@ -157,10 +157,28 @@ service cloud.firestore {
       return get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data;
     }
 
+    function validWorkerMember(wsId, station, memberData) {
+      return memberData.active == true
+        && memberData.workspaceId == wsId
+        && (
+          memberData.station == station
+          || (memberData.station == 'hamburguesas' && station == 'comida_rapida')
+        );
+    }
+
     function isActiveStationWorker(wsId, station) {
-      return hasActiveMemberDoc()
-        && memberDoc().workspaceId == wsId
-        && memberDoc().station == station;
+      return isVerifiedUser()
+        && exists(/databases/$(database)/documents/teamMembers/$(request.auth.uid))
+        && validWorkerMember(
+          wsId,
+          station,
+          get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data
+        );
+    }
+
+    function validWorkerReportCreate(wsData, report) {
+      return isWorkspaceWithinSchedule(wsData)
+        && report.ownerUid == wsData.ownerUid;
     }
 
     function reportAfterMatchesEntry(reportData, entry) {
@@ -172,7 +190,10 @@ service cloud.firestore {
 
     function entryMatchesItem(entry, itemData) {
       return itemData.workspaceId == entry.workspaceId
-        && itemData.station == entry.station
+        && (
+          itemData.station == entry.station
+          || (itemData.station == 'hamburguesas' && entry.station == 'comida_rapida')
+        )
         && itemData.name == entry.itemName
         && itemData.unit == entry.unit
         && itemData.minStock == entry.minStock
@@ -549,7 +570,11 @@ service cloud.firestore {
             || (
               hasActiveMemberDoc()
               && memberDoc().workspaceId == existing().workspaceId
-              && (memberDoc().station == existing().station || memberDoc().station == 'jefe')
+              && (
+                memberDoc().station == existing().station
+                || (existing().station == 'hamburguesas' && memberDoc().station == 'comida_rapida')
+                || memberDoc().station == 'jefe'
+              )
             )
           )
         )
@@ -629,8 +654,10 @@ service cloud.firestore {
           (
             isActiveStationWorker(incoming().workspaceId, incoming().station)
             && isValidWorkerOperationalDate(incoming().date)
-            && isWorkspaceWithinSchedule(get(/databases/$(database)/documents/workspaces/$(incoming().workspaceId)).data)
-            && incoming().ownerUid == get(/databases/$(database)/documents/workspaces/$(incoming().workspaceId)).data.ownerUid
+            && validWorkerReportCreate(
+              get(/databases/$(database)/documents/workspaces/$(incoming().workspaceId)).data,
+              incoming()
+            )
           )
           || (
             canManageWorkspace(incoming().workspaceId)

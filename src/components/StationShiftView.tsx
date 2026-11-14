@@ -8,9 +8,7 @@ import {
   CheckCheck,
   CheckCircle2,
   ChevronDown,
-  ChevronUp,
   Clock,
-  Eye,
   Lock,
   Minus,
   Moon,
@@ -25,6 +23,7 @@ import {
 import { MAX_NOTES_LENGTH } from '../constants';
 import {
   ConcurrencyConflictError,
+  DiagnosticSaveError,
   fetchStationEntriesOnce,
   reopenStationReport,
   saveStationReportBatch,
@@ -57,7 +56,7 @@ import {
   type EntryAnomaly,
   type StationSaveErrorInfo,
 } from '../utils/inventory';
-import type { WorkerScheduleStatus } from '../utils/schedule';
+import { formatTime12h, type WorkerScheduleStatus } from '../utils/schedule';
 import { ShiftOutsideHoursView } from './shift/ShiftOutsideHoursView';
 import { ShiftSubmitConfirmModal } from './shift/ShiftSubmitConfirmModal';
 
@@ -272,7 +271,8 @@ export function StationShiftView({
   );
   const [restoredFromLocal, setRestoredFromLocal] = useState(false);
   const [reopening, setReopening] = useState(false);
-  const [showSubmittedDetails, setShowSubmittedDetails] = useState(false);
+  const [submittedThankYouMode, setSubmittedThankYouMode] = useState<'opening' | 'closing' | null>(null);
+  const [submittedOfflineQueued, setSubmittedOfflineQueued] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [itemFilter, setItemFilter] = useState<ItemFilter>('todos');
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
@@ -380,7 +380,8 @@ export function StationShiftView({
     setRemoteChangedBy(null);
     setPendingConflict(null);
     setConfirmModalState(null);
-    setShowSubmittedDetails(false);
+    setSubmittedThankYouMode(null);
+    setSubmittedOfflineQueued(false);
     setFeedback(null);
     setSaveError(null);
   }, [workspace.id, station.id, selectedDate, report?.id, draftMode, storageKey]);
@@ -925,10 +926,6 @@ export function StationShiftView({
       setItemFilter('pendientes');
       const reasonMsg =
         check.reasonText ?? 'Completa los conteos faltantes antes de enviar.';
-      setFeedback({
-        type: 'error',
-        text: reasonMsg,
-      });
       setSaveError({
         title: 'Faltan insumos por revisar o contar',
         detail: reasonMsg,
@@ -978,32 +975,44 @@ export function StationShiftView({
       setRemoteChangedBy(null);
       setSaveError(null);
 
-      setFeedback({
-        type: 'success',
-        text: saveResult.queuedOffline
-          ? mode === 'opening'
-            ? 'Sin conexión — apertura guardada en este celular. Se enviará sola al volver internet.'
-            : 'Sin conexión — cierre guardado en este celular. Se enviará al jefe al volver internet.'
-          : mode === 'opening'
-            ? '¡Apertura guardada! El jefe ya puede ver qué coincidió y qué se ajustó.'
-            : '¡Listo, gracias! Tu cierre fue enviado al jefe.',
-      });
+      if (!canManage) {
+        setSubmittedOfflineQueued(saveResult.queuedOffline);
+        setSubmittedThankYouMode(mode);
+      } else {
+        setFeedback({
+          type: 'success',
+          text: saveResult.queuedOffline
+            ? mode === 'opening'
+              ? 'Sin conexión — apertura guardada localmente. Se subirá al volver internet.'
+              : 'Sin conexión — cierre guardado localmente. Se subirá al volver internet.'
+            : mode === 'opening'
+              ? '¡Apertura guardada correctamente!'
+              : '¡Cierre guardado correctamente!',
+        });
+      }
       onSaved?.();
     } catch (err) {
+      if (err instanceof DiagnosticSaveError) {
+        setSaveError({
+          title: err.title,
+          detail: err.detail,
+          code: err.code,
+        });
+        return;
+      }
+
       if (err instanceof ConcurrencyConflictError) {
         if (err.reason === 'completed_locked') {
           setSaveError({
             title: 'Planilla ya enviada y bloqueada',
             detail: err.message,
           });
-          setFeedback({ type: 'error', text: err.message });
         } else {
           setPendingConflict({ mode, message: err.message });
           setSaveError({
             title: 'Otro dispositivo actualizó esta planilla',
             detail: err.message,
           });
-          setFeedback({ type: 'error', text: err.message });
         }
         return;
       }
@@ -1014,10 +1023,6 @@ export function StationShiftView({
         isOnline,
       });
       setSaveError(formatted);
-      setFeedback({
-        type: 'error',
-        text: `${formatted.title}: ${formatted.detail}${formatted.code ? ` (${formatted.code})` : ''}`,
-      });
     } finally {
       setSavingMode(null);
     }
@@ -1083,68 +1088,104 @@ export function StationShiftView({
     );
   }
 
-  // Post-submit "Listo, gracias" celebration screen for workers after closing is sent
-  if (isLocked && !showSubmittedDetails) {
+  const showClosingThankYou =
+    !canManage && (submittedThankYouMode === 'closing' || isLocked);
+  const showOpeningThankYou =
+    !canManage &&
+    !showClosingThankYou &&
+    (submittedThankYouMode === 'opening' ||
+      (isWorkerOpeningPhase && report?.status === 'opening_saved' && !isCompleted));
+
+  // Full-screen non-editable thank-you view after successful save (apertura or cierre)
+  if (showClosingThankYou || showOpeningThankYou) {
+    const closingStart12h = formatTime12h(scheduleStatus.schedule.closingStart);
+    const openingStart12h = formatTime12h(scheduleStatus.schedule.openingStart);
+
     return (
-      <div className="py-6 sm:py-10 flex items-center justify-center">
+      <div className="min-h-[65vh] py-8 sm:py-12 flex items-center justify-center">
         <motion.div
-          initial={{ opacity: 0, y: 10 }}
+          initial={{ opacity: 0, y: 12 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.25 }}
           className="w-full max-w-lg bg-white border border-emerald-200 rounded-2xl p-6 sm:p-8 text-center space-y-5 shadow-xs"
         >
-          <div className="w-14 h-14 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-700 flex items-center justify-center mx-auto">
-            <CheckCircle2 className="w-8 h-8" />
+          <div className="w-16 h-16 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-700 flex items-center justify-center mx-auto">
+            <CheckCircle2 className="w-9 h-9" />
           </div>
 
-          <div className="space-y-1.5">
+          <div className="space-y-2">
             <p className="text-xs font-semibold text-emerald-700">
               {station.name} · {formatDateHuman(selectedDate)}
             </p>
-            <h1 className="font-display text-2xl sm:text-3xl font-bold text-stone-900">
-              ¡Listo, gracias{station.workerName ? `, ${station.workerName}` : ''}!
+            <h1 className="font-display text-2xl sm:text-3xl font-bold text-stone-900 [text-wrap:balance]">
+              {showClosingThankYou
+                ? '¡Gracias por hacer el inventario de cierre!'
+                : '¡Gracias por hacer el inventario de apertura!'}
             </h1>
-            <p className="text-sm text-stone-600 leading-relaxed">
-              Tu cierre del día quedó enviado al jefe{closingTime ? ` a las ${closingTime}` : ''}. Ya puedes cerrar esta ventana.
+            <p className="text-base font-medium text-stone-700 leading-relaxed">
+              {showClosingThankYou
+                ? `La próxima apertura es a las ${openingStart12h}.`
+                : `Podrás hacer el cierre a las ${closingStart12h}.`}
             </p>
+            {submittedOfflineQueued && (
+              <p className="text-xs font-medium text-amber-800 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2">
+                Sin conexión — tu inventario quedó guardado en este celular y se sincronizará al volver internet.
+              </p>
+            )}
           </div>
 
-          <div className="grid grid-cols-3 gap-2 text-center">
-            <div className="p-3 rounded-xl bg-stone-50 border border-stone-200">
-              <p className="text-[11px] font-medium text-stone-500">Insumos</p>
-              <p className="font-mono tabular-nums text-lg font-bold text-stone-900 mt-0.5">
-                {counts.total - counts.naCount}
-              </p>
+          {showClosingThankYou ? (
+            <div className="grid grid-cols-3 gap-2 text-center">
+              <div className="p-3 rounded-xl bg-stone-50 border border-stone-200">
+                <p className="text-[11px] font-medium text-stone-500">Insumos</p>
+                <p className="font-mono tabular-nums text-lg font-bold text-stone-900 mt-0.5">
+                  {counts.total - counts.naCount}
+                </p>
+              </div>
+              <div className="p-3 rounded-xl bg-red-50/70 border border-red-200">
+                <p className="text-[11px] font-medium text-red-700">En cero</p>
+                <p className="font-mono tabular-nums text-lg font-bold text-red-700 mt-0.5">
+                  {counts.zeroClosing}
+                </p>
+              </div>
+              <div className="p-3 rounded-xl bg-emerald-50/70 border border-emerald-200">
+                <p className="text-[11px] font-medium text-emerald-700">Coincidieron</p>
+                <p className="font-mono tabular-nums text-lg font-bold text-emerald-700 mt-0.5">
+                  {counts.confirmedMatch}
+                </p>
+              </div>
             </div>
-            <div className="p-3 rounded-xl bg-red-50/70 border border-red-200">
-              <p className="text-[11px] font-medium text-red-700">En cero</p>
-              <p className="font-mono tabular-nums text-lg font-bold text-red-700 mt-0.5">
-                {counts.zeroClosing}
-              </p>
+          ) : (
+            <div className="grid grid-cols-3 gap-2 text-center">
+              <div className="p-3 rounded-xl bg-stone-50 border border-stone-200">
+                <p className="text-[11px] font-medium text-stone-500">Insumos</p>
+                <p className="font-mono tabular-nums text-lg font-bold text-stone-900 mt-0.5">
+                  {counts.total - counts.naCount}
+                </p>
+              </div>
+              <div className="p-3 rounded-xl bg-emerald-50/70 border border-emerald-200">
+                <p className="text-[11px] font-medium text-emerald-700">Confirmados</p>
+                <p className="font-mono tabular-nums text-lg font-bold text-emerald-700 mt-0.5">
+                  {counts.confirmedMatch + counts.manualOpening}
+                </p>
+              </div>
+              <div className="p-3 rounded-xl bg-amber-50/70 border border-amber-200">
+                <p className="text-[11px] font-medium text-amber-800">Corregidos</p>
+                <p className="font-mono tabular-nums text-lg font-bold text-amber-800 mt-0.5">
+                  {counts.adjusted}
+                </p>
+              </div>
             </div>
-            <div className="p-3 rounded-xl bg-emerald-50/70 border border-emerald-200">
-              <p className="text-[11px] font-medium text-emerald-700">Coincidieron</p>
-              <p className="font-mono tabular-nums text-lg font-bold text-emerald-700 mt-0.5">
-                {counts.confirmedMatch}
-              </p>
-            </div>
-          </div>
+          )}
 
           <div className="p-3.5 rounded-xl bg-stone-50 border border-stone-200 text-xs text-stone-600 flex items-center justify-center gap-2">
             <Lock className="w-4 h-4 text-stone-500 shrink-0" />
             <span>
-              La planilla queda bloqueada para evitar cambios por error. Si necesitas corregir algo, pídele al jefe que la reabra.
+              {showClosingThankYou
+                ? `Registro cerrado${closingTime ? ` (${closingTime})` : ''}. Si necesitas corregir algo, pídele al jefe que lo reabra.`
+                : `Apertura registrada${draftTime ? ` (${draftTime})` : ''}. Ya puedes cerrar esta ventana hasta la hora del cierre.`}
             </span>
           </div>
-
-          <button
-            type="button"
-            onClick={() => setShowSubmittedDetails(true)}
-            className="min-h-[44px] inline-flex items-center justify-center gap-2 px-4 py-2 text-xs sm:text-sm font-semibold text-stone-700 bg-white border border-stone-300 rounded-xl hover:bg-stone-100 transition-colors cursor-pointer"
-          >
-            <Eye className="w-4 h-4" />
-            Ver resumen enviado
-          </button>
         </motion.div>
       </div>
     );
@@ -1172,16 +1213,6 @@ export function StationShiftView({
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          {isLocked && showSubmittedDetails && (
-            <button
-              type="button"
-              onClick={() => setShowSubmittedDetails(false)}
-              className="min-h-[42px] inline-flex items-center gap-2 px-3.5 py-2 text-xs sm:text-sm font-semibold text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-xl hover:bg-emerald-100 transition-colors cursor-pointer"
-            >
-              <ChevronUp className="w-4 h-4" />
-              Volver a confirmación
-            </button>
-          )}
           {isCompleted && canManage && (
             <button
               type="button"
@@ -2320,7 +2351,7 @@ export function StationShiftView({
                       </span>
                     ) : null}
                   </p>
-                  <p className="text-red-900 leading-relaxed">{saveError.detail}</p>
+                  <p className="text-red-900 leading-relaxed break-words">{saveError.detail}</p>
                 </div>
               </div>
               <button
@@ -2390,6 +2421,31 @@ export function StationShiftView({
       {/* Mobile Sticky Bottom CTA Bar (compact <= 15% mobile viewport height) */}
       {stationItems.length > 0 && !isLocked && (
         <div className="lg:hidden fixed bottom-0 left-0 right-0 z-30 bg-white/95 backdrop-blur-md border-t border-stone-200 shadow-lg no-print">
+          {pendingConflict && (
+            <div className="px-4 py-2.5 bg-amber-50 border-b border-amber-200 text-amber-950">
+              <div className="max-w-lg mx-auto flex flex-wrap items-center justify-between gap-2 text-xs">
+                <span className="font-semibold">Otro dispositivo editó esta planilla.</span>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={syncDraftsWithServer}
+                    className="min-h-[36px] px-2.5 py-1 font-semibold text-stone-800 bg-white border border-stone-300 rounded-lg cursor-pointer"
+                  >
+                    Cargar servidor
+                  </button>
+                  <button
+                    type="button"
+                    disabled={savingMode !== null}
+                    onClick={() => executeSave(pendingConflict.mode, { forceOverwrite: true })}
+                    className="min-h-[36px] px-2.5 py-1 font-semibold text-white bg-red-700 rounded-lg disabled:opacity-50 cursor-pointer"
+                  >
+                    Sobrescribir
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
           {saveError && (
             <div
               role="alert"
@@ -2405,7 +2461,7 @@ export function StationShiftView({
                         <span className="ml-1.5 font-mono text-red-700">({saveError.code})</span>
                       ) : null}
                     </p>
-                    <p className="text-red-900 leading-snug mt-0.5">{saveError.detail}</p>
+                    <p className="text-red-900 leading-snug mt-0.5 break-words">{saveError.detail}</p>
                   </div>
                 </div>
                 <button

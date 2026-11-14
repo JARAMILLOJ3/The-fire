@@ -41,10 +41,13 @@ describe('firestore.rules structural security audit', () => {
     });
   });
 
-  it('uses single-get helpers for worker entry creation and checks worker branch before canManageWorkspace', () => {
+  it('uses single-get helpers for worker report/entry creation and handles legacy hamburguesas station IDs', () => {
     expect(rulesText).toContain('function isActiveStationWorker(wsId, station)');
+    expect(rulesText).toContain('function validWorkerMember(wsId, station, memberData)');
+    expect(rulesText).toContain('function validWorkerReportCreate(wsData, report)');
     expect(rulesText).toContain('function reportAfterMatchesEntry(reportData, entry)');
     expect(rulesText).toContain('function entryMatchesItem(entry, itemData)');
+    expect(rulesText).toContain("itemData.station == 'hamburguesas' && entry.station == 'comida_rapida'");
     expect(rulesText).toContain('entryMatchesItem(\n                incoming(),\n                get(/databases/$(database)/documents/items/$(itemId)).data');
     expect(rulesText).not.toContain('exists(/databases/$(database)/documents/items/$(itemId))');
   });

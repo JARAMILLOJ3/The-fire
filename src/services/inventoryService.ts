@@ -77,6 +77,27 @@ export class ConcurrencyConflictError extends Error {
   }
 }
 
+export class DiagnosticSaveError extends Error {
+  readonly title: string;
+  readonly detail: string;
+  readonly failedDocumentPath: string;
+  readonly code?: string;
+
+  constructor(params: {
+    title: string;
+    detail: string;
+    failedDocumentPath: string;
+    code?: string;
+  }) {
+    super(`${params.title}: ${params.detail}`);
+    this.name = 'DiagnosticSaveError';
+    this.title = params.title;
+    this.detail = params.detail;
+    this.failedDocumentPath = params.failedDocumentPath;
+    this.code = params.code;
+  }
+}
+
 export function evaluateReportSaveGuard(params: {
   mode: 'opening' | 'closing';
   canManage: boolean;
@@ -1140,7 +1161,7 @@ export async function saveStationReportBatch(params: {
   const cleanNotes = clampString(notes, MAX_NOTES_LENGTH);
   const rawAuthorizedEmails = (workspace.authorizedEmails ?? [])
     .map((e) => e.trim().toLowerCase())
-    .filter((e) => e.length >= 3 && e.includes('@'))
+    .filter((e) => e.length >= 3 && e.length <= 120 && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e))
     .slice(0, 15);
   const authorizedEmails =
     rawAuthorizedEmails.length > 0
@@ -1224,9 +1245,13 @@ export async function saveStationReportBatch(params: {
   }
 
   interface EntryWriteOp {
+    itemId: string;
+    itemName: string;
     ref: ReturnType<typeof doc>;
     kind: 'update' | 'set';
     payload: Record<string, unknown>;
+    updatePayload: Record<string, unknown>;
+    createPayload: Record<string, unknown>;
   }
 
   const entryOperations: EntryWriteOp[] = [];
@@ -1272,63 +1297,69 @@ export async function saveStationReportBatch(params: {
               ? prev?.openingStatus ?? 'manual'
               : prev?.openingStatus);
 
-    if (prev) {
-      const updatePayload: Record<string, unknown> = {
-        opening: openingVal,
-        added: effectiveAdded,
-        closing: closingVal,
-        hasOpening,
-        hasClosing,
-        notApplicable,
-        updatedByUid: user.uid,
-        updatedByName: reporterName,
-        updatedAt: serverTimestamp(),
-      };
-      if (previousClosingVal !== undefined) {
-        updatePayload.previousClosing = previousClosingVal;
-      }
-      if (derivedOpeningStatus !== undefined) {
-        updatePayload.openingStatus = derivedOpeningStatus;
-      }
-      if (canManage) {
-        updatePayload.itemName = row.itemName;
-        updatePayload.unit = row.unit;
-        updatePayload.minStock = clampNumber(row.minStock);
-        updatePayload.targetStock = clampNumber(row.targetStock);
-      }
-      entryOperations.push({ ref: entryRef, kind: 'update', payload: updatePayload });
-    } else {
-      const createPayload: Record<string, unknown> = {
-        workspaceId: workspace.id,
-        ownerUid: workspace.ownerUid,
-        authorizedEmails,
-        reportId,
-        itemId: row.itemId,
-        station,
-        date,
-        itemName: row.itemName,
-        unit: row.unit,
-        minStock: canManage ? clampNumber(row.minStock) : Number(row.minStock),
-        targetStock: canManage ? clampNumber(row.targetStock) : Number(row.targetStock),
-        opening: openingVal,
-        added: effectiveAdded,
-        closing: closingVal,
-        hasOpening,
-        hasClosing,
-        notApplicable,
-        updatedByUid: user.uid,
-        updatedByName: reporterName,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      };
-      if (previousClosingVal !== undefined) {
-        createPayload.previousClosing = previousClosingVal;
-      }
-      if (derivedOpeningStatus !== undefined) {
-        createPayload.openingStatus = derivedOpeningStatus;
-      }
-      entryOperations.push({ ref: entryRef, kind: 'set', payload: createPayload });
+    const updatePayload: Record<string, unknown> = {
+      opening: openingVal,
+      added: effectiveAdded,
+      closing: closingVal,
+      hasOpening,
+      hasClosing,
+      notApplicable,
+      updatedByUid: user.uid,
+      updatedByName: reporterName,
+      updatedAt: serverTimestamp(),
+    };
+    if (previousClosingVal !== undefined) {
+      updatePayload.previousClosing = previousClosingVal;
     }
+    if (derivedOpeningStatus !== undefined) {
+      updatePayload.openingStatus = derivedOpeningStatus;
+    }
+    if (canManage) {
+      updatePayload.itemName = row.itemName;
+      updatePayload.unit = row.unit;
+      updatePayload.minStock = clampNumber(row.minStock);
+      updatePayload.targetStock = clampNumber(row.targetStock);
+    }
+
+    const createPayload: Record<string, unknown> = {
+      workspaceId: workspace.id,
+      ownerUid: workspace.ownerUid,
+      authorizedEmails,
+      reportId,
+      itemId: row.itemId,
+      station,
+      date,
+      itemName: row.itemName,
+      unit: row.unit,
+      minStock: canManage ? clampNumber(row.minStock) : Number(row.minStock),
+      targetStock: canManage ? clampNumber(row.targetStock) : Number(row.targetStock),
+      opening: openingVal,
+      added: effectiveAdded,
+      closing: closingVal,
+      hasOpening,
+      hasClosing,
+      notApplicable,
+      updatedByUid: user.uid,
+      updatedByName: reporterName,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    };
+    if (previousClosingVal !== undefined) {
+      createPayload.previousClosing = previousClosingVal;
+    }
+    if (derivedOpeningStatus !== undefined) {
+      createPayload.openingStatus = derivedOpeningStatus;
+    }
+
+    entryOperations.push({
+      itemId: row.itemId,
+      itemName: row.itemName,
+      ref: entryRef,
+      kind: prev ? 'update' : 'set',
+      payload: prev ? updatePayload : createPayload,
+      updatePayload,
+      createPayload,
+    });
   });
 
   // Chunk into batches of <= 8 entries so Firestore security rules stay safely under the 20-read batch limit
@@ -1405,13 +1436,254 @@ export async function saveStationReportBatch(params: {
     return { queuedOffline: true };
   }
 
+  const extractFirebaseCode = (error: unknown): string | undefined =>
+    error &&
+    typeof error === 'object' &&
+    'code' in error &&
+    typeof (error as { code?: unknown }).code === 'string'
+      ? (error as { code: string }).code
+      : undefined;
+
   try {
     for (const b of batches) {
       await b.commit();
     }
     return { queuedOffline: false };
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, `dailyReports/${reportId}`);
+  } catch (batchError) {
+    console.warn(
+      `[saveStationReportBatch] Lote rechazado (${extractFirebaseCode(batchError) ?? 'error'}). Iniciando diagnóstico documento por documento...`,
+      batchError,
+    );
+
+    // Diagnostic mode: save report alone first, then each entry 1-by-1 to isolate exact doc & reason
+    let liveReportExists = serverExists;
+    try {
+      const liveReportSnap = await getDoc(reportRef);
+      liveReportExists = liveReportSnap.exists();
+    } catch {
+      // Keep prior knowledge if read fails
+    }
+
+    const firstStepReportStatus: ReportStatus =
+      entryOperations.length === 0 ? guard.effectiveStatus : intermediateStatus;
+
+    try {
+      if (liveReportExists) {
+        await updateDoc(reportRef, {
+          status: firstStepReportStatus,
+          reportedByUid: user.uid,
+          reportedByName: reporterName,
+          notes: cleanNotes,
+          updatedAt: serverTimestamp(),
+        });
+      } else {
+        await setDoc(reportRef, {
+          workspaceId: workspace.id,
+          ownerUid: workspace.ownerUid,
+          authorizedEmails,
+          date,
+          station,
+          status: firstStepReportStatus,
+          reportedByUid: user.uid,
+          reportedByName: reporterName,
+          notes: cleanNotes,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+    } catch (reportWriteError) {
+      const errCode = extractFirebaseCode(reportWriteError) ?? extractFirebaseCode(batchError);
+      const reasons: string[] = [];
+
+      if (!user.emailVerified) {
+        reasons.push('tu cuenta de Google no tiene email verificado');
+      }
+      if (!canManage) {
+        try {
+          const [memSnap, wsSnap, repSnap] = await Promise.all([
+            getDoc(doc(db, 'teamMembers', user.uid)),
+            getDoc(doc(db, 'workspaces', workspace.id)),
+            getDoc(reportRef),
+          ]);
+          if (!memSnap.exists()) {
+            reasons.push(`no existe teamMembers/${user.uid}`);
+          } else {
+            const m = memSnap.data() as Partial<TeamMember>;
+            if (!m.active) reasons.push('tu acceso en teamMembers está desactivado (active: false)');
+            if (m.workspaceId !== workspace.id) {
+              reasons.push(`teamMembers.workspaceId (${m.workspaceId}) no coincide con ${workspace.id}`);
+            }
+            if (m.station !== station) {
+              reasons.push(`teamMembers.station (${m.station}) no coincide con ${station}`);
+            }
+          }
+          if (wsSnap.exists()) {
+            const ws = wsSnap.data() as Partial<Workspace>;
+            if (ws.ownerUid !== workspace.ownerUid) {
+              reasons.push('el ownerUid del restaurante cambió en el servidor');
+            }
+            if (ws.shiftSchedule?.enabled) {
+              reasons.push(
+                `horario servidor habilitado (${ws.shiftSchedule.openingStart}–${ws.shiftSchedule.openingEnd} / ${ws.shiftSchedule.closingStart}–${ws.shiftSchedule.closingEnd}), fecha reporte: ${date}`,
+              );
+            }
+          }
+          if (repSnap.exists()) {
+            const r = repSnap.data() as Partial<DailyReport>;
+            if (r.status === 'completed') {
+              reasons.push('el reporte ya está marcado como completed');
+            }
+          }
+        } catch {
+          // Ignore secondary diagnostic read errors
+        }
+      }
+
+      const opLabel = liveReportExists ? 'actualización' : 'creación';
+      const detail =
+        reasons.length > 0
+          ? `Documento rechazado: dailyReports/${reportId} (${opLabel}). Motivo: ${reasons.join('; ')}.`
+          : `Documento rechazado: dailyReports/${reportId} (${opLabel}). Verifica el horario permitido, la fecha operativa (${date}) o que el reporte no esté bloqueado.`;
+
+      console.error('Firestore Diagnostic Report Error:', {
+        path: `dailyReports/${reportId}`,
+        code: errCode,
+        reasons,
+        reportWriteError,
+      });
+
+      throw new DiagnosticSaveError({
+        title: 'Firebase rechazó el encabezado del reporte',
+        detail,
+        failedDocumentPath: `dailyReports/${reportId}`,
+        code: errCode,
+      });
+    }
+
+    // Report succeeded; now write each entry one by one
+    for (const op of entryOperations) {
+      let liveEntryExists = op.kind === 'update';
+      try {
+        const entrySnap = await getDoc(op.ref);
+        liveEntryExists = entrySnap.exists();
+      } catch {
+        // Use expected op kind if pre-read fails
+      }
+
+      try {
+        if (liveEntryExists) {
+          await updateDoc(op.ref, op.updatePayload);
+        } else {
+          await setDoc(op.ref, op.createPayload);
+        }
+      } catch (entryWriteError) {
+        const errCode = extractFirebaseCode(entryWriteError) ?? extractFirebaseCode(batchError);
+        const reasons: string[] = [];
+
+        try {
+          const [itemSnap, repSnap, wsSnap] = await Promise.all([
+            getDoc(doc(db, 'items', op.itemId)),
+            getDoc(reportRef),
+            getDoc(doc(db, 'workspaces', workspace.id)),
+          ]);
+
+          if (!itemSnap.exists()) {
+            reasons.push(`el insumo items/${op.itemId} no existe en el servidor`);
+          } else {
+            const it = itemSnap.data() as Partial<InventoryItem>;
+            if (it.workspaceId !== workspace.id) {
+              reasons.push(`workspaceId del catálogo (${it.workspaceId}) ≠ ${workspace.id}`);
+            }
+            if (it.station !== station && !(it.station === 'hamburguesas' && station === 'comida_rapida')) {
+              reasons.push(`puesto en catálogo (${it.station}) ≠ ${station}`);
+            }
+            if (it.name !== op.createPayload.itemName) {
+              reasons.push(`nombre en catálogo ("${it.name}") ≠ "${String(op.createPayload.itemName)}"`);
+            }
+            if (it.unit !== op.createPayload.unit) {
+              reasons.push(`unidad en catálogo ("${it.unit}") ≠ "${String(op.createPayload.unit)}"`);
+            }
+            if (it.minStock !== op.createPayload.minStock) {
+              reasons.push(`minStock en catálogo (${it.minStock}) ≠ ${String(op.createPayload.minStock)}`);
+            }
+            if (it.targetStock !== op.createPayload.targetStock) {
+              reasons.push(`targetStock en catálogo (${it.targetStock}) ≠ ${String(op.createPayload.targetStock)}`);
+            }
+          }
+
+          if (repSnap.exists()) {
+            const rep = repSnap.data() as Partial<DailyReport>;
+            if (rep.status === 'completed') {
+              reasons.push(`dailyReports/${reportId} está en estado completed`);
+            }
+            if (rep.ownerUid && rep.ownerUid !== workspace.ownerUid) {
+              reasons.push(`ownerUid del reporte (${rep.ownerUid}) ≠ ${workspace.ownerUid}`);
+            }
+          } else {
+            reasons.push(`no existe dailyReports/${reportId}`);
+          }
+
+          if (wsSnap.exists()) {
+            const ws = wsSnap.data() as Partial<Workspace>;
+            if (ws.ownerUid !== workspace.ownerUid) {
+              reasons.push(`ownerUid del restaurante (${ws.ownerUid}) ≠ ${workspace.ownerUid}`);
+            }
+            if (ws.shiftSchedule?.enabled) {
+              reasons.push(
+                `ventana configurada en servidor (${ws.shiftSchedule.openingStart}–${ws.shiftSchedule.openingEnd} / ${ws.shiftSchedule.closingStart}–${ws.shiftSchedule.closingEnd}), fecha: ${date}`,
+              );
+            }
+          }
+        } catch {
+          // Ignore secondary diagnostic read errors
+        }
+
+        const entryPath = `dailyReports/${reportId}/entries/${op.itemId}`;
+        const opLabel = liveEntryExists ? 'actualización' : 'creación';
+        const detail =
+          reasons.length > 0
+            ? `Documento rechazado: ${entryPath} ("${op.itemName}", ${opLabel}). Motivo: ${reasons.join('; ')}.`
+            : `Documento rechazado: ${entryPath} ("${op.itemName}", ${opLabel}). Revisa que el insumo coincida con el catálogo o que el horario siga activo.`;
+
+        console.error('Firestore Diagnostic Entry Error:', {
+          path: entryPath,
+          itemName: op.itemName,
+          code: errCode,
+          reasons,
+          entryWriteError,
+        });
+
+        throw new DiagnosticSaveError({
+          title: `Error al guardar insumo "${op.itemName}"`,
+          detail,
+          failedDocumentPath: entryPath,
+          code: errCode,
+        });
+      }
+    }
+
+    // Finalize report status to completed if needed
+    if (guard.effectiveStatus !== firstStepReportStatus) {
+      try {
+        await updateDoc(reportRef, {
+          status: guard.effectiveStatus,
+          reportedByUid: user.uid,
+          reportedByName: reporterName,
+          notes: cleanNotes,
+          updatedAt: serverTimestamp(),
+        });
+      } catch (finalizeError) {
+        const errCode = extractFirebaseCode(finalizeError) ?? extractFirebaseCode(batchError);
+        throw new DiagnosticSaveError({
+          title: 'Error al finalizar el cierre del reporte',
+          detail: `Se guardaron los insumos, pero Firebase rechazó cerrar dailyReports/${reportId}.`,
+          failedDocumentPath: `dailyReports/${reportId}`,
+          code: errCode,
+        });
+      }
+    }
+
+    return { queuedOffline: false };
   }
 }
 

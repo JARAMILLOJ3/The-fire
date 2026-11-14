@@ -308,4 +308,12 @@ describe('inventory.ts (sanitización, sin_dato, anomalías y compras)', () => {
     expect(offlineErr.code).toBe('unavailable');
     expect(offlineErr.title).toContain('Sin conexión');
   });
+
+  it('formats configured opening/closing times for thank-you screens cleanly', async () => {
+    const { formatTime12h } = await import('../schedule');
+    expect(formatTime12h('10:00')).toBe('10:00 a. m.');
+    expect(formatTime12h('19:00')).toBe('7:00 p. m.');
+    expect(formatTime12h('23:00')).toBe('11:00 p. m.');
+    expect(formatTime12h('02:00')).toBe('2:00 a. m.');
+  });
 });
