@@ -245,3 +245,39 @@ export function resolveWorkerScheduleStatus(
     currentTimeLabel,
   };
 }
+
+export function getNextScheduleWindowInfo(
+  now: Date,
+  rawSchedule?: ShiftSchedule,
+): {
+  windowName: 'Apertura' | 'Cierre';
+  startLabel: string;
+  dayLabel: 'Hoy' | 'Mañana';
+  minutesUntil: number;
+} {
+  const schedule = normalizeShiftSchedule(rawSchedule);
+  const bogota = getBogotaNowParts(now);
+  const nowMinutes = bogota.totalMinutes;
+
+  const openStartMin = parseTimeToMinutes(schedule.openingStart);
+  const closeStartMin = parseTimeToMinutes(schedule.closingStart);
+
+  const deltaOpen = (openStartMin - nowMinutes + 1440) % 1440 || 1440;
+  const deltaClose = (closeStartMin - nowMinutes + 1440) % 1440 || 1440;
+
+  if (deltaOpen <= deltaClose) {
+    return {
+      windowName: 'Apertura',
+      startLabel: formatTime12h(schedule.openingStart),
+      dayLabel: nowMinutes + deltaOpen >= 1440 ? 'Mañana' : 'Hoy',
+      minutesUntil: deltaOpen,
+    };
+  }
+
+  return {
+    windowName: 'Cierre',
+    startLabel: formatTime12h(schedule.closingStart),
+    dayLabel: nowMinutes + deltaClose >= 1440 ? 'Mañana' : 'Hoy',
+    minutesUntil: deltaClose,
+  };
+}

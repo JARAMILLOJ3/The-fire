@@ -1,8 +1,9 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { motion } from 'motion/react';
 import { ClipboardCheck, QrCode, ShoppingCart, Store, UtensilsCrossed } from 'lucide-react';
 import heroPhoto from '../assets/images/restaurant_prep_hero.webp';
 import type { StationLink } from '../types';
+import { resolveWorkerScheduleStatus } from '../utils/schedule';
 import { BrandLogo } from './BrandLogo';
 
 interface AuthScreenProps {
@@ -22,7 +23,27 @@ export function AuthScreen({
 }: AuthScreenProps) {
   const [imgFailed, setImgFailed] = useState(false);
 
+  const bogotaWindow = useMemo(() => resolveWorkerScheduleStatus(new Date()), []);
+  const isOpeningTime = bogotaWindow.phase === 'opening';
+  const isClosingTime = bogotaWindow.phase === 'closing';
+
   if (pendingLink || hasLinkParams) {
+    const step2Text = isOpeningTime
+      ? '2. Confirma el inicio con "Está bien" y anota si llegó surtido.'
+      : isClosingTime
+        ? '2. Revisa el inicio del día y anota cuánto quedó al cerrar.'
+        : '2. Revisa apertura, surtido o conteo de cierre según tu horario.';
+    const step3Text = isOpeningTime
+      ? '3. Presiona "Guardar apertura" para dejar listo tu turno.'
+      : isClosingTime
+        ? '3. Presiona "Enviar cierre al jefe" y listo.'
+        : '3. Guarda tu reporte cuando tu ventana esté habilitada.';
+    const ctaText = isOpeningTime
+      ? 'Entrar a registrar apertura con Google'
+      : isClosingTime
+        ? 'Entrar a hacer mi cierre con Google'
+        : 'Entrar a mi puesto con Google';
+
     return (
       <div className="min-h-screen overflow-x-hidden bg-stone-50 text-stone-900 flex flex-col">
         <header className="px-4 sm:px-6 py-4 bg-white border-b border-stone-200 flex items-center justify-between">
@@ -33,7 +54,7 @@ export function AuthScreen({
           <motion.div
             initial={{ opacity: 0, y: 14 }}
             animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
+            transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }}
             className="w-full max-w-md bg-white border border-stone-200 rounded-2xl p-6 sm:p-8 space-y-6 shadow-sm"
           >
             <div className="space-y-2">
@@ -41,14 +62,18 @@ export function AuthScreen({
                 <QrCode className="w-4 h-4 shrink-0" />
                 <span>Ingreso directo a tu puesto</span>
               </div>
-              <h1 className="font-display text-2xl sm:text-3xl font-bold text-stone-900">
+              <h1 className="font-display text-2xl sm:text-3xl font-bold text-stone-900 [text-wrap:balance]">
                 {pendingLink?.stationName ?? 'Tu Puesto de Trabajo'}
               </h1>
               {pendingLink?.workerName ? (
                 <p className="text-sm text-stone-600">
                   ¡Hola,{' '}
                   <span className="font-semibold text-stone-900">{pendingLink.workerName}</span>!
-                  Entra con Google para contar el inventario al terminar tu turno.
+                  {isOpeningTime
+                    ? ' Entra con Google para confirmar con cuánto inicia tu turno.'
+                    : isClosingTime
+                      ? ' Entra con Google para contar el inventario al terminar tu turno.'
+                      : ' Entra con Google para abrir la planilla de tu puesto.'}
                 </p>
               ) : (
                 <p className="text-sm text-stone-600">
@@ -60,8 +85,8 @@ export function AuthScreen({
             <div className="p-4 bg-stone-50 border border-stone-200 rounded-xl text-sm text-stone-700 space-y-1.5">
               <p className="font-semibold text-stone-900">Así de fácil en 3 pasos:</p>
               <p>1. Entra con tu cuenta de Google desde tu celular.</p>
-              <p>2. Toca + o − para anotar cuánto quedó al cerrar.</p>
-              <p>3. Presiona &ldquo;Enviar cierre al jefe&rdquo; y listo.</p>
+              <p>{step2Text}</p>
+              <p>{step3Text}</p>
             </div>
 
             {errorMessage && (
@@ -80,7 +105,7 @@ export function AuthScreen({
               className="w-full min-h-[48px] inline-flex items-center justify-center gap-2.5 px-5 py-3 text-base font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.99] disabled:opacity-60 transition-all cursor-pointer"
             >
               <Store className="w-5 h-5 shrink-0" />
-              {loading ? 'Ingresando...' : 'Entrar a hacer mi cierre con Google'}
+              {loading ? 'Ingresando...' : ctaText}
             </button>
           </motion.div>
         </main>

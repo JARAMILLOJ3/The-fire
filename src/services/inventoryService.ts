@@ -1266,6 +1266,24 @@ export async function saveStationReportBatch(params: {
     const closingVal =
       !row.hasClosing && prev?.hasClosing ? clampNumber(prev.closing) : clampNumber(row.closing);
 
+    const previousClosingVal =
+      typeof row.previousClosing === 'number'
+        ? clampNumber(row.previousClosing)
+        : typeof prev?.previousClosing === 'number'
+          ? clampNumber(prev.previousClosing)
+          : undefined;
+    const derivedOpeningStatus =
+      notApplicable
+        ? undefined
+        : row.openingStatus ??
+          (hasOpening && previousClosingVal !== undefined
+            ? openingVal === previousClosingVal
+              ? 'confirmed_match'
+              : 'adjusted'
+            : hasOpening
+              ? prev?.openingStatus ?? 'manual'
+              : prev?.openingStatus);
+
     if (prev) {
       const updatePayload: Record<string, unknown> = {
         opening: openingVal,
@@ -1278,6 +1296,12 @@ export async function saveStationReportBatch(params: {
         updatedByName: reporterName,
         updatedAt: serverTimestamp(),
       };
+      if (previousClosingVal !== undefined) {
+        updatePayload.previousClosing = previousClosingVal;
+      }
+      if (derivedOpeningStatus !== undefined) {
+        updatePayload.openingStatus = derivedOpeningStatus;
+      }
       if (canManage) {
         updatePayload.itemName = row.itemName;
         updatePayload.unit = row.unit;
@@ -1286,7 +1310,7 @@ export async function saveStationReportBatch(params: {
       }
       batch.update(entryRef, updatePayload);
     } else {
-      batch.set(entryRef, {
+      const createPayload: Record<string, unknown> = {
         workspaceId: workspace.id,
         ownerUid: workspace.ownerUid,
         authorizedEmails,
@@ -1308,7 +1332,14 @@ export async function saveStationReportBatch(params: {
         updatedByName: reporterName,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
-      });
+      };
+      if (previousClosingVal !== undefined) {
+        createPayload.previousClosing = previousClosingVal;
+      }
+      if (derivedOpeningStatus !== undefined) {
+        createPayload.openingStatus = derivedOpeningStatus;
+      }
+      batch.set(entryRef, createPayload);
     }
   });
 

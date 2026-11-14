@@ -4,6 +4,7 @@ export type StationId = string;
 export type TeamStationId = StationId | 'jefe';
 export type ReportStatus = 'open' | 'opening_saved' | 'completed';
 export type StockLevel = 'agotado' | 'comprar' | 'medio' | 'suficiente' | 'sin_dato';
+export type OpeningAuditStatus = 'confirmed_match' | 'adjusted' | 'manual';
 
 export interface ShiftSchedule {
   enabled: boolean;
@@ -104,6 +105,8 @@ export interface DailyReportEntry {
   hasOpening: boolean;
   hasClosing: boolean;
   notApplicable?: boolean;
+  previousClosing?: number;
+  openingStatus?: OpeningAuditStatus;
   updatedByUid: string;
   updatedByName: string;
   createdAt?: Timestamp;
@@ -146,6 +149,8 @@ export interface DraftEntryRow {
   hasOpening: boolean;
   hasClosing: boolean;
   notApplicable?: boolean;
+  previousClosing?: number;
+  openingStatus?: OpeningAuditStatus;
 }
 
 export interface ConsolidatedItemRow {

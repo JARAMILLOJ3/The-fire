@@ -291,6 +291,7 @@ service cloud.firestore {
           'workspaceId', 'ownerUid', 'authorizedEmails', 'reportId', 'itemId',
           'station', 'date', 'itemName', 'unit', 'minStock', 'targetStock',
           'opening', 'added', 'closing', 'hasOpening', 'hasClosing', 'notApplicable',
+          'previousClosing', 'openingStatus',
           'updatedByUid', 'updatedByName', 'createdAt', 'updatedAt'
         ])
         && isValidId(data.workspaceId)
@@ -310,6 +311,8 @@ service cloud.firestore {
         && data.hasOpening is bool
         && data.hasClosing is bool
         && (!('notApplicable' in data) || data.notApplicable is bool)
+        && (!('previousClosing' in data) || (data.previousClosing is number && data.previousClosing >= 0 && data.previousClosing <= 100000))
+        && (!('openingStatus' in data) || (data.openingStatus is string && data.openingStatus in ['confirmed_match', 'adjusted', 'manual']))
         && isValidId(data.updatedByUid)
         && data.updatedByName is string && data.updatedByName.size() >= 1 && data.updatedByName.size() <= 80
         && data.createdAt is timestamp
@@ -689,7 +692,8 @@ service cloud.firestore {
               canManageWorkspace(existing().workspaceId)
               && incoming().diff(existing()).affectedKeys().hasOnly([
                 'authorizedEmails', 'opening', 'added', 'closing', 'hasOpening', 'hasClosing',
-                'notApplicable', 'itemName', 'unit', 'minStock', 'targetStock',
+                'notApplicable', 'previousClosing', 'openingStatus',
+                'itemName', 'unit', 'minStock', 'targetStock',
                 'updatedByUid', 'updatedByName', 'updatedAt'
               ])
             )
@@ -704,7 +708,8 @@ service cloud.firestore {
               && incoming().targetStock == existing().targetStock
               && incoming().diff(existing()).affectedKeys().hasOnly([
                 'opening', 'added', 'closing', 'hasOpening', 'hasClosing',
-                'notApplicable', 'updatedByUid', 'updatedByName', 'updatedAt'
+                'notApplicable', 'previousClosing', 'openingStatus',
+                'updatedByUid', 'updatedByName', 'updatedAt'
               ])
             )
           );

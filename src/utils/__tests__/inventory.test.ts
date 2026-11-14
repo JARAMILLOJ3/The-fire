@@ -205,4 +205,74 @@ describe('inventory.ts (sanitización, sin_dato, anomalías y compras)', () => {
     expect(getSuggestedPurchase(11, 10, 30)).toBe(0);
     expect(getSuggestedPurchase(5, 10, 30)).toBe(25);
   });
+
+  it('keeps preloaded yesterday closing as pending_confirm until confirmed or edited, and bulk-confirms only untouched rows', async () => {
+    const {
+      confirmAllPendingOpeningRows,
+      confirmPreloadedOpeningRow,
+      getOpeningRowState,
+    } = await import('../inventory');
+
+    const preloadedUntouched: DraftEntryRow = {
+      itemId: 'mesera_1',
+      itemName: 'Coca-Cola 400ml',
+      unit: 'und',
+      minStock: 10,
+      targetStock: 30,
+      opening: 12,
+      added: 0,
+      closing: 0,
+      hasOpening: false,
+      hasClosing: false,
+      previousClosing: 12,
+    };
+    expect(getOpeningRowState(preloadedUntouched)).toBe('pending_confirm');
+
+    const confirmedSingle = confirmPreloadedOpeningRow(preloadedUntouched);
+    expect(confirmedSingle.hasOpening).toBe(true);
+    expect(confirmedSingle.openingStatus).toBe('confirmed_match');
+    expect(getOpeningRowState(confirmedSingle)).toBe('confirmed');
+
+    const manuallyCorrected: DraftEntryRow = {
+      ...preloadedUntouched,
+      itemId: 'mesera_2',
+      opening: 9,
+      hasOpening: true,
+      openingStatus: 'adjusted',
+      previousClosing: 12,
+    };
+    expect(getOpeningRowState(manuallyCorrected)).toBe('adjusted');
+
+    const noYesterday: DraftEntryRow = {
+      itemId: 'mesera_3',
+      itemName: 'Agua',
+      unit: 'und',
+      minStock: 5,
+      targetStock: 15,
+      opening: 0,
+      added: 0,
+      closing: 0,
+      hasOpening: false,
+      hasClosing: false,
+    };
+    expect(getOpeningRowState(noYesterday)).toBe('uncounted');
+
+    const bulkResult = confirmAllPendingOpeningRows(
+      {
+        mesera_1: preloadedUntouched,
+        mesera_2: manuallyCorrected,
+        mesera_3: noYesterday,
+      },
+      {
+        mesera_2: { opening: true },
+      },
+    );
+
+    expect(bulkResult.confirmedIds).toEqual(['mesera_1']);
+    expect(bulkResult.nextRows.mesera_1.hasOpening).toBe(true);
+    expect(bulkResult.nextRows.mesera_1.openingStatus).toBe('confirmed_match');
+    expect(bulkResult.nextRows.mesera_2.opening).toBe(9);
+    expect(bulkResult.nextRows.mesera_2.openingStatus).toBe('adjusted');
+    expect(bulkResult.nextRows.mesera_3.hasOpening).toBe(false);
+  });
 });

@@ -395,6 +395,15 @@
         "notApplicable": {
           "type": "boolean"
         },
+        "previousClosing": {
+          "type": "number",
+          "description": "Cierre registrado el día anterior para comparar con la apertura de hoy"
+        },
+        "openingStatus": {
+          "type": "string",
+          "enum": ["confirmed_match", "adjusted", "manual"],
+          "description": "Indica si la apertura coincidió con ayer, se corrigió o se contó manualmente"
+        },
         "updatedByUid": {
           "type": "string",
           "pattern": "^[a-zA-Z0-9_\\-]+$",

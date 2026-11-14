@@ -4,11 +4,13 @@ import { AnimatePresence, motion } from 'motion/react';
 import {
   AlertTriangle,
   Ban,
+  Check,
+  CheckCheck,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
   Clock,
-  History,
+  Eye,
   Lock,
   Minus,
   Moon,
@@ -31,14 +33,19 @@ import type {
   DailyReportEntry,
   DraftEntryRow,
   InventoryItem,
+  OpeningAuditStatus,
   Workspace,
   Workstation,
 } from '../types';
 import {
+  computeOpeningStatusForValue,
+  confirmAllPendingOpeningRows,
+  confirmPreloadedOpeningRow,
   detectEntryAnomalies,
   detectReportAnomalies,
   formatDateHuman,
   formatTimeShort,
+  getOpeningRowState,
   getPreviousDateStr,
   getStockLevel,
   getStockLevelMeta,
@@ -48,6 +55,8 @@ import {
   type EntryAnomaly,
 } from '../utils/inventory';
 import type { WorkerScheduleStatus } from '../utils/schedule';
+import { ShiftOutsideHoursView } from './shift/ShiftOutsideHoursView';
+import { ShiftSubmitConfirmModal } from './shift/ShiftSubmitConfirmModal';
 
 interface StationShiftViewProps {
   workspace: Workspace;
@@ -65,6 +74,7 @@ interface StationShiftViewProps {
 }
 
 type ItemFilter = 'todos' | 'pendientes' | 'bajos';
+type YesterdayLoadStatus = 'idle' | 'loading' | 'found' | 'none';
 
 interface TouchedFlags {
   opening?: boolean;
@@ -80,6 +90,8 @@ interface StoredRowDraft {
   hasOpening: boolean;
   hasClosing: boolean;
   notApplicable: boolean;
+  previousClosing?: number;
+  openingStatus?: OpeningAuditStatus;
 }
 
 interface StoredDraftPayload {
@@ -153,16 +165,28 @@ function buildRowFromSources(
     ? Boolean(storedRow?.notApplicable)
     : Boolean(existing?.notApplicable);
 
+  const previousClosing =
+    typeof storedRow?.previousClosing === 'number'
+      ? storedRow.previousClosing
+      : typeof existing?.previousClosing === 'number'
+        ? existing.previousClosing
+        : undefined;
+
   const opening = storedTouched?.opening
     ? storedRow?.opening ?? 0
     : existing
       ? existing.opening
-      : 0;
+      : typeof previousClosing === 'number'
+        ? previousClosing
+        : 0;
   const hasOpening = notApplicable
     ? false
     : storedTouched?.opening
       ? Boolean(storedRow?.hasOpening)
       : Boolean(existing?.hasOpening);
+  const openingStatus = storedTouched?.opening
+    ? storedRow?.openingStatus
+    : existing?.openingStatus;
 
   const added = storedTouched?.added
     ? storedRow?.added ?? 0
@@ -193,6 +217,8 @@ function buildRowFromSources(
     hasOpening,
     hasClosing,
     notApplicable,
+    previousClosing,
+    openingStatus,
   };
 }
 
@@ -237,11 +263,13 @@ export function StationShiftView({
   const [drafts, setDrafts] = useState<Record<string, DraftEntryRow>>({});
   const [notes, setNotes] = useState('');
   const [savingMode, setSavingMode] = useState<'opening' | 'closing' | null>(null);
-  const [loadingPrev, setLoadingPrev] = useState(false);
-  const [autoLoadedPrevDate, setAutoLoadedPrevDate] = useState<string | null>(null);
+  const [yesterdayStatus, setYesterdayStatus] = useState<YesterdayLoadStatus>('idle');
+  const [yesterdayDateStr, setYesterdayDateStr] = useState<string>(() =>
+    getPreviousDateStr(selectedDate),
+  );
   const [restoredFromLocal, setRestoredFromLocal] = useState(false);
   const [reopening, setReopening] = useState(false);
-  const [showOpeningDetails, setShowOpeningDetails] = useState(false);
+  const [showSubmittedDetails, setShowSubmittedDetails] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [itemFilter, setItemFilter] = useState<ItemFilter>('todos');
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
@@ -250,7 +278,7 @@ export function StationShiftView({
     mode: 'opening' | 'closing';
     message: string;
   } | null>(null);
-  const [pendingAnomalyConfirm, setPendingAnomalyConfirm] = useState<{
+  const [confirmModalState, setConfirmModalState] = useState<{
     mode: 'opening' | 'closing';
     anomalies: EntryAnomaly[];
   } | null>(null);
@@ -266,7 +294,7 @@ export function StationShiftView({
   const latestItemsRef = useRef(stationItems);
   const latestReportNotesRef = useRef(report?.notes ?? '');
   const latestReportUpdatedAtMsRef = useRef<number | null>(null);
-  const autoPreloadKeyRef = useRef<string>('');
+  const yesterdayPreloadKeyRef = useRef<string>('');
   const listSectionRef = useRef<HTMLDivElement | null>(null);
 
   latestEntriesRef.current = entriesByItemId;
@@ -295,6 +323,8 @@ export function StationShiftView({
             hasOpening: row.hasOpening,
             hasClosing: row.hasClosing,
             notApplicable: Boolean(row.notApplicable),
+            previousClosing: row.previousClosing,
+            openingStatus: row.openingStatus,
           };
         }
       });
@@ -337,17 +367,20 @@ export function StationShiftView({
         ? stored.baselineUpdatedAtMs
         : latestReportUpdatedAtMsRef.current;
 
+    yesterdayPreloadKeyRef.current = '';
+    setYesterdayStatus('idle');
+    setYesterdayDateStr(getPreviousDateStr(selectedDate));
     setDrafts(nextDrafts);
     setNotes(stored?.notesTouched ? stored.notes : latestReportNotesRef.current);
     setRestoredFromLocal(hasRestoredEdits);
     setRemoteChangedBy(null);
     setPendingConflict(null);
-    setPendingAnomalyConfirm(null);
+    setConfirmModalState(null);
+    setShowSubmittedDetails(false);
     setFeedback(null);
-    setAutoLoadedPrevDate(null);
   }, [workspace.id, station.id, selectedDate, report?.id, draftMode, storageKey]);
 
-  // 2. Merge remote snapshot updates WITHOUT overwriting any touched local fields
+  // 2. Merge remote snapshot updates WITHOUT overwriting touched local fields or preloaded previousClosing
   useEffect(() => {
     const stored = readStoredDraft(storageKey);
     const currentRemoteUpdatedAtMs =
@@ -408,7 +441,19 @@ export function StationShiftView({
         }
 
         if (existing) {
-          if (!touched?.notApplicable && Boolean(existing.notApplicable) !== Boolean(updatedRow.notApplicable)) {
+          if (
+            typeof existing.previousClosing === 'number' &&
+            updatedRow.previousClosing !== existing.previousClosing
+          ) {
+            updatedRow = {
+              ...updatedRow,
+              previousClosing: existing.previousClosing,
+            };
+          }
+          if (
+            !touched?.notApplicable &&
+            Boolean(existing.notApplicable) !== Boolean(updatedRow.notApplicable)
+          ) {
             updatedRow = {
               ...updatedRow,
               notApplicable: Boolean(existing.notApplicable),
@@ -417,12 +462,15 @@ export function StationShiftView({
           if (
             !touched?.opening &&
             !touched?.notApplicable &&
-            (updatedRow.opening !== existing.opening || updatedRow.hasOpening !== existing.hasOpening)
+            (updatedRow.opening !== existing.opening ||
+              updatedRow.hasOpening !== existing.hasOpening ||
+              updatedRow.openingStatus !== existing.openingStatus)
           ) {
             updatedRow = {
               ...updatedRow,
               opening: existing.opening,
               hasOpening: existing.hasOpening,
+              openingStatus: existing.openingStatus,
             };
           }
           if (!touched?.added && updatedRow.added !== existing.added) {
@@ -458,15 +506,19 @@ export function StationShiftView({
     }
   }, [stationItems, entriesByItemId, report?.notes, report?.updatedAt, report?.reportedByName, storageKey]);
 
-  // 3. Auto-preload yesterday's closing as today's opening if today has no report yet
+  // 3. Auto-preload yesterday's closing as "Por confirmar" (hasOpening remains false until confirmed or edited)
   useEffect(() => {
-    if (isWorkerOutsideHours || report || stationItems.length === 0) return;
-    const key = `${workspace.id}_${selectedDate}_${station.id}_${stationItems.length}`;
-    if (autoPreloadKeyRef.current === key) return;
-    autoPreloadKeyRef.current = key;
+    if (isWorkerOutsideHours || stationItems.length === 0) return;
+    const itemSignature = stationItems.map((i) => i.id).join(',');
+    const key = `${workspace.id}_${selectedDate}_${station.id}_${itemSignature}`;
+    if (yesterdayPreloadKeyRef.current === key) return;
+    yesterdayPreloadKeyRef.current = key;
 
     let cancelled = false;
     const prevDate = getPreviousDateStr(selectedDate);
+    setYesterdayDateStr(prevDate);
+    setYesterdayStatus('loading');
+
     fetchStationEntriesOnce(
       workspace.id,
       prevDate,
@@ -475,44 +527,65 @@ export function StationShiftView({
     )
       .then((prevEntries) => {
         if (cancelled) return;
-        if (Object.keys(prevEntries).length === 0) return;
-        let loadedAny = false;
+        const validClosings = Object.values(prevEntries).filter(
+          (e) => e && e.hasClosing && !e.notApplicable,
+        );
+        const anyExistingPrevClosing = Object.values(latestEntriesRef.current).some(
+          (e) => typeof e?.previousClosing === 'number',
+        );
+
+        if (validClosings.length === 0 && !anyExistingPrevClosing) {
+          setYesterdayStatus('none');
+          return;
+        }
+
+        setYesterdayStatus('found');
         setDrafts((prev) => {
+          let changed = false;
           const updated = { ...prev };
+
           Object.keys(updated).forEach((itemId) => {
+            const cur = updated[itemId];
             const prevEntry = prevEntries[itemId];
+            if (!prevEntry || !prevEntry.hasClosing || prevEntry.notApplicable) return;
+
             const touched = touchedRef.current[itemId];
-            if (
-              prevEntry &&
-              prevEntry.hasClosing &&
-              !prevEntry.notApplicable &&
-              !updated[itemId].hasOpening &&
-              !updated[itemId].notApplicable &&
-              !touched?.opening &&
-              !touched?.notApplicable
-            ) {
+            const remoteEntry = latestEntriesRef.current[itemId];
+            const nextPrevClosing = prevEntry.closing;
+
+            // Only attach previousClosing + prefill opening as "Por confirmar" when not yet saved/edited
+            if (!cur.hasOpening && !cur.notApplicable && !touched?.opening && !touched?.notApplicable && !remoteEntry?.hasOpening) {
+              if (cur.opening !== nextPrevClosing || cur.previousClosing !== nextPrevClosing) {
+                updated[itemId] = {
+                  ...cur,
+                  opening: nextPrevClosing,
+                  hasOpening: false,
+                  previousClosing: nextPrevClosing,
+                };
+                changed = true;
+              }
+            } else if (cur.previousClosing === undefined) {
               updated[itemId] = {
-                ...updated[itemId],
-                opening: prevEntry.closing,
-                hasOpening: true,
+                ...cur,
+                previousClosing: nextPrevClosing,
               };
-              loadedAny = true;
+              changed = true;
             }
           });
-          return loadedAny ? updated : prev;
+
+          return changed ? updated : prev;
         });
-        if (loadedAny) {
-          setAutoLoadedPrevDate(prevDate);
-        }
       })
       .catch(() => {
-        // Silent auto-preload fallback
+        if (!cancelled) {
+          setYesterdayStatus('none');
+        }
       });
 
     return () => {
       cancelled = true;
     };
-  }, [isWorkerOutsideHours, report, workspace.id, selectedDate, station.id, stationItems]);
+  }, [isWorkerOutsideHours, workspace.id, selectedDate, station.id, stationItems]);
 
   const applyRowMutation = (
     itemId: string,
@@ -557,6 +630,7 @@ export function StationShiftView({
           [field]: 0,
           hasOpening: field === 'opening' ? false : current.hasOpening,
           hasClosing: field === 'closing' ? false : current.hasClosing,
+          openingStatus: field === 'opening' ? undefined : current.openingStatus,
         }),
         { [field]: true },
       );
@@ -571,6 +645,10 @@ export function StationShiftView({
         notApplicable: field === 'added' ? current.notApplicable : false,
         hasOpening: field === 'opening' ? true : current.hasOpening,
         hasClosing: field === 'closing' ? true : current.hasClosing,
+        openingStatus:
+          field === 'opening'
+            ? computeOpeningStatusForValue(parsed.value, current.previousClosing)
+            : current.openingStatus,
       }),
       {
         [field]: true,
@@ -588,7 +666,7 @@ export function StationShiftView({
           ? current.closing
           : 0
         : field === 'opening'
-          ? current.hasOpening
+          ? current.hasOpening || typeof current.previousClosing === 'number'
             ? current.opening
             : 0
           : current.added;
@@ -601,12 +679,42 @@ export function StationShiftView({
         notApplicable: field === 'added' ? row.notApplicable : false,
         hasOpening: field === 'opening' ? true : row.hasOpening,
         hasClosing: field === 'closing' ? true : row.hasClosing,
+        openingStatus:
+          field === 'opening'
+            ? computeOpeningStatusForValue(nextVal, row.previousClosing)
+            : row.openingStatus,
       }),
       {
         [field]: true,
         ...(field !== 'added' ? { notApplicable: true } : {}),
       },
     );
+  };
+
+  const confirmSingleOpening = (itemId: string) => {
+    applyRowMutation(
+      itemId,
+      (row) => confirmPreloadedOpeningRow(row),
+      { opening: true, notApplicable: true },
+    );
+  };
+
+  const handleConfirmAllUntouched = () => {
+    if (isLocked) return;
+    const { nextRows, confirmedIds } = confirmAllPendingOpeningRows(drafts, touchedRef.current);
+    if (confirmedIds.length === 0) return;
+
+    const nextTouched = { ...touchedRef.current };
+    confirmedIds.forEach((id) => {
+      nextTouched[id] = { ...(nextTouched[id] ?? {}), opening: true };
+    });
+    touchedRef.current = nextTouched;
+    setDrafts(nextRows);
+    persistLocalDraft(nextRows, notes);
+    setFeedback({
+      type: 'success',
+      text: `Confirmaste ${confirmedIds.length} ${confirmedIds.length === 1 ? 'insumo' : 'insumos'} sin cambios respecto al cierre de ayer.`,
+    });
   };
 
   const markZeroExplicit = (itemId: string, field: 'opening' | 'closing') => {
@@ -618,6 +726,10 @@ export function StationShiftView({
         notApplicable: false,
         hasOpening: field === 'opening' ? true : row.hasOpening,
         hasClosing: field === 'closing' ? true : row.hasClosing,
+        openingStatus:
+          field === 'opening'
+            ? computeOpeningStatusForValue(0, row.previousClosing)
+            : row.openingStatus,
       }),
       { [field]: true, notApplicable: true },
     );
@@ -632,11 +744,12 @@ export function StationShiftView({
       (row) => ({
         ...row,
         notApplicable: nextNA,
-        opening: nextNA ? 0 : row.opening,
+        opening: nextNA ? 0 : typeof row.previousClosing === 'number' ? row.previousClosing : row.opening,
         added: nextNA ? 0 : row.added,
         closing: nextNA ? 0 : row.closing,
-        hasOpening: nextNA ? false : row.hasOpening,
-        hasClosing: nextNA ? false : row.hasClosing,
+        hasOpening: false,
+        hasClosing: false,
+        openingStatus: undefined,
       }),
       { notApplicable: true, opening: true, closing: true },
     );
@@ -648,87 +761,114 @@ export function StationShiftView({
     persistLocalDraft(drafts, nextNotes);
   };
 
-  const handleLoadYesterdayClosing = async () => {
-    if (stationItems.length === 0) return;
-    setLoadingPrev(true);
-    setFeedback(null);
-    try {
-      const prevDate = getPreviousDateStr(selectedDate);
-      const prevEntries = await fetchStationEntriesOnce(
-        workspace.id,
-        prevDate,
-        station.id,
-        stationItems.map((i) => i.id),
-      );
-      const countFound = Object.keys(prevEntries).length;
-      if (countFound === 0) {
-        setFeedback({
-          type: 'error',
-          text: `No se encontró un cierre guardado para ${formatDateHuman(prevDate)}.`,
-        });
+  // Counters & blocking evaluation
+  const counts = useMemo(() => {
+    let pendingConfirm = 0;
+    let missingOpening = 0;
+    let missingClosing = 0;
+    let confirmedMatch = 0;
+    let adjusted = 0;
+    let manualOpening = 0;
+    let naCount = 0;
+    let zeroClosing = 0;
+    let zeroOpening = 0;
+    let accounted = 0;
+    let lowCount = 0;
+
+    stationItems.forEach((item) => {
+      const row = drafts[item.id];
+      const openingState = getOpeningRowState(row);
+      const isNA = Boolean(row?.notApplicable);
+
+      if (isNA) {
+        naCount += 1;
+        accounted += 1;
         return;
       }
 
-      setDrafts((prev) => {
-        const updated = { ...prev };
-        Object.keys(updated).forEach((itemId) => {
-          const prevEntry = prevEntries[itemId];
-          if (prevEntry && prevEntry.hasClosing && !prevEntry.notApplicable) {
-            updated[itemId] = {
-              ...updated[itemId],
-              opening: prevEntry.closing,
-              hasOpening: true,
-              notApplicable: false,
-            };
-            touchedRef.current[itemId] = {
-              ...(touchedRef.current[itemId] ?? {}),
-              opening: true,
-              notApplicable: true,
-            };
-          }
-        });
-        persistLocalDraft(updated, notes);
-        return updated;
-      });
-      setAutoLoadedPrevDate(prevDate);
-      setFeedback({
-        type: 'success',
-        text: `Se cargó el cierre del ${formatDateHuman(prevDate)} como base de apertura.`,
-      });
-    } catch {
-      setFeedback({
-        type: 'error',
-        text: 'No se pudo consultar el reporte del día anterior.',
-      });
-    } finally {
-      setLoadingPrev(false);
-    }
-  };
+      if (openingState === 'pending_confirm') pendingConfirm += 1;
+      if (openingState === 'uncounted') missingOpening += 1;
+      if (openingState === 'confirmed') confirmedMatch += 1;
+      if (openingState === 'adjusted') adjusted += 1;
+      if (openingState === 'manual') manualOpening += 1;
+      if (row?.hasOpening && row.opening === 0) zeroOpening += 1;
 
-  const isRowAccounted = useCallback(
-    (row: DraftEntryRow | undefined): boolean => {
-      if (!row) return false;
-      if (row.notApplicable) return true;
-      return isWorkerOpeningPhase ? Boolean(row.hasOpening) : Boolean(row.hasClosing);
+      if (!row?.hasClosing) missingClosing += 1;
+      if (row?.hasClosing && row.closing === 0) zeroClosing += 1;
+
+      if (isWorkerOpeningPhase) {
+        if (row?.hasOpening) {
+          accounted += 1;
+          const lvl = getStockLevel(row.opening + row.added, item.minStock);
+          if (lvl === 'agotado' || lvl === 'comprar' || lvl === 'medio') lowCount += 1;
+        }
+      } else {
+        // Closing requires closing value AND no preloaded opening waiting confirmation
+        if (row?.hasClosing && openingState !== 'pending_confirm') {
+          accounted += 1;
+          const lvl = getStockLevel(row.closing, item.minStock);
+          if (lvl === 'agotado' || lvl === 'comprar' || lvl === 'medio') lowCount += 1;
+        }
+      }
+    });
+
+    const missingCount = Math.max(0, stationItems.length - accounted);
+    return {
+      total: stationItems.length,
+      pendingConfirm,
+      missingOpening,
+      missingClosing,
+      confirmedMatch,
+      adjusted,
+      manualOpening,
+      naCount,
+      zeroClosing,
+      zeroOpening,
+      accounted,
+      missingCount,
+      lowCount,
+    };
+  }, [stationItems, drafts, isWorkerOpeningPhase]);
+
+  const canSubmitMode = useCallback(
+    (mode: 'opening' | 'closing'): { ok: boolean; reasonText?: string } => {
+      if (counts.total === 0) return { ok: false, reasonText: 'No hay insumos activos.' };
+      if (counts.pendingConfirm > 0) {
+        return {
+          ok: false,
+          reasonText: `Tienes ${counts.pendingConfirm} ${
+            counts.pendingConfirm === 1 ? 'insumo por confirmar' : 'insumos por confirmar'
+          } respecto al cierre de ayer. Toca "✓ Está bien", corrige el valor o pulsa "Todo coincide".`,
+        };
+      }
+      if (mode === 'opening' && counts.missingOpening > 0) {
+        return {
+          ok: false,
+          reasonText: `Faltan ${counts.missingOpening} ${
+            counts.missingOpening === 1 ? 'insumo' : 'insumos'
+          } por contar en el inicio del día.`,
+        };
+      }
+      if (mode === 'closing' && counts.missingClosing > 0) {
+        return {
+          ok: false,
+          reasonText: `Faltan ${counts.missingClosing} ${
+            counts.missingClosing === 1 ? 'insumo' : 'insumos'
+          } por contar en el cierre.`,
+        };
+      }
+      return { ok: true };
     },
-    [isWorkerOpeningPhase],
+    [counts],
   );
 
-  const countedCount = stationItems.filter((it) => isRowAccounted(drafts[it.id])).length;
-  const missingCount = Math.max(0, stationItems.length - countedCount);
-  const allAccounted = stationItems.length > 0 && missingCount === 0;
-
-  const lowCount = stationItems.filter((it) => {
-    const row = drafts[it.id];
-    if (!row || row.notApplicable) return false;
-    const isCounted = isWorkerOpeningPhase ? row.hasOpening : row.hasClosing;
-    if (!isCounted) return false;
-    const lvl = getStockLevel(isWorkerOpeningPhase ? row.opening + row.added : row.closing, it.minStock);
-    return lvl === 'agotado' || lvl === 'comprar' || lvl === 'medio';
-  }).length;
+  const primaryBlockStatus = useMemo(
+    () => canSubmitMode(draftMode),
+    [canSubmitMode, draftMode],
+  );
 
   const progressPct =
-    stationItems.length > 0 ? Math.round((countedCount / stationItems.length) * 100) : 0;
+    counts.total > 0 ? Math.round((counts.accounted / counts.total) * 100) : 0;
 
   const syncDraftsWithServer = () => {
     clearStoredDraft(storageKey);
@@ -745,6 +885,7 @@ export function StationShiftView({
         undefined,
       );
     });
+    yesterdayPreloadKeyRef.current = '';
     setDrafts(syncedDrafts);
     setNotes(report?.notes ?? '');
     setRestoredFromLocal(false);
@@ -756,37 +897,35 @@ export function StationShiftView({
     });
   };
 
-  const handleSave = async (
-    mode: 'opening' | 'closing',
-    options?: { forceOverwrite?: boolean; skipAnomalyCheck?: boolean },
-  ) => {
-    if (stationItems.length === 0) return;
-
-    const requiresFullCount = mode === 'closing' || isWorkerOpeningPhase;
-    if (requiresFullCount && !allAccounted) {
+  const requestSaveWithConfirmation = (mode: 'opening' | 'closing') => {
+    const check = canSubmitMode(mode);
+    if (!check.ok && (mode === 'closing' || isWorkerOpeningPhase)) {
       setItemFilter('pendientes');
       setFeedback({
         type: 'error',
-        text: `Faltan ${missingCount} ${missingCount === 1 ? 'insumo' : 'insumos'} por contar. Escribe la cantidad, pulsa "0 / No queda" o marca "No aplica hoy".`,
+        text: check.reasonText ?? 'Completa los conteos faltantes antes de enviar.',
       });
       listSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
       return;
     }
 
     const rows = stationItems.map((it) => drafts[it.id]).filter(Boolean);
+    const anomalies = detectReportAnomalies(rows, mode);
+    setConfirmModalState({ mode, anomalies });
+  };
 
-    if (!options?.skipAnomalyCheck) {
-      const anomalies = detectReportAnomalies(rows, mode);
-      if (anomalies.length > 0) {
-        setPendingAnomalyConfirm({ mode, anomalies });
-        return;
-      }
-    }
+  const executeSave = async (
+    mode: 'opening' | 'closing',
+    options?: { forceOverwrite?: boolean },
+  ) => {
+    if (stationItems.length === 0) return;
 
-    setPendingAnomalyConfirm(null);
+    const rows = stationItems.map((it) => drafts[it.id]).filter(Boolean);
+    setConfirmModalState(null);
     setPendingConflict(null);
     setSavingMode(mode);
     setFeedback(null);
+
     try {
       const saveResult = await saveStationReportBatch({
         workspace,
@@ -814,10 +953,10 @@ export function StationShiftView({
         text: saveResult.queuedOffline
           ? mode === 'opening'
             ? 'Sin conexión — apertura guardada en este celular. Se enviará sola al volver internet.'
-            : 'Sin conexión — cierre guardado en este celular. Se enviará al jefe en cuanto vuelva la señal.'
+            : 'Sin conexión — cierre guardado en este celular. Se enviará al jefe al volver internet.'
           : mode === 'opening'
-            ? '¡Apertura y surtido guardados! Si llegan más productos en este horario puedes volver a ajustarlo.'
-            : '¡Excelente! Tu cierre fue enviado y el jefe ya puede verlo en su resumen.',
+            ? '¡Apertura guardada! El jefe ya puede ver qué coincidió y qué se ajustó.'
+            : '¡Listo, gracias! Tu cierre fue enviado al jefe.',
       });
       onSaved?.();
     } catch (err) {
@@ -836,7 +975,7 @@ export function StationShiftView({
       setFeedback({
         type: 'error',
         text: isPerm
-          ? 'No se pudo guardar porque el horario ya terminó o el cierre ya fue enviado. Pídele al jefe revisar la planilla. Tu borrador sigue guardado aquí.'
+          ? 'No se pudo guardar porque el horario terminó o el cierre ya fue enviado. Pídele al jefe revisar la planilla. Tu borrador sigue guardado aquí.'
           : 'Ocurrió un error al guardar el inventario. Tu borrador sigue guardado en este celular.',
       });
     } finally {
@@ -870,11 +1009,16 @@ export function StationShiftView({
     return stationItems.filter((item) => {
       if (q && !item.name.toLowerCase().includes(q)) return false;
       const row = drafts[item.id];
+      const openingState = getOpeningRowState(row);
+      const isNA = Boolean(row?.notApplicable);
+
       if (itemFilter === 'pendientes') {
-        return !isRowAccounted(row);
+        if (isNA) return false;
+        if (openingState === 'pending_confirm') return true;
+        return isWorkerOpeningPhase ? !row?.hasOpening : !row?.hasClosing;
       }
       if (itemFilter === 'bajos') {
-        if (!row || row.notApplicable) return false;
+        if (!row || isNA) return false;
         const isCounted = isWorkerOpeningPhase ? row.hasOpening : row.hasClosing;
         if (!isCounted) return false;
         const val = isWorkerOpeningPhase ? row.opening + row.added : row.closing;
@@ -883,106 +1027,121 @@ export function StationShiftView({
       }
       return true;
     });
-  }, [stationItems, searchTerm, itemFilter, drafts, isRowAccounted, isWorkerOpeningPhase]);
+  }, [stationItems, searchTerm, itemFilter, drafts, isWorkerOpeningPhase]);
 
   const closingTime = report?.status === 'completed' ? formatTimeShort(report?.updatedAt) : null;
   const draftTime = report?.status === 'opening_saved' ? formatTimeShort(report?.updatedAt) : null;
 
-  // Outside Allowed Shift Schedule (Workers only) -> Render nothing from inventory
+  // Outside Allowed Shift Schedule (Workers only)
   if (isWorkerOutsideHours) {
     return (
-      <div className="py-8 sm:py-12 flex items-center justify-center">
+      <ShiftOutsideHoursView
+        station={station}
+        selectedDate={selectedDate}
+        scheduleStatus={scheduleStatus}
+      />
+    );
+  }
+
+  // Post-submit "Listo, gracias" celebration screen for workers after closing is sent
+  if (isLocked && !showSubmittedDetails) {
+    return (
+      <div className="py-6 sm:py-10 flex items-center justify-center">
         <motion.div
-          initial={{ opacity: 0, y: 12 }}
+          initial={{ opacity: 0, y: 10 }}
           animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.28 }}
-          className="w-full max-w-lg bg-white border border-stone-200 rounded-2xl p-6 sm:p-8 text-center space-y-5 shadow-xs"
+          transition={{ duration: 0.25 }}
+          className="w-full max-w-lg bg-white border border-emerald-200 rounded-2xl p-6 sm:p-8 text-center space-y-5 shadow-xs"
         >
-          <div className="w-12 h-12 rounded-2xl bg-stone-100 text-stone-700 flex items-center justify-center mx-auto">
-            <Clock className="w-6 h-6" />
+          <div className="w-14 h-14 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-700 flex items-center justify-center mx-auto">
+            <CheckCircle2 className="w-8 h-8" />
           </div>
 
           <div className="space-y-1.5">
-            <p className="text-xs font-semibold text-orange-600">
-              ¡Hola, {station.workerName}! · {station.name}
+            <p className="text-xs font-semibold text-emerald-700">
+              {station.name} · {formatDateHuman(selectedDate)}
             </p>
-            <h1 className="font-display text-2xl font-bold text-stone-900">
-              Fuera de horario de inventario
+            <h1 className="font-display text-2xl sm:text-3xl font-bold text-stone-900">
+              ¡Listo, gracias{station.workerName ? `, ${station.workerName}` : ''}!
             </h1>
             <p className="text-sm text-stone-600 leading-relaxed">
-              En este momento la planilla está cerrada. Tu espacio solo se habilita en los horarios definidos por el jefe:
+              Tu cierre del día quedó enviado al jefe{closingTime ? ` a las ${closingTime}` : ''}. Ya puedes cerrar esta ventana.
             </p>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-left">
-            <div className="p-4 rounded-xl bg-orange-50/70 border border-orange-200/80 space-y-1">
-              <div className="flex items-center gap-1.5 text-xs font-bold text-orange-800">
-                <Sun className="w-4 h-4 shrink-0" />
-                <span>Apertura y surtido</span>
-              </div>
-              <p className="font-mono text-sm font-bold text-stone-900">
-                {scheduleStatus.openingRangeLabel}
+          <div className="grid grid-cols-3 gap-2 text-center">
+            <div className="p-3 rounded-xl bg-stone-50 border border-stone-200">
+              <p className="text-[11px] font-medium text-stone-500">Insumos</p>
+              <p className="font-mono tabular-nums text-lg font-bold text-stone-900 mt-0.5">
+                {counts.total - counts.naCount}
               </p>
-              <p className="text-xs text-stone-600">Inicio del turno y llegada de productos</p>
             </div>
-
-            <div className="p-4 rounded-xl bg-stone-100 border border-stone-200 space-y-1">
-              <div className="flex items-center gap-1.5 text-xs font-bold text-stone-800">
-                <Moon className="w-4 h-4 shrink-0" />
-                <span>Cierre del día</span>
-              </div>
-              <p className="font-mono text-sm font-bold text-stone-900">
-                {scheduleStatus.closingRangeLabel}
+            <div className="p-3 rounded-xl bg-red-50/70 border border-red-200">
+              <p className="text-[11px] font-medium text-red-700">En cero</p>
+              <p className="font-mono tabular-nums text-lg font-bold text-red-700 mt-0.5">
+                {counts.zeroClosing}
               </p>
-              <p className="text-xs text-stone-600">Conteo final al terminar la jornada</p>
+            </div>
+            <div className="p-3 rounded-xl bg-emerald-50/70 border border-emerald-200">
+              <p className="text-[11px] font-medium text-emerald-700">Coincidieron</p>
+              <p className="font-mono tabular-nums text-lg font-bold text-emerald-700 mt-0.5">
+                {counts.confirmedMatch}
+              </p>
             </div>
           </div>
 
-          <p className="text-xs font-mono text-stone-500 pt-1">
-            Hora actual: {scheduleStatus.currentTimeLabel}
-          </p>
+          <div className="p-3.5 rounded-xl bg-stone-50 border border-stone-200 text-xs text-stone-600 flex items-center justify-center gap-2">
+            <Lock className="w-4 h-4 text-stone-500 shrink-0" />
+            <span>
+              La planilla queda bloqueada para evitar cambios por error. Si necesitas corregir algo, pídele al jefe que la reabra.
+            </span>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setShowSubmittedDetails(true)}
+            className="min-h-[44px] inline-flex items-center justify-center gap-2 px-4 py-2 text-xs sm:text-sm font-semibold text-stone-700 bg-white border border-stone-300 rounded-xl hover:bg-stone-100 transition-colors cursor-pointer"
+          >
+            <Eye className="w-4 h-4" />
+            Ver resumen enviado
+          </button>
         </motion.div>
       </div>
     );
   }
 
   return (
-    <div className="space-y-5 pb-8 min-w-0">
-      {/* Friendly Personalized Header */}
-      <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
+    <div className="space-y-4 sm:space-y-5 pb-28 lg:pb-8 min-w-0">
+      {/* Header */}
+      <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-3.5">
         <div className="min-w-0">
           <p className="text-xs font-semibold text-orange-600">
             ¡Hola, {station.workerName}! · {station.area || 'Tu puesto'} ·{' '}
             {formatDateHuman(selectedDate)}
           </p>
-          <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-stone-900 mt-1 [text-wrap:balance]">
+          <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-stone-900 mt-0.5 [text-wrap:balance]">
             {station.name}
           </h1>
           <p className="text-sm text-stone-600 mt-1">
             {isWorkerOpeningPhase
-              ? `Horario de apertura (${scheduleStatus.openingRangeLabel}): confirma con cuánto inicia el puesto y anota si llegaron productos.`
+              ? `Apertura (${scheduleStatus.openingRangeLabel}): confirma el inicio respecto a ayer y anota si llegó mercancía.`
               : !canManage && scheduleStatus.phase === 'closing'
-                ? `Horario de cierre (${scheduleStatus.closingRangeLabel}): anota cuántas unidades quedaron hoy al terminar el turno.`
-                : 'Registra apertura, surtido o cierre diario del puesto.'}
+                ? `Cierre (${scheduleStatus.closingRangeLabel}): revisa inicio/surtido y cuenta cuánto quedó al terminar el turno.`
+                : 'Paso 1: Inicio y surtido del día · Paso 2: Cierre del día.'}
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          {!isWorkerOpeningPhase && (
+          {isLocked && showSubmittedDetails && (
             <button
               type="button"
-              onClick={() => setShowOpeningDetails((v) => !v)}
-              className="min-h-[42px] inline-flex items-center gap-2 px-3.5 py-2 text-xs sm:text-sm font-medium text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              onClick={() => setShowSubmittedDetails(false)}
+              className="min-h-[42px] inline-flex items-center gap-2 px-3.5 py-2 text-xs sm:text-sm font-semibold text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-xl hover:bg-emerald-100 transition-colors cursor-pointer"
             >
-              {showOpeningDetails ? (
-                <ChevronUp className="w-4 h-4" />
-              ) : (
-                <ChevronDown className="w-4 h-4" />
-              )}
-              {showOpeningDetails ? 'Ocultar inicio y surtido' : 'Ver / ajustar inicio y surtido'}
+              <ChevronUp className="w-4 h-4" />
+              Volver a confirmación
             </button>
           )}
-
           {isCompleted && canManage && (
             <button
               type="button"
@@ -1028,6 +1187,44 @@ export function StationShiftView({
         </div>
       )}
 
+      {/* No yesterday closing warning */}
+      {yesterdayStatus === 'none' && !isLocked && (
+        <div
+          role="alert"
+          className="px-4 py-3.5 rounded-2xl bg-amber-50 border border-amber-300 text-xs sm:text-sm text-amber-950 flex items-start gap-2.5"
+        >
+          <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+          <span>
+            <strong>Ayer no se registró cierre, cuenta cada insumo</strong> ({formatDateHuman(yesterdayDateStr)} sin cierre guardado). Los campos están vacíos para que ingreses el conteo real.
+          </span>
+        </div>
+      )}
+
+      {/* Bulk confirmation bar for preloaded yesterday closings */}
+      {counts.pendingConfirm > 0 && !isLocked && (
+        <div className="px-4 py-3.5 rounded-2xl bg-sky-50 border border-sky-300 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-start gap-2.5 text-xs sm:text-sm text-sky-950 min-w-0">
+            <Clock className="w-4 h-4 text-sky-700 shrink-0 mt-0.5" />
+            <div>
+              <p className="font-bold">
+                <span className="font-mono tabular-nums">{counts.pendingConfirm}</span> por confirmar respecto a ayer ({formatDateHuman(yesterdayDateStr)})
+              </p>
+              <p className="text-sky-800 text-xs mt-0.5">
+                Los valores precargados están marcados en azul. Confirma cada uno con &ldquo;✓ Está bien&rdquo;, corrígelo o confirma los que no has tocado de una vez.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={handleConfirmAllUntouched}
+            className="min-h-[44px] inline-flex items-center justify-center gap-2 px-4 py-2 text-xs sm:text-sm font-semibold text-white bg-sky-700 rounded-xl hover:bg-sky-800 active:scale-[0.99] transition-all whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            <CheckCheck className="w-4 h-4 shrink-0" />
+            Todo coincide ({counts.pendingConfirm})
+          </button>
+        </div>
+      )}
+
       {/* Remote concurrent edit notice */}
       {remoteChangedBy && !isLocked && (
         <div className="px-4 py-3 rounded-2xl bg-amber-50 border border-amber-200 text-xs sm:text-sm text-amber-900 flex flex-wrap items-center justify-between gap-2">
@@ -1052,8 +1249,8 @@ export function StationShiftView({
         className={`rounded-2xl border p-4 sm:p-5 space-y-3 transition-colors ${
           isCompleted
             ? 'bg-emerald-50/70 border-emerald-200'
-            : isWorkerOpeningPhase
-              ? 'bg-orange-50/40 border-orange-200/80'
+            : counts.pendingConfirm > 0
+              ? 'bg-sky-50/40 border-sky-200'
               : 'bg-white border-stone-200'
         }`}
       >
@@ -1063,7 +1260,7 @@ export function StationShiftView({
               <>
                 <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
                 <span className="font-semibold text-emerald-900">
-                  ¡Cierre enviado al jefe!{closingTime ? ` (${closingTime})` : ''}
+                  Cierre enviado{closingTime ? ` (${closingTime})` : ''}
                 </span>
               </>
             ) : isWorkerOpeningPhase ? (
@@ -1071,29 +1268,34 @@ export function StationShiftView({
                 <Sun className="w-5 h-5 text-orange-600 shrink-0" />
                 <span className="font-semibold text-stone-900">
                   {report?.status === 'opening_saved'
-                    ? `Apertura guardada${draftTime ? ` (${draftTime})` : ''} · Puedes ajustar si llega más mercancía`
-                    : 'Registro de apertura y llegada de productos'}
+                    ? `Apertura guardada${draftTime ? ` (${draftTime})` : ''}`
+                    : 'Paso 1: Apertura y llegada de productos'}
                 </span>
               </>
             ) : report?.status === 'opening_saved' ? (
               <>
                 <Save className="w-5 h-5 text-amber-600 shrink-0" />
                 <span className="font-semibold text-amber-900">
-                  Apertura lista{draftTime ? ` (${draftTime})` : ''} · Falta enviar cierre final
+                  Apertura lista{draftTime ? ` (${draftTime})` : ''} · Paso 2: Cierre del día
                 </span>
               </>
             ) : (
               <>
                 <Moon className="w-5 h-5 text-orange-600 shrink-0" />
                 <span className="font-semibold text-stone-900">
-                  Conteo de cierre del día
+                  Inicio, surtido y cierre del día
                 </span>
               </>
             )}
           </div>
 
-          <div className="text-sm font-mono tabular-nums font-bold text-stone-800 shrink-0">
-            {countedCount} de {stationItems.length} contados
+          <div className="flex items-center gap-2.5 font-mono tabular-nums text-xs sm:text-sm font-bold shrink-0">
+            {counts.pendingConfirm > 0 && (
+              <span className="text-sky-700">{counts.pendingConfirm} por confirmar</span>
+            )}
+            <span className="text-stone-800">
+              {counts.accounted} de {counts.total} listos
+            </span>
           </div>
         </div>
 
@@ -1101,9 +1303,13 @@ export function StationShiftView({
           <motion.div
             initial={false}
             animate={{ width: `${progressPct}%` }}
-            transition={{ duration: 0.35, ease: [0.22, 1, 0.36, 1] }}
+            transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
             className={`h-full rounded-full ${
-              isCompleted ? 'bg-emerald-600' : 'bg-orange-600'
+              isCompleted
+                ? 'bg-emerald-600'
+                : counts.pendingConfirm > 0
+                  ? 'bg-sky-600'
+                  : 'bg-orange-600'
             }`}
           />
         </div>
@@ -1111,35 +1317,20 @@ export function StationShiftView({
         <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-stone-600">
           <span>
             {restoredFromLocal
-              ? 'Borrador recuperado en este dispositivo. Tus números editados están a salvo.'
-              : autoLoadedPrevDate
-                ? `Base inicial cargada automáticamente con el cierre de ${formatDateHuman(autoLoadedPrevDate)}.`
-                : isWorkerOpeningPhase
-                  ? 'Cuenta cada insumo, toca "0" si no hay o "No aplica hoy" para poder guardar.'
-                  : 'Cuenta todos los insumos (o marca "0 / No queda" / "No aplica") para habilitar el envío.'}
+              ? 'Borrador recuperado en este dispositivo.'
+              : yesterdayStatus === 'loading'
+                ? 'Cargando cierre de ayer para comparar...'
+                : yesterdayStatus === 'found'
+                  ? `Precargado con cierre de ${formatDateHuman(yesterdayDateStr)}. Revisa o confirma cada insumo.`
+                  : 'Cuenta cada insumo, toca "0" si no hay o "No aplica hoy".'}
           </span>
-          {!isLocked && stationItems.length > 0 && (
-            <button
-              type="button"
-              onClick={handleLoadYesterdayClosing}
-              disabled={loadingPrev}
-              className="inline-flex items-center gap-1.5 font-semibold text-orange-600 hover:text-orange-700 cursor-pointer"
-            >
-              <History className="w-3.5 h-3.5" />
-              {loadingPrev ? 'Consultando...' : 'Cargar cierre de ayer'}
-            </button>
+          {(counts.confirmedMatch > 0 || counts.adjusted > 0) && (
+            <span className="font-mono tabular-nums text-stone-700">
+              {counts.confirmedMatch} coinciden · {counts.adjusted} corregidos
+            </span>
           )}
         </div>
       </div>
-
-      {isLocked && (
-        <div className="flex items-center gap-3 px-4 py-3.5 text-sm text-stone-800 bg-stone-100 border border-stone-200 rounded-2xl">
-          <Lock className="w-4 h-4 text-stone-600 shrink-0" />
-          <span>
-            Este cierre ya fue enviado al jefe. Si necesitas cambiar un dato, pídele que reabra el reporte.
-          </span>
-        </div>
-      )}
 
       <AnimatePresence>
         {feedback && (
@@ -1159,7 +1350,7 @@ export function StationShiftView({
         )}
       </AnimatePresence>
 
-      {/* Quick Search & Filter Toolbar */}
+      {/* Search & Filter Toolbar */}
       {stationItems.length > 0 && (
         <div
           ref={listSectionRef}
@@ -1169,35 +1360,37 @@ export function StationShiftView({
             <button
               type="button"
               onClick={() => setItemFilter('todos')}
-              className={`min-h-[38px] px-3 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+              className={`min-h-[40px] px-3 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
                 itemFilter === 'todos'
                   ? 'bg-white text-stone-900 shadow-sm'
                   : 'text-stone-700 hover:text-stone-900'
               }`}
             >
-              Todos ({stationItems.length})
+              Todos ({counts.total})
             </button>
             <button
               type="button"
               onClick={() => setItemFilter('pendientes')}
-              className={`min-h-[38px] px-3 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+              className={`min-h-[40px] px-3 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
                 itemFilter === 'pendientes'
                   ? 'bg-white text-stone-900 shadow-sm'
                   : 'text-stone-700 hover:text-stone-900'
               }`}
             >
-              Faltan ({missingCount})
+              {counts.pendingConfirm > 0
+                ? `Pendientes (${counts.missingCount})`
+                : `Faltan (${counts.missingCount})`}
             </button>
             <button
               type="button"
               onClick={() => setItemFilter('bajos')}
-              className={`min-h-[38px] px-3 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+              className={`min-h-[40px] px-3 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
                 itemFilter === 'bajos'
                   ? 'bg-white text-stone-900 shadow-sm'
                   : 'text-stone-700 hover:text-stone-900'
               }`}
             >
-              Bajos ({lowCount})
+              Bajos ({counts.lowCount})
             </button>
           </div>
 
@@ -1208,6 +1401,7 @@ export function StationShiftView({
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
               placeholder="Buscar insumo..."
+              aria-label="Buscar insumo"
               className="w-full min-h-[44px] pl-10 pr-3 py-2 text-base sm:text-sm bg-white border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
             />
           </div>
@@ -1238,7 +1432,7 @@ export function StationShiftView({
           </div>
         ) : (
           <>
-            {/* Mobile / Tablet Touch-First List */}
+            {/* Mobile / Tablet Touch-First Cards (< lg) */}
             <div className="lg:hidden divide-y divide-stone-200">
               {filteredItems.map((item) => {
                 const row: DraftEntryRow = drafts[item.id] ?? {
@@ -1254,78 +1448,74 @@ export function StationShiftView({
                   hasClosing: false,
                   notApplicable: false,
                 };
+
                 const isNA = Boolean(row.notApplicable);
-                const hasOpeningVal = row.hasOpening && !isNA;
+                const openingState = getOpeningRowState(row);
+                const isPendingConfirm = openingState === 'pending_confirm';
+                const showOpeningNumber =
+                  !isNA && (row.hasOpening || isPendingConfirm);
                 const hasClosingVal = row.hasClosing && !isNA;
-                const activeStockVal = isWorkerOpeningPhase ? row.opening + row.added : row.closing;
-                const level = getStockLevel(activeStockVal, item.minStock);
+
+                const level = getStockLevel(row.closing, item.minStock);
                 const meta = getStockLevelMeta(level);
                 const suggestBuy = getSuggestedPurchase(
                   row.closing,
                   item.minStock,
                   item.targetStock,
                 );
-
-                const inputBorderClass = isNA
-                  ? 'bg-stone-100 border-stone-200 text-stone-400'
-                  : !hasClosingVal
-                    ? 'bg-stone-50 border-stone-300 text-stone-800'
-                    : level === 'agotado' || level === 'comprar'
-                      ? 'bg-red-50/40 border-red-400 text-stone-900'
-                      : level === 'medio'
-                        ? 'bg-amber-50/40 border-amber-400 text-stone-900'
-                        : 'bg-emerald-50/40 border-emerald-500 text-stone-900';
-
-                const isAccounted = isRowAccounted(row);
                 const rowAnomalies = detectEntryAnomalies(row, draftMode);
 
+                const cardSurface = isNA
+                  ? 'bg-stone-100/80'
+                  : isPendingConfirm
+                    ? 'bg-sky-50/50'
+                    : isWorkerOpeningPhase && row.hasOpening
+                      ? 'bg-emerald-50/25'
+                      : !isWorkerOpeningPhase && hasClosingVal
+                        ? 'bg-white'
+                        : 'bg-white';
+
                 return (
-                  <div
-                    key={item.id}
-                    className={`p-4 sm:p-5 space-y-3.5 transition-colors ${
-                      isNA ? 'bg-stone-100/70' : isAccounted ? 'bg-white' : 'bg-stone-50/50'
-                    }`}
-                  >
+                  <div key={item.id} className={`p-4 sm:p-5 space-y-4 ${cardSurface}`}>
+                    {/* Item Title + Status */}
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
                         <h3 className="text-base font-bold text-stone-900 leading-snug">
                           {item.name}
                         </h3>
                         <p className="text-xs text-stone-500 mt-0.5 font-mono tabular-nums">
-                          {item.unit} · Mínimo: {item.minStock}
-                          {!isWorkerOpeningPhase && row.hasOpening && !isNA && !showOpeningDetails
-                            ? ` · Base: ${row.opening + row.added}`
-                            : ''}
+                          {item.unit} · Mín: {item.minStock}
+                          {typeof row.previousClosing === 'number' && (
+                            <> · <span className="text-sky-800 font-semibold">Ayer quedó: {row.previousClosing}</span></>
+                          )}
                         </p>
                       </div>
 
                       <div className="shrink-0 text-right">
                         {isNA ? (
-                          <span className="text-xs font-semibold text-stone-500">
-                            No aplica hoy
+                          <span className="inline-flex items-center gap-1 text-xs font-semibold text-stone-500">
+                            <Ban className="w-3.5 h-3.5 shrink-0" />
+                            No aplica
                           </span>
-                        ) : isWorkerOpeningPhase ? (
-                          hasOpeningVal ? (
-                            <span className="text-xs font-mono font-bold text-orange-700">
-                              Total: {row.opening + row.added} {item.unit}
-                            </span>
-                          ) : (
-                            <span className="text-xs font-semibold text-stone-400">
-                              Por contar
-                            </span>
-                          )
-                        ) : !hasClosingVal ? (
-                          <span className="text-xs font-semibold text-stone-400">
-                            Por contar
+                        ) : isPendingConfirm ? (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-sky-100 text-sky-800 border border-sky-300 text-xs font-bold">
+                            <Clock className="w-3.5 h-3.5 shrink-0" />
+                            Por confirmar
+                          </span>
+                        ) : openingState === 'adjusted' ? (
+                          <span className="inline-flex items-center gap-1 text-xs font-semibold text-orange-700">
+                            <Check className="w-3.5 h-3.5 shrink-0" />
+                            Corregido
+                          </span>
+                        ) : openingState === 'confirmed' || openingState === 'manual' ? (
+                          <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700">
+                            <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                            Inicio OK
                           </span>
                         ) : (
-                          <span
-                            className={`inline-flex items-center gap-1 text-xs font-semibold ${meta.textClass}`}
-                          >
-                            {(level === 'agotado' || level === 'comprar') && (
-                              <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-                            )}
-                            {suggestBuy > 0 ? `Pedir +${suggestBuy}` : meta.label}
+                          <span className="inline-flex items-center gap-1 text-xs font-semibold text-stone-500">
+                            <Clock className="w-3.5 h-3.5 shrink-0" />
+                            Por contar
                           </span>
                         )}
                       </div>
@@ -1338,119 +1528,269 @@ export function StationShiftView({
                       </div>
                     )}
 
-                    {isWorkerOpeningPhase ? (
-                      /* OPENING & RESTOCK PHASE */
-                      <div className="space-y-3">
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                          <div className="space-y-1.5">
-                            <label className="block text-xs font-semibold text-stone-700">
-                              Con cuánto abre ({item.unit})
-                            </label>
-                            <div className="flex items-center gap-2">
-                              <motion.button
-                                whileTap={{ scale: 0.93 }}
-                                type="button"
-                                disabled={isLocked || isNA}
-                                onClick={() => stepField(item.id, 'opening', -1)}
-                                aria-label={`Restar inicio ${item.name}`}
-                                className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                              >
-                                <Minus className="w-5 h-5" />
-                              </motion.button>
-                              <input
-                                type="number"
-                                inputMode="decimal"
-                                min={0}
-                                step="any"
-                                disabled={isLocked || isNA}
-                                placeholder="—"
-                                value={hasOpeningVal ? row.opening : ''}
-                                onChange={(e) =>
-                                  handleNumberInput(
-                                    item.id,
-                                    'opening',
-                                    e.target.value,
-                                    e.target.validity.badInput,
-                                  )
-                                }
-                                className="min-w-0 flex-1 h-12 text-center font-mono tabular-nums text-xl font-bold rounded-xl border border-stone-300 bg-white text-stone-900 placeholder:text-stone-300 focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:bg-stone-100"
-                              />
-                              <motion.button
-                                whileTap={{ scale: 0.93 }}
-                                type="button"
-                                disabled={isLocked || isNA}
-                                onClick={() => stepField(item.id, 'opening', 1)}
-                                aria-label={`Sumar inicio ${item.name}`}
-                                className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                              >
-                                <Plus className="w-5 h-5" />
-                              </motion.button>
-                            </div>
-                          </div>
+                    {/* PASO 1: Inicio del día y Surtido (+) — ALWAYS VISIBLE */}
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="font-bold text-stone-700">
+                          Paso 1 · Inicio y surtido
+                        </span>
+                        {!isNA && (row.hasOpening || isPendingConfirm) && (
+                          <span className="font-mono tabular-nums font-semibold text-stone-600">
+                            Disponible: {sanitizeStockQuantity(row.opening + row.added)} {item.unit}
+                          </span>
+                        )}
+                      </div>
 
-                          <div className="space-y-1.5">
-                            <label className="block text-xs font-semibold text-orange-700">
-                              ¿Llegó producto hoy? / Surtido (+)
-                            </label>
-                            <div className="flex items-center gap-2">
-                              <motion.button
-                                whileTap={{ scale: 0.93 }}
-                                type="button"
-                                disabled={isLocked || isNA}
-                                onClick={() => stepField(item.id, 'added', -1)}
-                                aria-label={`Restar surtido ${item.name}`}
-                                className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-orange-200 bg-orange-50 text-orange-800 hover:bg-orange-100 disabled:opacity-40 cursor-pointer"
-                              >
-                                <Minus className="w-5 h-5" />
-                              </motion.button>
-                              <input
-                                type="number"
-                                inputMode="decimal"
-                                min={0}
-                                step="any"
-                                disabled={isLocked || isNA}
-                                value={isNA ? '' : row.added}
-                                onChange={(e) =>
-                                  handleNumberInput(
-                                    item.id,
-                                    'added',
-                                    e.target.value,
-                                    e.target.validity.badInput,
-                                  )
-                                }
-                                className="min-w-0 flex-1 h-12 text-center font-mono tabular-nums text-xl font-bold rounded-xl border border-orange-300 bg-orange-50/40 text-stone-900 focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:bg-stone-100"
-                              />
-                              <motion.button
-                                whileTap={{ scale: 0.93 }}
-                                type="button"
-                                disabled={isLocked || isNA}
-                                onClick={() => stepField(item.id, 'added', 1)}
-                                aria-label={`Sumar surtido ${item.name}`}
-                                className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-orange-200 bg-orange-50 text-orange-800 hover:bg-orange-100 disabled:opacity-40 cursor-pointer"
-                              >
-                                <Plus className="w-5 h-5" />
-                              </motion.button>
-                            </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div className="space-y-1.5">
+                          <label
+                            htmlFor={`m-open-${item.id}`}
+                            className="flex items-center justify-between gap-2 text-xs font-semibold text-stone-700"
+                          >
+                            <span>Inicio del día ({item.unit})</span>
+                            {typeof row.previousClosing === 'number' && (
+                              <span className="font-mono tabular-nums text-sky-800">
+                                Ayer quedó: {row.previousClosing}
+                              </span>
+                            )}
+                          </label>
+                          <div className="flex items-center gap-2">
+                            <motion.button
+                              whileTap={{ scale: 0.94 }}
+                              type="button"
+                              disabled={isLocked || isNA}
+                              onClick={() => stepField(item.id, 'opening', -1)}
+                              aria-label={`Restar inicio ${item.name}`}
+                              className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
+                            >
+                              <Minus className="w-5 h-5" />
+                            </motion.button>
+                            <input
+                              id={`m-open-${item.id}`}
+                              type="number"
+                              inputMode="decimal"
+                              min={0}
+                              step="any"
+                              disabled={isLocked || isNA}
+                              placeholder="—"
+                              value={showOpeningNumber ? row.opening : ''}
+                              onChange={(e) =>
+                                handleNumberInput(
+                                  item.id,
+                                  'opening',
+                                  e.target.value,
+                                  e.target.validity.badInput,
+                                )
+                              }
+                              className={`min-w-0 flex-1 h-12 text-center font-mono tabular-nums text-xl font-bold rounded-xl border placeholder:text-stone-300 focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:bg-stone-100 ${
+                                isPendingConfirm
+                                  ? 'bg-sky-50 border-sky-400 text-sky-950'
+                                  : openingState === 'adjusted'
+                                    ? 'bg-orange-50/40 border-orange-400 text-stone-900'
+                                    : row.hasOpening
+                                      ? 'bg-emerald-50/40 border-emerald-500 text-stone-900'
+                                      : 'bg-white border-stone-300 text-stone-900'
+                              }`}
+                            />
+                            <motion.button
+                              whileTap={{ scale: 0.94 }}
+                              type="button"
+                              disabled={isLocked || isNA}
+                              onClick={() => stepField(item.id, 'opening', 1)}
+                              aria-label={`Sumar inicio ${item.name}`}
+                              className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
+                            >
+                              <Plus className="w-5 h-5" />
+                            </motion.button>
                           </div>
                         </div>
 
-                        {!isLocked && (
-                          <div className="grid grid-cols-2 gap-2">
+                        <div className="space-y-1.5">
+                          <label
+                            htmlFor={`m-add-${item.id}`}
+                            className="block text-xs font-semibold text-orange-700"
+                          >
+                            Surtido / llegó hoy (+)
+                          </label>
+                          <div className="flex items-center gap-2">
+                            <motion.button
+                              whileTap={{ scale: 0.94 }}
+                              type="button"
+                              disabled={isLocked || isNA}
+                              onClick={() => stepField(item.id, 'added', -1)}
+                              aria-label={`Restar surtido ${item.name}`}
+                              className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-orange-200 bg-orange-50 text-orange-800 hover:bg-orange-100 disabled:opacity-40 cursor-pointer"
+                            >
+                              <Minus className="w-5 h-5" />
+                            </motion.button>
+                            <input
+                              id={`m-add-${item.id}`}
+                              type="number"
+                              inputMode="decimal"
+                              min={0}
+                              step="any"
+                              disabled={isLocked || isNA}
+                              value={isNA ? '' : row.added}
+                              onChange={(e) =>
+                                handleNumberInput(
+                                  item.id,
+                                  'added',
+                                  e.target.value,
+                                  e.target.validity.badInput,
+                                )
+                              }
+                              className="min-w-0 flex-1 h-12 text-center font-mono tabular-nums text-xl font-bold rounded-xl border border-orange-300 bg-orange-50/40 text-stone-900 focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:bg-stone-100"
+                            />
+                            <motion.button
+                              whileTap={{ scale: 0.94 }}
+                              type="button"
+                              disabled={isLocked || isNA}
+                              onClick={() => stepField(item.id, 'added', 1)}
+                              aria-label={`Sumar surtido ${item.name}`}
+                              className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-orange-200 bg-orange-50 text-orange-800 hover:bg-orange-100 disabled:opacity-40 cursor-pointer"
+                            >
+                              <Plus className="w-5 h-5" />
+                            </motion.button>
+                          </div>
+                        </div>
+                      </div>
+
+                      {!isLocked && (
+                        <div className="flex flex-wrap gap-2">
+                          {isPendingConfirm && (
+                            <button
+                              type="button"
+                              onClick={() => confirmSingleOpening(item.id)}
+                              className="flex-1 min-w-[140px] min-h-[44px] inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs sm:text-sm font-bold rounded-xl bg-sky-600 text-white hover:bg-sky-700 active:scale-[0.99] transition-all cursor-pointer"
+                            >
+                              <Check className="w-4 h-4 shrink-0" />
+                              ✓ Está bien
+                            </button>
+                          )}
+                          {isWorkerOpeningPhase && (
                             <button
                               type="button"
                               onClick={() => markZeroExplicit(item.id, 'opening')}
-                              className={`min-h-[42px] px-3 py-2 text-xs font-semibold rounded-xl border transition-colors cursor-pointer ${
-                                hasOpeningVal && row.opening === 0
+                              className={`flex-1 min-h-[44px] px-3 py-2 text-xs font-semibold rounded-xl border transition-colors cursor-pointer ${
+                                row.hasOpening && !isNA && row.opening === 0
                                   ? 'bg-stone-900 text-white border-stone-900'
                                   : 'bg-white text-stone-700 border-stone-200 hover:bg-stone-100'
                               }`}
                             >
                               0 / Sin existencia
                             </button>
+                          )}
+                          {isWorkerOpeningPhase && (
                             <button
                               type="button"
                               onClick={() => toggleNotApplicable(item.id)}
-                              className={`min-h-[42px] inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-xl border transition-colors cursor-pointer ${
+                              className={`min-h-[44px] inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-xl border transition-colors cursor-pointer ${
+                                isNA
+                                  ? 'bg-stone-700 text-white border-stone-700'
+                                  : 'bg-white text-stone-600 border-stone-200 hover:bg-stone-100'
+                              }`}
+                            >
+                              <Ban className="w-3.5 h-3.5 shrink-0" />
+                              {isNA ? 'No aplica' : 'No aplica hoy'}
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* PASO 2: Cierre del día (visible en cierre / jefe / horario libre) */}
+                    {!isWorkerOpeningPhase && (
+                      <div className="pt-3 border-t border-stone-100 space-y-2.5">
+                        <div className="flex items-center justify-between gap-2">
+                          <label
+                            htmlFor={`mobile-close-${item.id}`}
+                            className="text-xs font-bold text-stone-800"
+                          >
+                            Paso 2 · ¿Cuánto quedó hoy al cerrar? ({item.unit})
+                          </label>
+                          {hasClosingVal ? (
+                            <span
+                              className={`inline-flex items-center gap-1 text-xs font-semibold ${meta.textClass}`}
+                            >
+                              {(level === 'agotado' || level === 'comprar') && (
+                                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                              )}
+                              {suggestBuy > 0 ? `Pedir +${suggestBuy}` : meta.label}
+                            </span>
+                          ) : !isNA ? (
+                            <span className="text-xs font-semibold text-stone-400">Por contar</span>
+                          ) : null}
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <motion.button
+                            whileTap={{ scale: 0.94 }}
+                            type="button"
+                            disabled={isLocked || isNA}
+                            onClick={() => stepField(item.id, 'closing', -1)}
+                            aria-label={`Restar cierre ${item.name}`}
+                            className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
+                          >
+                            <Minus className="w-5 h-5" />
+                          </motion.button>
+                          <input
+                            id={`mobile-close-${item.id}`}
+                            type="number"
+                            inputMode="decimal"
+                            min={0}
+                            step="any"
+                            disabled={isLocked || isNA}
+                            placeholder="—"
+                            value={hasClosingVal ? row.closing : ''}
+                            onChange={(e) =>
+                              handleNumberInput(
+                                item.id,
+                                'closing',
+                                e.target.value,
+                                e.target.validity.badInput,
+                              )
+                            }
+                            className={`min-w-0 flex-1 h-12 text-center font-mono tabular-nums text-xl font-bold rounded-xl border placeholder:text-stone-300 focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:opacity-60 transition-colors ${
+                              isNA
+                                ? 'bg-stone-100 border-stone-200 text-stone-400'
+                                : !hasClosingVal
+                                  ? 'bg-stone-50 border-stone-300 text-stone-800'
+                                  : level === 'agotado' || level === 'comprar'
+                                    ? 'bg-red-50/40 border-red-400 text-stone-900'
+                                    : level === 'medio'
+                                      ? 'bg-amber-50/40 border-amber-400 text-stone-900'
+                                      : 'bg-emerald-50/40 border-emerald-500 text-stone-900'
+                            }`}
+                          />
+                          <motion.button
+                            whileTap={{ scale: 0.94 }}
+                            type="button"
+                            disabled={isLocked || isNA}
+                            onClick={() => stepField(item.id, 'closing', 1)}
+                            aria-label={`Sumar cierre ${item.name}`}
+                            className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
+                          >
+                            <Plus className="w-5 h-5" />
+                          </motion.button>
+                        </div>
+
+                        {!isLocked && (
+                          <div className="grid grid-cols-2 gap-2 pt-0.5">
+                            <button
+                              type="button"
+                              onClick={() => markZeroExplicit(item.id, 'closing')}
+                              className={`min-h-[44px] px-3 py-2 text-xs font-semibold rounded-xl border transition-colors cursor-pointer ${
+                                hasClosingVal && row.closing === 0
+                                  ? 'bg-red-700 text-white border-red-700'
+                                  : 'bg-white text-stone-700 border-stone-200 hover:bg-stone-100'
+                              }`}
+                            >
+                              0 / No queda
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => toggleNotApplicable(item.id)}
+                              className={`min-h-[44px] inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-xl border transition-colors cursor-pointer ${
                                 isNA
                                   ? 'bg-stone-700 text-white border-stone-700'
                                   : 'bg-white text-stone-600 border-stone-200 hover:bg-stone-100'
@@ -1462,215 +1802,30 @@ export function StationShiftView({
                           </div>
                         )}
                       </div>
-                    ) : (
-                      /* CLOSING PHASE OR BOSS VIEW */
-                      <>
-                        <div className="space-y-2">
-                          <label
-                            htmlFor={`mobile-close-${item.id}`}
-                            className="block text-xs font-semibold text-stone-600"
-                          >
-                            ¿Cuánto quedó hoy al cerrar? ({item.unit})
-                          </label>
-                          <div className="flex items-center gap-2">
-                            <motion.button
-                              whileTap={{ scale: 0.93 }}
-                              type="button"
-                              disabled={isLocked || isNA}
-                              onClick={() => stepField(item.id, 'closing', -1)}
-                              aria-label={`Restar ${item.name}`}
-                              className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                            >
-                              <Minus className="w-5 h-5" />
-                            </motion.button>
-                            <input
-                              id={`mobile-close-${item.id}`}
-                              type="number"
-                              inputMode="decimal"
-                              min={0}
-                              step="any"
-                              disabled={isLocked || isNA}
-                              placeholder="—"
-                              value={hasClosingVal ? row.closing : ''}
-                              onChange={(e) =>
-                                handleNumberInput(
-                                  item.id,
-                                  'closing',
-                                  e.target.value,
-                                  e.target.validity.badInput,
-                                )
-                              }
-                              className={`min-w-0 flex-1 h-12 text-center font-mono tabular-nums text-xl font-bold rounded-xl border placeholder:text-stone-300 focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:opacity-60 transition-colors ${inputBorderClass}`}
-                            />
-                            <motion.button
-                              whileTap={{ scale: 0.93 }}
-                              type="button"
-                              disabled={isLocked || isNA}
-                              onClick={() => stepField(item.id, 'closing', 1)}
-                              aria-label={`Sumar ${item.name}`}
-                              className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                            >
-                              <Plus className="w-5 h-5" />
-                            </motion.button>
-                          </div>
-
-                          {!isLocked && (
-                            <div className="grid grid-cols-2 gap-2 pt-0.5">
-                              <button
-                                type="button"
-                                onClick={() => markZeroExplicit(item.id, 'closing')}
-                                className={`min-h-[42px] px-3 py-2 text-xs font-semibold rounded-xl border transition-colors cursor-pointer ${
-                                  hasClosingVal && row.closing === 0
-                                    ? 'bg-red-700 text-white border-red-700'
-                                    : 'bg-white text-stone-700 border-stone-200 hover:bg-stone-100'
-                                }`}
-                              >
-                                0 / No queda
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => toggleNotApplicable(item.id)}
-                                className={`min-h-[42px] inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-xl border transition-colors cursor-pointer ${
-                                  isNA
-                                    ? 'bg-stone-700 text-white border-stone-700'
-                                    : 'bg-white text-stone-600 border-stone-200 hover:bg-stone-100'
-                                }`}
-                              >
-                                <Ban className="w-3.5 h-3.5 shrink-0" />
-                                {isNA ? 'Marcado: No aplica' : 'No aplica hoy'}
-                              </button>
-                            </div>
-                          )}
-                        </div>
-
-                        <AnimatePresence initial={false}>
-                          {showOpeningDetails && !isNA && (
-                            <motion.div
-                              initial={{ opacity: 0, height: 0 }}
-                              animate={{ opacity: 1, height: 'auto' }}
-                              exit={{ opacity: 0, height: 0 }}
-                              className="overflow-hidden"
-                            >
-                              <div className="pt-2.5 border-t border-stone-100 grid grid-cols-2 gap-3">
-                                <div className="min-w-0">
-                                  <label className="block text-xs font-medium text-stone-600 mb-1">
-                                    Inicio del día
-                                  </label>
-                                  <div className="flex items-center gap-1">
-                                    <button
-                                      type="button"
-                                      disabled={isLocked}
-                                      onClick={() => stepField(item.id, 'opening', -1)}
-                                      aria-label={`Restar inicio ${item.name}`}
-                                      className="w-9 h-10 shrink-0 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 disabled:opacity-40 cursor-pointer"
-                                    >
-                                      <Minus className="w-3.5 h-3.5" />
-                                    </button>
-                                    <input
-                                      type="number"
-                                      inputMode="decimal"
-                                      min={0}
-                                      step="any"
-                                      disabled={isLocked}
-                                      placeholder="—"
-                                      value={hasOpeningVal ? row.opening : ''}
-                                      onChange={(e) =>
-                                        handleNumberInput(
-                                          item.id,
-                                          'opening',
-                                          e.target.value,
-                                          e.target.validity.badInput,
-                                        )
-                                      }
-                                      className="min-w-0 w-full h-10 text-center font-mono tabular-nums text-base sm:text-sm font-semibold bg-stone-50 border border-stone-200 rounded-lg"
-                                    />
-                                    <button
-                                      type="button"
-                                      disabled={isLocked}
-                                      onClick={() => stepField(item.id, 'opening', 1)}
-                                      aria-label={`Sumar inicio ${item.name}`}
-                                      className="w-9 h-10 shrink-0 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 disabled:opacity-40 cursor-pointer"
-                                    >
-                                      <Plus className="w-3.5 h-3.5" />
-                                    </button>
-                                  </div>
-                                </div>
-
-                                <div className="min-w-0">
-                                  <label className="block text-xs font-medium text-stone-600 mb-1">
-                                    Surtido hoy (+)
-                                  </label>
-                                  <div className="flex items-center gap-1">
-                                    <button
-                                      type="button"
-                                      disabled={isLocked}
-                                      onClick={() => stepField(item.id, 'added', -1)}
-                                      aria-label={`Restar surtido ${item.name}`}
-                                      className="w-9 h-10 shrink-0 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 disabled:opacity-40 cursor-pointer"
-                                    >
-                                      <Minus className="w-3.5 h-3.5" />
-                                    </button>
-                                    <input
-                                      type="number"
-                                      inputMode="decimal"
-                                      min={0}
-                                      step="any"
-                                      disabled={isLocked}
-                                      value={row.added}
-                                      onChange={(e) =>
-                                        handleNumberInput(
-                                          item.id,
-                                          'added',
-                                          e.target.value,
-                                          e.target.validity.badInput,
-                                        )
-                                      }
-                                      className="min-w-0 w-full h-10 text-center font-mono tabular-nums text-base sm:text-sm font-semibold bg-stone-50 border border-stone-200 rounded-lg"
-                                    />
-                                    <button
-                                      type="button"
-                                      disabled={isLocked}
-                                      onClick={() => stepField(item.id, 'added', 1)}
-                                      aria-label={`Sumar surtido ${item.name}`}
-                                      className="w-9 h-10 shrink-0 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 disabled:opacity-40 cursor-pointer"
-                                    >
-                                      <Plus className="w-3.5 h-3.5" />
-                                    </button>
-                                  </div>
-                                </div>
-                              </div>
-                            </motion.div>
-                          )}
-                        </AnimatePresence>
-                      </>
                     )}
                   </div>
                 );
               })}
             </div>
 
-            {/* Desktop Spacious Table */}
+            {/* Desktop Table (>= lg) — Inicio y surtido SIEMPRE visibles antes del cierre */}
             <div className="hidden lg:block overflow-x-auto">
               <table className="w-full text-left border-collapse">
                 <thead>
                   <tr className="border-b border-stone-200 bg-stone-50 text-xs font-semibold text-stone-600">
                     <th className="py-3.5 px-5 min-w-[210px]">Insumo</th>
-                    {(isWorkerOpeningPhase || showOpeningDetails) && (
-                      <>
-                        <th className="py-3.5 px-3 text-center">Inicio del día</th>
-                        <th className="py-3.5 px-3 text-center">Surtido (+)</th>
-                      </>
-                    )}
+                    <th className="py-3.5 px-3 text-center">Inicio del día</th>
+                    <th className="py-3.5 px-3 text-center">Surtido (+)</th>
                     {isWorkerOpeningPhase ? (
                       <>
-                        <th className="py-3.5 px-4 text-center">Opciones</th>
+                        <th className="py-3.5 px-4 text-center">Confirmación y opciones</th>
                         <th className="py-3.5 px-5 text-right">Total disponible</th>
                       </>
                     ) : (
                       <>
                         <th className="py-3.5 px-4 text-center">¿Cuánto quedó hoy? (Cierre)</th>
                         <th className="py-3.5 px-3 text-center">Opciones</th>
-                        {showOpeningDetails && <th className="py-3.5 px-4 text-right">Consumo</th>}
+                        <th className="py-3.5 px-4 text-right">Consumo</th>
                         <th className="py-3.5 px-5">Estado / Alerta</th>
                       </>
                     )}
@@ -1691,11 +1846,14 @@ export function StationShiftView({
                       hasClosing: false,
                       notApplicable: false,
                     };
+
                     const isNA = Boolean(row.notApplicable);
-                    const hasOpeningVal = row.hasOpening && !isNA;
+                    const openingState = getOpeningRowState(row);
+                    const isPendingConfirm = openingState === 'pending_confirm';
+                    const showOpeningNumber = !isNA && (row.hasOpening || isPendingConfirm);
                     const hasValue = row.hasClosing && !isNA;
                     const consumed =
-                      hasOpeningVal && hasValue
+                      row.hasOpening && hasValue
                         ? Math.max(0, row.opening + row.added - row.closing)
                         : null;
                     const level = getStockLevel(row.closing, item.minStock);
@@ -1705,23 +1863,30 @@ export function StationShiftView({
                       item.minStock,
                       item.targetStock,
                     );
-
                     const rowAnomalies = detectEntryAnomalies(row, draftMode);
 
                     return (
                       <tr
                         key={item.id}
-                        className={`transition-colors ${isNA ? 'bg-stone-50/90' : 'hover:bg-stone-50/70'}`}
+                        className={`transition-colors ${
+                          isNA
+                            ? 'bg-stone-50/90'
+                            : isPendingConfirm
+                              ? 'bg-sky-50/45 hover:bg-sky-50/70'
+                              : 'hover:bg-stone-50/70'
+                        }`}
                       >
                         <td className="py-4 px-5">
-                          <div className="text-base font-semibold text-stone-900">
-                            {item.name}
-                          </div>
-                          <div className="text-xs text-stone-500 font-mono tabular-nums mt-0.5">
-                            {item.unit} · Mínimo: {item.minStock}
-                            {!isWorkerOpeningPhase && !showOpeningDetails && hasOpeningVal
-                              ? ` · Base día: ${row.opening + row.added}`
-                              : ''}
+                          <div className="text-base font-semibold text-stone-900">{item.name}</div>
+                          <div className="text-xs text-stone-500 font-mono tabular-nums mt-0.5 flex flex-wrap items-center gap-x-1.5">
+                            <span>
+                              {item.unit} · Mín: {item.minStock}
+                            </span>
+                            {typeof row.previousClosing === 'number' && (
+                              <span className="text-sky-800 font-semibold">
+                                · Ayer quedó: {row.previousClosing}
+                              </span>
+                            )}
                           </div>
                           {rowAnomalies.length > 0 && (
                             <div className="inline-flex items-center gap-1 mt-1 text-xs font-medium text-amber-700">
@@ -1731,90 +1896,117 @@ export function StationShiftView({
                           )}
                         </td>
 
-                        {(isWorkerOpeningPhase || showOpeningDetails) && (
-                          <>
-                            <td className="py-4 px-3">
-                              <div className="flex items-center justify-center gap-1">
-                                <button
-                                  type="button"
-                                  disabled={isLocked || isNA}
-                                  onClick={() => stepField(item.id, 'opening', -1)}
-                                  aria-label={`Restar inicio de ${item.name}`}
-                                  className="w-9 h-10 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                                >
-                                  <Minus className="w-3.5 h-3.5" />
-                                </button>
-                                <input
-                                  type="number"
-                                  min={0}
-                                  step="any"
-                                  disabled={isLocked || isNA}
-                                  placeholder="—"
-                                  aria-label={`Inicio de ${item.name}`}
-                                  value={hasOpeningVal ? row.opening : ''}
-                                  onChange={(e) =>
-                                    handleNumberInput(
-                                      item.id,
-                                      'opening',
-                                      e.target.value,
-                                      e.target.validity.badInput,
-                                    )
-                                  }
-                                  className="w-16 h-10 text-center font-mono tabular-nums text-sm font-medium bg-stone-50 border border-stone-200 rounded-lg placeholder:text-stone-300 focus:outline-none focus:ring-2 focus:ring-orange-500 focus:bg-white disabled:opacity-60"
-                                />
-                                <button
-                                  type="button"
-                                  disabled={isLocked || isNA}
-                                  onClick={() => stepField(item.id, 'opening', 1)}
-                                  aria-label={`Sumar inicio de ${item.name}`}
-                                  className="w-9 h-10 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                                >
-                                  <Plus className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
-                            </td>
+                        {/* Inicio del día + "✓ Está bien" si pendiente */}
+                        <td className="py-4 px-3">
+                          <div className="flex flex-col items-center gap-1.5">
+                            <div className="flex items-center justify-center gap-1">
+                              <button
+                                type="button"
+                                disabled={isLocked || isNA}
+                                onClick={() => stepField(item.id, 'opening', -1)}
+                                aria-label={`Restar inicio de ${item.name}`}
+                                className="w-9 h-10 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
+                              >
+                                <Minus className="w-3.5 h-3.5" />
+                              </button>
+                              <input
+                                type="number"
+                                min={0}
+                                step="any"
+                                disabled={isLocked || isNA}
+                                placeholder="—"
+                                aria-label={`Inicio de ${item.name}`}
+                                value={showOpeningNumber ? row.opening : ''}
+                                onChange={(e) =>
+                                  handleNumberInput(
+                                    item.id,
+                                    'opening',
+                                    e.target.value,
+                                    e.target.validity.badInput,
+                                  )
+                                }
+                                className={`w-16 h-10 text-center font-mono tabular-nums text-sm font-bold rounded-lg border placeholder:text-stone-300 focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:opacity-60 ${
+                                  isPendingConfirm
+                                    ? 'bg-sky-50 border-sky-400 text-sky-950'
+                                    : openingState === 'adjusted'
+                                      ? 'bg-orange-50 border-orange-400 text-stone-900'
+                                      : row.hasOpening
+                                        ? 'bg-emerald-50/50 border-emerald-500 text-stone-900'
+                                        : 'bg-stone-50 border-stone-200 text-stone-900'
+                                }`}
+                              />
+                              <button
+                                type="button"
+                                disabled={isLocked || isNA}
+                                onClick={() => stepField(item.id, 'opening', 1)}
+                                aria-label={`Sumar inicio de ${item.name}`}
+                                className="w-9 h-10 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
+                              >
+                                <Plus className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
 
-                            <td className="py-4 px-3">
-                              <div className="flex items-center justify-center gap-1">
-                                <button
-                                  type="button"
-                                  disabled={isLocked || isNA}
-                                  onClick={() => stepField(item.id, 'added', -1)}
-                                  aria-label={`Restar surtido de ${item.name}`}
-                                  className="w-9 h-10 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                                >
-                                  <Minus className="w-3.5 h-3.5" />
-                                </button>
-                                <input
-                                  type="number"
-                                  min={0}
-                                  step="any"
-                                  disabled={isLocked || isNA}
-                                  aria-label={`Surtido de ${item.name}`}
-                                  value={isNA ? '' : row.added}
-                                  onChange={(e) =>
-                                    handleNumberInput(
-                                      item.id,
-                                      'added',
-                                      e.target.value,
-                                      e.target.validity.badInput,
-                                    )
-                                  }
-                                  className="w-16 h-10 text-center font-mono tabular-nums text-sm bg-stone-50 border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500 focus:bg-white disabled:opacity-60"
-                                />
-                                <button
-                                  type="button"
-                                  disabled={isLocked || isNA}
-                                  onClick={() => stepField(item.id, 'added', 1)}
-                                  aria-label={`Sumar surtido de ${item.name}`}
-                                  className="w-9 h-10 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                                >
-                                  <Plus className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
-                            </td>
-                          </>
-                        )}
+                            {isPendingConfirm && !isLocked ? (
+                              <button
+                                type="button"
+                                onClick={() => confirmSingleOpening(item.id)}
+                                className="min-h-[34px] inline-flex items-center gap-1 px-2.5 py-1 text-xs font-bold text-white bg-sky-600 rounded-lg hover:bg-sky-700 whitespace-nowrap cursor-pointer"
+                              >
+                                <Check className="w-3.5 h-3.5" />
+                                ✓ Está bien
+                              </button>
+                            ) : !isNA && openingState === 'adjusted' ? (
+                              <span className="text-[11px] font-semibold text-orange-700">
+                                Corregido
+                              </span>
+                            ) : !isNA && openingState === 'confirmed' ? (
+                              <span className="text-[11px] font-semibold text-emerald-700">
+                                Confirmado
+                              </span>
+                            ) : null}
+                          </div>
+                        </td>
+
+                        {/* Surtido (+) */}
+                        <td className="py-4 px-3">
+                          <div className="flex items-center justify-center gap-1">
+                            <button
+                              type="button"
+                              disabled={isLocked || isNA}
+                              onClick={() => stepField(item.id, 'added', -1)}
+                              aria-label={`Restar surtido de ${item.name}`}
+                              className="w-9 h-10 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
+                            >
+                              <Minus className="w-3.5 h-3.5" />
+                            </button>
+                            <input
+                              type="number"
+                              min={0}
+                              step="any"
+                              disabled={isLocked || isNA}
+                              aria-label={`Surtido de ${item.name}`}
+                              value={isNA ? '' : row.added}
+                              onChange={(e) =>
+                                handleNumberInput(
+                                  item.id,
+                                  'added',
+                                  e.target.value,
+                                  e.target.validity.badInput,
+                                )
+                              }
+                              className="w-16 h-10 text-center font-mono tabular-nums text-sm bg-stone-50 border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500 focus:bg-white disabled:opacity-60"
+                            />
+                            <button
+                              type="button"
+                              disabled={isLocked || isNA}
+                              onClick={() => stepField(item.id, 'added', 1)}
+                              aria-label={`Sumar surtido de ${item.name}`}
+                              className="w-9 h-10 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
+                            >
+                              <Plus className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </td>
 
                         {isWorkerOpeningPhase ? (
                           <>
@@ -1824,8 +2016,8 @@ export function StationShiftView({
                                   type="button"
                                   disabled={isLocked}
                                   onClick={() => markZeroExplicit(item.id, 'opening')}
-                                  className={`min-h-[36px] px-2.5 py-1 text-xs font-semibold rounded-lg border whitespace-nowrap cursor-pointer disabled:opacity-50 ${
-                                    hasOpeningVal && row.opening === 0
+                                  className={`min-h-[38px] px-2.5 py-1 text-xs font-semibold rounded-lg border whitespace-nowrap cursor-pointer disabled:opacity-50 ${
+                                    row.hasOpening && !isNA && row.opening === 0
                                       ? 'bg-stone-900 text-white border-stone-900'
                                       : 'bg-white text-stone-700 border-stone-200 hover:bg-stone-100'
                                   }`}
@@ -1836,7 +2028,7 @@ export function StationShiftView({
                                   type="button"
                                   disabled={isLocked}
                                   onClick={() => toggleNotApplicable(item.id)}
-                                  className={`min-h-[36px] px-2.5 py-1 text-xs font-semibold rounded-lg border whitespace-nowrap cursor-pointer disabled:opacity-50 ${
+                                  className={`min-h-[38px] px-2.5 py-1 text-xs font-semibold rounded-lg border whitespace-nowrap cursor-pointer disabled:opacity-50 ${
                                     isNA
                                       ? 'bg-stone-700 text-white border-stone-700'
                                       : 'bg-white text-stone-600 border-stone-200 hover:bg-stone-100'
@@ -1846,12 +2038,18 @@ export function StationShiftView({
                                 </button>
                               </div>
                             </td>
-                            <td className="py-4 px-5 text-right font-mono tabular-nums font-bold text-stone-900">
-                              {isNA
-                                ? 'No aplica'
-                                : hasOpeningVal
-                                  ? `${row.opening + row.added} ${item.unit}`
-                                  : 'Por contar'}
+                            <td className="py-4 px-5 text-right font-mono tabular-nums font-bold">
+                              {isNA ? (
+                                <span className="text-stone-500 font-normal">No aplica</span>
+                              ) : isPendingConfirm ? (
+                                <span className="text-sky-700">Por confirmar</span>
+                              ) : row.hasOpening ? (
+                                <span className="text-stone-900">
+                                  {row.opening + row.added} {item.unit}
+                                </span>
+                              ) : (
+                                <span className="text-stone-400 font-normal">Por contar</span>
+                              )}
                             </td>
                           </>
                         ) : (
@@ -1859,7 +2057,7 @@ export function StationShiftView({
                             <td className="py-4 px-4">
                               <div className="flex items-center justify-center gap-1.5">
                                 <motion.button
-                                  whileTap={{ scale: 0.93 }}
+                                  whileTap={{ scale: 0.94 }}
                                   type="button"
                                   disabled={isLocked || isNA}
                                   onClick={() => stepField(item.id, 'closing', -1)}
@@ -1893,7 +2091,7 @@ export function StationShiftView({
                                   }`}
                                 />
                                 <motion.button
-                                  whileTap={{ scale: 0.93 }}
+                                  whileTap={{ scale: 0.94 }}
                                   type="button"
                                   disabled={isLocked || isNA}
                                   onClick={() => stepField(item.id, 'closing', 1)}
@@ -1934,16 +2132,18 @@ export function StationShiftView({
                               </div>
                             </td>
 
-                            {showOpeningDetails && (
-                              <td className="py-4 px-4 text-right font-mono tabular-nums text-stone-700">
-                                {consumed !== null ? `${consumed} ${item.unit}` : '—'}
-                              </td>
-                            )}
+                            <td className="py-4 px-4 text-right font-mono tabular-nums text-stone-700">
+                              {consumed !== null ? `${consumed} ${item.unit}` : '—'}
+                            </td>
 
                             <td className="py-4 px-5 whitespace-nowrap">
                               {isNA ? (
                                 <span className="text-xs font-semibold text-stone-500">
                                   No aplica hoy
+                                </span>
+                              ) : isPendingConfirm ? (
+                                <span className="text-xs font-bold text-sky-700">
+                                  Inicio por confirmar
                                 </span>
                               ) : !hasValue ? (
                                 <span className="text-xs font-medium text-stone-400">
@@ -1979,7 +2179,7 @@ export function StationShiftView({
         )}
       </div>
 
-      {/* Notes & Primary Save Footer */}
+      {/* Notes & Desktop Save Section */}
       {stationItems.length > 0 && (
         <div className="bg-white border border-stone-200 rounded-2xl p-4 sm:p-5 space-y-4">
           <div>
@@ -2020,20 +2220,15 @@ export function StationShiftView({
                 <button
                   type="button"
                   onClick={syncDraftsWithServer}
-                  className="min-h-[40px] px-3.5 py-2 text-xs font-semibold text-stone-800 bg-white border border-stone-300 rounded-xl hover:bg-stone-100 cursor-pointer"
+                  className="min-h-[42px] px-3.5 py-2 text-xs font-semibold text-stone-800 bg-white border border-stone-300 rounded-xl hover:bg-stone-100 cursor-pointer"
                 >
                   Aceptar versión del servidor
                 </button>
                 <button
                   type="button"
                   disabled={savingMode !== null}
-                  onClick={() =>
-                    handleSave(pendingConflict.mode, {
-                      forceOverwrite: true,
-                      skipAnomalyCheck: true,
-                    })
-                  }
-                  className="min-h-[40px] px-3.5 py-2 text-xs font-semibold text-white bg-red-700 rounded-xl hover:bg-red-800 disabled:opacity-50 cursor-pointer"
+                  onClick={() => executeSave(pendingConflict.mode, { forceOverwrite: true })}
+                  className="min-h-[42px] px-3.5 py-2 text-xs font-semibold text-white bg-red-700 rounded-xl hover:bg-red-800 disabled:opacity-50 cursor-pointer"
                 >
                   Sobrescribir con mis conteos
                 </button>
@@ -2041,53 +2236,19 @@ export function StationShiftView({
             </div>
           )}
 
-          {pendingAnomalyConfirm && !isLocked && (
-            <div className="p-4 rounded-xl bg-amber-50 border border-amber-200 space-y-3">
-              <div className="flex items-start gap-2.5 text-sm text-amber-950">
-                <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                <div className="space-y-1">
-                  <p className="font-semibold">
-                    Verifica {pendingAnomalyConfirm.anomalies.length}{' '}
-                    {pendingAnomalyConfirm.anomalies.length === 1 ? 'cantidad inusual' : 'cantidades inusuales'} antes de enviar
-                  </p>
-                  <ul className="text-xs text-amber-900 space-y-1 list-disc pl-4">
-                    {pendingAnomalyConfirm.anomalies.slice(0, 5).map((a) => (
-                      <li key={`${a.itemId}-${a.type}`}>
-                        <strong>{a.itemName}:</strong> {a.message}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  onClick={() => setPendingAnomalyConfirm(null)}
-                  className="min-h-[40px] px-3.5 py-2 text-xs font-semibold text-stone-800 bg-white border border-stone-300 rounded-xl hover:bg-stone-100 cursor-pointer"
-                >
-                  Revisar conteos
-                </button>
-                <button
-                  type="button"
-                  disabled={savingMode !== null}
-                  onClick={() =>
-                    handleSave(pendingAnomalyConfirm.mode, {
-                      skipAnomalyCheck: true,
-                    })
-                  }
-                  className="min-h-[40px] px-3.5 py-2 text-xs font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 disabled:opacity-50 cursor-pointer"
-                >
-                  Confirmar y enviar así
-                </button>
-              </div>
-            </div>
-          )}
-
-          {!isLocked && !allAccounted && (
+          {!isLocked && !primaryBlockStatus.ok && (
             <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2.5 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900">
               <span>
-                <strong>{countedCount} de {stationItems.length} contados.</strong> Faltan{' '}
-                {missingCount} {missingCount === 1 ? 'insumo' : 'insumos'} para poder enviar.
+                {counts.pendingConfirm > 0 ? (
+                  <>
+                    <strong>{counts.pendingConfirm} por confirmar</strong> respecto a ayer. Confírmalos o corrígelos para habilitar el envío.
+                  </>
+                ) : (
+                  <>
+                    <strong>{counts.accounted} de {counts.total} listos.</strong> Faltan{' '}
+                    {counts.missingCount} {counts.missingCount === 1 ? 'insumo' : 'insumos'} por contar.
+                  </>
+                )}
               </span>
               <button
                 type="button"
@@ -2097,25 +2258,28 @@ export function StationShiftView({
                 }}
                 className="font-bold text-orange-700 underline hover:text-orange-900 cursor-pointer"
               >
-                Ver los {missingCount} faltantes
+                Ver pendientes
               </button>
             </div>
           )}
 
-          <div className="flex flex-col-reverse sm:flex-row sm:items-center justify-end gap-3">
+          {/* Desktop Action Row */}
+          <div className="hidden lg:flex items-center justify-end gap-3">
             {isWorkerOpeningPhase ? (
               <button
                 type="button"
-                disabled={isLocked || savingMode !== null || !allAccounted}
-                onClick={() => handleSave('opening')}
-                className="min-h-[48px] inline-flex items-center justify-center gap-2 px-6 py-3 text-sm sm:text-base font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.99] disabled:opacity-50 disabled:cursor-not-allowed transition-all whitespace-nowrap shrink-0 cursor-pointer"
+                disabled={isLocked || savingMode !== null || !primaryBlockStatus.ok}
+                onClick={() => requestSaveWithConfirmation('opening')}
+                className="min-h-[48px] inline-flex items-center justify-center gap-2 px-6 py-3 text-base font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.99] disabled:opacity-50 disabled:cursor-not-allowed transition-all whitespace-nowrap shrink-0 cursor-pointer"
               >
                 <Save className="w-5 h-5" />
                 {savingMode === 'opening'
                   ? 'Guardando apertura...'
-                  : allAccounted
-                    ? 'Guardar apertura y surtido'
-                    : `Faltan ${missingCount} por contar`}
+                  : counts.pendingConfirm > 0
+                    ? `${counts.pendingConfirm} por confirmar`
+                    : counts.missingOpening > 0
+                      ? `Faltan ${counts.missingOpening} por contar`
+                      : 'Guardar apertura y surtido'}
               </button>
             ) : (
               <>
@@ -2123,7 +2287,7 @@ export function StationShiftView({
                   <button
                     type="button"
                     disabled={isLocked || savingMode !== null}
-                    onClick={() => handleSave('opening')}
+                    onClick={() => requestSaveWithConfirmation('opening')}
                     className="min-h-[48px] inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-semibold text-stone-700 bg-white border border-stone-300 rounded-xl hover:bg-stone-100 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                   >
                     <Save className="w-4 h-4" />
@@ -2133,22 +2297,81 @@ export function StationShiftView({
 
                 <button
                   type="button"
-                  disabled={isLocked || savingMode !== null || !allAccounted}
-                  onClick={() => handleSave('closing')}
-                  className="min-h-[48px] inline-flex items-center justify-center gap-2 px-6 py-3 text-sm sm:text-base font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.99] disabled:opacity-50 disabled:cursor-not-allowed transition-all whitespace-nowrap shrink-0 cursor-pointer"
+                  disabled={isLocked || savingMode !== null || !primaryBlockStatus.ok}
+                  onClick={() => requestSaveWithConfirmation('closing')}
+                  className="min-h-[48px] inline-flex items-center justify-center gap-2 px-6 py-3 text-base font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.99] disabled:opacity-50 disabled:cursor-not-allowed transition-all whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   <CheckCircle2 className="w-5 h-5" />
                   {savingMode === 'closing'
                     ? 'Enviando cierre...'
-                    : allAccounted
-                      ? 'Enviar cierre del día al jefe'
-                      : `Faltan ${missingCount} por contar`}
+                    : counts.pendingConfirm > 0
+                      ? `${counts.pendingConfirm} por confirmar`
+                      : counts.missingClosing > 0
+                        ? `Faltan ${counts.missingClosing} por contar`
+                        : 'Enviar cierre del día al jefe'}
                 </button>
               </>
             )}
           </div>
         </div>
       )}
+
+      {/* Mobile Sticky Bottom CTA Bar (compact <= 15% mobile viewport height) */}
+      {stationItems.length > 0 && !isLocked && (
+        <div className="lg:hidden fixed bottom-0 left-0 right-0 z-30 bg-white/95 backdrop-blur-md border-t border-stone-200 px-4 py-2.5 shadow-lg no-print">
+          <div className="max-w-lg mx-auto flex items-center gap-3">
+            <div className="min-w-0 flex-1">
+              <p className="text-xs font-mono tabular-nums font-bold text-stone-900 truncate">
+                {counts.pendingConfirm > 0
+                  ? `${counts.pendingConfirm} por confirmar`
+                  : counts.missingCount > 0
+                    ? `Faltan ${counts.missingCount} por contar`
+                    : `${counts.total} de ${counts.total} listos`}
+              </p>
+              <p className="text-[11px] text-stone-500 truncate">
+                {isWorkerOpeningPhase ? 'Apertura del día' : 'Cierre del día'}
+              </p>
+            </div>
+
+            <button
+              type="button"
+              disabled={savingMode !== null || !primaryBlockStatus.ok}
+              onClick={() => requestSaveWithConfirmation(draftMode)}
+              className="min-h-[46px] px-4 py-2.5 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed transition-all whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              {savingMode !== null
+                ? 'Guardando...'
+                : counts.pendingConfirm > 0
+                  ? `${counts.pendingConfirm} por confirmar`
+                  : counts.missingCount > 0
+                    ? `Faltan ${counts.missingCount}`
+                    : isWorkerOpeningPhase
+                      ? 'Guardar apertura'
+                      : 'Enviar cierre'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Pre-Submit Summary Confirmation Dialog */}
+      <ShiftSubmitConfirmModal
+        open={confirmModalState !== null}
+        mode={confirmModalState?.mode ?? draftMode}
+        stationName={station.name}
+        totalItems={counts.total}
+        confirmedMatchCount={counts.confirmedMatch}
+        adjustedCount={counts.adjusted}
+        zeroCount={
+          confirmModalState?.mode === 'opening' ? counts.zeroOpening : counts.zeroClosing
+        }
+        naCount={counts.naCount}
+        anomalies={confirmModalState?.anomalies ?? []}
+        saving={savingMode !== null}
+        onCancel={() => setConfirmModalState(null)}
+        onConfirm={() =>
+          confirmModalState && executeSave(confirmModalState.mode)
+        }
+      />
     </div>
   );
 }

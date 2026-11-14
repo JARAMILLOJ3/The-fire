@@ -627,6 +627,7 @@ export default function App() {
                           setCatalogFilterStation('all');
                           navigateTo('catalogo');
                         }}
+                        onGoToTeam={() => navigateTo('equipo')}
                         onOpenScheduleModal={() => setScheduleModalOpen(true)}
                       />
                     ) : activeSection === 'puestos' && canManage ? (

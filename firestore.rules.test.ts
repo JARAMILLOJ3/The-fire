@@ -529,5 +529,35 @@ describe('Firestore Security Rules (Emulator Suite)', () => {
         updatedAt: serverTimestamp(),
       }),
     );
+
+    // Opening audit metadata on an open report: valid values succeed, tampered/invalid values fail
+    await assertSucceeds(
+      updateDoc(doc(bossDb, 'dailyReports', `${WS_ID}_${opDate}_mesera`), {
+        status: 'opening_saved',
+        reportedByUid: OWNER_UID,
+        reportedByName: 'Jefe',
+        notes: 'reabierto',
+        updatedAt: serverTimestamp(),
+      }),
+    );
+    await assertSucceeds(
+      updateDoc(doc(workerDb, 'dailyReports', `${WS_ID}_${opDate}_mesera`, 'entries', 'mesera_1'), {
+        opening: 5,
+        hasOpening: true,
+        previousClosing: 5,
+        openingStatus: 'confirmed_match',
+        updatedByUid: WORKER_UID,
+        updatedByName: 'Ana',
+        updatedAt: serverTimestamp(),
+      }),
+    );
+    await assertFails(
+      updateDoc(doc(workerDb, 'dailyReports', `${WS_ID}_${opDate}_mesera`, 'entries', 'mesera_1'), {
+        openingStatus: 'hacked',
+        updatedByUid: WORKER_UID,
+        updatedByName: 'Ana',
+        updatedAt: serverTimestamp(),
+      }),
+    );
   });
 });

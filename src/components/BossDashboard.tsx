@@ -1,19 +1,24 @@
 import { useMemo, useState } from 'react';
-import { motion } from 'motion/react';
+import { AnimatePresence, motion } from 'motion/react';
 import {
   AlertTriangle,
   ArrowRight,
   CalendarClock,
   Check,
   CheckCircle2,
+  ChevronDown,
   Clock,
   Copy,
   Download,
+  GitCompareArrows,
   MessageSquareText,
+  Package,
   Printer,
   QrCode,
   Search,
+  Settings,
   ShoppingBag,
+  Users,
 } from 'lucide-react';
 import type {
   ConsolidatedItemRow,
@@ -52,17 +57,46 @@ interface BossDashboardProps {
   onOpenStation: (stationId: StationId) => void;
   onGoToWorkstations: () => void;
   onGoToCatalog: () => void;
+  onGoToTeam: () => void;
   onOpenScheduleModal: () => void;
 }
 
 type ViewTab = 'compras' | 'completo';
 type StockFilter = 'todos' | 'comprar' | 'medio' | 'suficiente' | 'sin_dato';
 
+interface OpeningDiffItem {
+  itemId: string;
+  itemName: string;
+  unit: string;
+  stationId: StationId;
+  stationName: string;
+  previousClosing: number;
+  opening: number;
+  delta: number;
+}
+
+interface GroupedShoppingSection {
+  stationId: string;
+  stationName: string;
+  workerName: string;
+  rows: ConsolidatedItemRow[];
+}
+
 function getTimeGreeting(): string {
   const hour = getBogotaNowParts().hour;
   if (hour < 12) return 'Buenos días';
   if (hour < 19) return 'Buenas tardes';
   return 'Buenas noches';
+}
+
+function formatQty(val: number): string {
+  const rounded = Math.round(val * 100) / 100;
+  return Number.isInteger(rounded) ? String(rounded) : String(rounded);
+}
+
+function formatSignedDelta(delta: number): string {
+  const rounded = Math.round(delta * 100) / 100;
+  return rounded > 0 ? `+${rounded}` : String(rounded);
 }
 
 export function BossDashboard({
@@ -82,6 +116,7 @@ export function BossDashboard({
   onOpenStation,
   onGoToWorkstations,
   onGoToCatalog,
+  onGoToTeam,
   onOpenScheduleModal,
 }: BossDashboardProps) {
   const [viewTab, setViewTab] = useState<ViewTab>('compras');
@@ -89,6 +124,7 @@ export function BossDashboard({
   const [stockFilter, setStockFilter] = useState<StockFilter>('todos');
   const [searchTerm, setSearchTerm] = useState('');
   const [copiedToast, setCopiedToast] = useState(false);
+  const [configOpen, setConfigOpen] = useState(false);
 
   const normalizedSchedule = useMemo(
     () => normalizeShiftSchedule(shiftSchedule),
@@ -112,6 +148,7 @@ export function BossDashboard({
     const completedStations = stations.filter(
       (s) => reportsByStation[s.id]?.status === 'completed',
     ).length;
+    const missingStations = Math.max(0, stations.length - completedStations);
     const anyReportedStations = stations.filter((s) => Boolean(reportsByStation[s.id])).length;
     const toBuy = consolidatedRows.filter(
       (r) => r.hasCountedClosing && (r.stockLevel === 'agotado' || r.stockLevel === 'comprar'),
@@ -129,6 +166,7 @@ export function BossDashboard({
 
     return {
       completedStations,
+      missingStations,
       anyReportedStations,
       toBuy,
       lowSoon,
@@ -137,6 +175,54 @@ export function BossDashboard({
       pendingCount,
     };
   }, [consolidatedRows, reportsByStation, stations]);
+
+  const openingAudit = useMemo(() => {
+    let confirmedMatchCount = 0;
+    const adjustedItems: OpeningDiffItem[] = [];
+    const byStation: Record<string, { confirmedMatch: number; adjusted: number }> = {};
+
+    consolidatedRows.forEach((row) => {
+      const entry = row.entry;
+      if (!entry || !entry.hasOpening || entry.notApplicable) return;
+
+      if (!byStation[row.item.station]) {
+        byStation[row.item.station] = { confirmedMatch: 0, adjusted: 0 };
+      }
+
+      const hasPrev = typeof entry.previousClosing === 'number';
+      const isAdjusted =
+        entry.openingStatus === 'adjusted' ||
+        (hasPrev && entry.opening !== entry.previousClosing);
+      const isConfirmedMatch =
+        entry.openingStatus === 'confirmed_match' ||
+        (hasPrev && entry.opening === entry.previousClosing);
+
+      if (isAdjusted && hasPrev) {
+        const prev = entry.previousClosing as number;
+        byStation[row.item.station].adjusted += 1;
+        adjustedItems.push({
+          itemId: row.item.id,
+          itemName: row.item.name,
+          unit: row.item.unit,
+          stationId: row.item.station,
+          stationName: stationMap[row.item.station]?.name ?? row.item.station,
+          previousClosing: prev,
+          opening: entry.opening,
+          delta: Math.round((entry.opening - prev) * 100) / 100,
+        });
+      } else if (isConfirmedMatch) {
+        confirmedMatchCount += 1;
+        byStation[row.item.station].confirmedMatch += 1;
+      }
+    });
+
+    return {
+      confirmedMatchCount,
+      adjustedItems,
+      byStation,
+      hasAuditData: confirmedMatchCount > 0 || adjustedItems.length > 0,
+    };
+  }, [consolidatedRows, stationMap]);
 
   const stationNotes = useMemo(() => {
     return stations
@@ -192,6 +278,53 @@ export function BossDashboard({
     });
   }, [filteredRows]);
 
+  const groupedShoppingSections = useMemo<GroupedShoppingSection[]>(() => {
+    const byStation = new Map<string, ConsolidatedItemRow[]>();
+    sortedShoppingRows.forEach((row) => {
+      const list = byStation.get(row.item.station) ?? [];
+      list.push(row);
+      byStation.set(row.item.station, list);
+    });
+
+    const priority: Record<ConsolidatedItemRow['stockLevel'], number> = {
+      agotado: 0,
+      comprar: 1,
+      medio: 2,
+      suficiente: 3,
+      sin_dato: 4,
+    };
+
+    const sections: GroupedShoppingSection[] = [];
+    const seen = new Set<string>();
+
+    stations.forEach((st) => {
+      const rows = byStation.get(st.id);
+      if (!rows || rows.length === 0) return;
+      seen.add(st.id);
+      sections.push({
+        stationId: st.id,
+        stationName: st.name,
+        workerName: st.workerName,
+        rows: [...rows].sort(
+          (a, b) =>
+            priority[a.stockLevel] - priority[b.stockLevel] || a.item.sortOrder - b.item.sortOrder,
+        ),
+      });
+    });
+
+    byStation.forEach((rows, stId) => {
+      if (seen.has(stId) || rows.length === 0) return;
+      sections.push({
+        stationId: stId,
+        stationName: stationMap[stId]?.name ?? stId,
+        workerName: stationMap[stId]?.workerName ?? 'Equipo',
+        rows,
+      });
+    });
+
+    return sections;
+  }, [sortedShoppingRows, stations, stationMap]);
+
   const handleCopyWhatsApp = async () => {
     const text = buildWhatsAppShoppingList(selectedDate, consolidatedRows, stations);
     try {
@@ -239,32 +372,16 @@ export function BossDashboard({
           <button
             type="button"
             onClick={handleCopyWhatsApp}
-            className="min-h-[42px] inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.98] transition-all whitespace-nowrap shrink-0 cursor-pointer"
+            className="min-h-[44px] inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.98] transition-all whitespace-nowrap shrink-0 cursor-pointer"
           >
             {copiedToast ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
             {copiedToast ? 'Lista copiada' : 'Copiar lista WhatsApp'}
           </button>
           <button
             type="button"
-            onClick={onOpenScheduleModal}
-            className="min-h-[42px] inline-flex items-center gap-2 px-3.5 py-2 text-sm font-medium text-stone-800 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            <Clock className="w-4 h-4 text-orange-600" />
-            Horarios
-          </button>
-          <button
-            type="button"
-            onClick={onGoToWorkstations}
-            className="min-h-[42px] inline-flex items-center gap-2 px-3.5 py-2 text-sm font-medium text-stone-800 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            <QrCode className="w-4 h-4 text-orange-600" />
-            Puestos y QR
-          </button>
-          <button
-            type="button"
             onClick={handleExportCsv}
             aria-label="Exportar CSV"
-            className="min-h-[42px] inline-flex items-center gap-1.5 px-3 py-2 text-sm font-medium text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            className="min-h-[44px] inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-medium text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
             <Download className="w-4 h-4" />
             <span>CSV</span>
@@ -273,29 +390,12 @@ export function BossDashboard({
             type="button"
             onClick={() => window.print()}
             aria-label="Imprimir reporte"
-            className="min-h-[42px] inline-flex items-center gap-1.5 px-3 py-2 text-sm font-medium text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            className="min-h-[44px] inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-medium text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
             <Printer className="w-4 h-4" />
             <span className="hidden sm:inline">Imprimir</span>
           </button>
         </div>
-      </div>
-
-      {/* Compact Worker Schedule Bar */}
-      <div className="bg-white border border-stone-200 rounded-2xl px-4 py-3 flex flex-wrap items-center justify-between gap-2 text-xs sm:text-sm no-print">
-        <div className="flex items-center gap-2 text-stone-700 min-w-0">
-          <Clock className="w-4 h-4 text-orange-600 shrink-0" />
-          <span className="font-medium truncate">
-            Horario trabajadoras: <strong className="text-stone-900">{scheduleSummaryLabel}</strong>
-          </span>
-        </div>
-        <button
-          type="button"
-          onClick={onOpenScheduleModal}
-          className="text-xs font-semibold text-orange-600 hover:text-orange-700 whitespace-nowrap shrink-0 cursor-pointer"
-        >
-          Configurar horarios
-        </button>
       </div>
 
       {/* Single Clean Contextual Date Banner (only shown when helpful) */}
@@ -338,50 +438,165 @@ export function BossDashboard({
         </motion.div>
       ) : null}
 
-      {/* Pixel-Perfect KPI Summary Strip using gap-px */}
+      {/* Semáforo KPI Summary Strip using gap-px */}
       <motion.section
         initial={{ opacity: 0, y: 8 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
+        aria-label="Resumen semáforo del día"
         className="grid grid-cols-2 lg:grid-cols-4 gap-px bg-stone-200 border border-stone-200 rounded-2xl overflow-hidden"
       >
         <div className="bg-white p-4 sm:p-5">
-          <p className="text-xs font-semibold text-stone-500">Puestos cerrados</p>
-          <p className="font-mono tabular-nums text-2xl sm:text-3xl font-bold text-stone-900 mt-1">
-            {metrics.completedStations} / {stations.length}
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-xs font-semibold text-stone-600">
+              {metrics.missingStations > 0 ? 'Faltan por cerrar' : 'Puestos cerrados'}
+            </p>
+            <span
+              aria-hidden="true"
+              className={`w-2.5 h-2.5 rounded-full shrink-0 ${
+                metrics.missingStations === 0 && stations.length > 0
+                  ? 'bg-emerald-500'
+                  : 'bg-amber-500'
+              }`}
+            />
+          </div>
+          <p
+            className={`font-mono tabular-nums text-2xl sm:text-3xl font-bold mt-1 ${
+              metrics.missingStations === 0 && stations.length > 0
+                ? 'text-emerald-700'
+                : 'text-stone-900'
+            }`}
+          >
+            {metrics.missingStations > 0
+              ? `${metrics.missingStations} de ${stations.length}`
+              : `${metrics.completedStations} / ${stations.length}`}
           </p>
-          <p className="text-xs text-stone-500 mt-1">
-            {metrics.completedStations === stations.length && stations.length > 0
+          <p className="text-xs text-stone-600 mt-1">
+            {metrics.missingStations === 0 && stations.length > 0
               ? 'Todos cerraron turno'
-              : 'Esperando cierre final'}
+              : `${metrics.completedStations} cerrados · en espera`}
           </p>
         </div>
+
         <div className="bg-white p-4 sm:p-5">
-          <p className="text-xs font-semibold text-stone-500">Para comprar</p>
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-xs font-semibold text-stone-600">Comprar</p>
+            <span
+              aria-hidden="true"
+              className={`w-2.5 h-2.5 rounded-full shrink-0 ${
+                metrics.toBuy > 0 ? 'bg-red-600' : 'bg-stone-300'
+              }`}
+            />
+          </div>
           <p className="font-mono tabular-nums text-2xl sm:text-3xl font-bold text-red-700 mt-1">
             {metrics.toBuy}
           </p>
-          <p className="text-xs text-stone-500 mt-1">
+          <p className="text-xs text-stone-600 mt-1">
             {metrics.outOfStock > 0
-              ? `${metrics.outOfStock} agotados · bajo mínimo`
-              : 'Bajo stock mínimo'}
+              ? `${metrics.outOfStock} agotados · cierres reales`
+              : 'Solo cierres completados'}
           </p>
         </div>
+
         <div className="bg-white p-4 sm:p-5">
-          <p className="text-xs font-semibold text-stone-500">Pronto a acabarse</p>
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-xs font-semibold text-stone-600">Pronto a acabarse</p>
+            <span
+              aria-hidden="true"
+              className={`w-2.5 h-2.5 rounded-full shrink-0 ${
+                metrics.lowSoon > 0 ? 'bg-amber-500' : 'bg-stone-300'
+              }`}
+            />
+          </div>
           <p className="font-mono tabular-nums text-2xl sm:text-3xl font-bold text-amber-700 mt-1">
             {metrics.lowSoon}
           </p>
-          <p className="text-xs text-stone-500 mt-1">Vigilar para reponer</p>
+          <p className="text-xs text-stone-600 mt-1">Vigilar para reponer</p>
         </div>
+
         <div className="bg-white p-4 sm:p-5">
-          <p className="text-xs font-semibold text-stone-500">Stock suficiente</p>
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-xs font-semibold text-stone-600">Stock suficiente</p>
+            <span
+              aria-hidden="true"
+              className={`w-2.5 h-2.5 rounded-full shrink-0 ${
+                metrics.sufficient > 0 ? 'bg-emerald-500' : 'bg-stone-300'
+              }`}
+            />
+          </div>
           <p className="font-mono tabular-nums text-2xl sm:text-3xl font-bold text-emerald-700 mt-1">
             {metrics.sufficient}
           </p>
-          <p className="text-xs text-stone-500 mt-1">Sin compra urgente</p>
+          <p className="text-xs text-stone-600 mt-1">
+            {metrics.pendingCount > 0
+              ? `${metrics.pendingCount} sin dato aún`
+              : 'Sin compra urgente'}
+          </p>
         </div>
       </motion.section>
+
+      {/* Opening Audit: Yesterday's Closing vs Today's Opening Differences */}
+      {openingAudit.hasAuditData && (
+        <section className="bg-white border border-stone-200 rounded-2xl p-4 sm:p-5 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-sm font-bold text-stone-900">
+              <GitCompareArrows className="w-4 h-4 text-orange-600 shrink-0" />
+              <span>Revisión de apertura (Ayer vs. Inicio hoy)</span>
+            </div>
+            <div className="flex flex-wrap items-center gap-3 text-xs font-medium">
+              <span className="text-emerald-700 font-semibold font-mono tabular-nums">
+                {openingAudit.confirmedMatchCount} coincidieron con ayer
+              </span>
+              <span
+                className={`font-semibold font-mono tabular-nums ${
+                  openingAudit.adjustedItems.length > 0 ? 'text-amber-700' : 'text-stone-500'
+                }`}
+              >
+                {openingAudit.adjustedItems.length}{' '}
+                {openingAudit.adjustedItems.length === 1 ? 'corregido' : 'corregidos'} al abrir
+              </span>
+            </div>
+          </div>
+
+          {openingAudit.adjustedItems.length > 0 ? (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+              {openingAudit.adjustedItems.map((diff) => (
+                <div
+                  key={diff.itemId}
+                  className="bg-amber-50/70 border border-amber-200 rounded-xl px-3.5 py-2.5 flex items-center justify-between gap-3"
+                >
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold text-stone-900 truncate">
+                      {diff.itemName}
+                    </p>
+                    <p className="text-xs text-stone-600 truncate">
+                      {diff.stationName} · Ayer quedó{' '}
+                      <span className="font-mono tabular-nums font-semibold text-stone-800">
+                        {formatQty(diff.previousClosing)}
+                      </span>{' '}
+                      → Hoy abrió{' '}
+                      <span className="font-mono tabular-nums font-semibold text-stone-900">
+                        {formatQty(diff.opening)} {diff.unit}
+                      </span>
+                    </p>
+                  </div>
+                  <span
+                    className={`font-mono tabular-nums text-xs font-bold shrink-0 ${
+                      diff.delta < 0 ? 'text-red-700' : 'text-amber-800'
+                    }`}
+                  >
+                    {formatSignedDelta(diff.delta)} {diff.unit}
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-xs text-stone-600">
+              Todos los insumos confirmados al abrir coincidieron exactamente con el cierre de ayer.
+            </p>
+          )}
+        </section>
+      )}
 
       {/* Actionable Daily Highlights: Notes & Things to Keep in Mind */}
       {stationNotes.length > 0 && (
@@ -398,7 +613,7 @@ export function BossDashboard({
               >
                 <p className="text-xs font-semibold text-stone-900">
                   {item.stationName}{' '}
-                  <span className="font-normal text-stone-500">· {item.workerName}</span>
+                  <span className="font-normal text-stone-600">· {item.workerName}</span>
                 </p>
                 <p className="text-xs text-stone-700 mt-0.5">&ldquo;{item.notes}&rdquo;</p>
               </div>
@@ -416,7 +631,7 @@ export function BossDashboard({
           <button
             type="button"
             onClick={onGoToWorkstations}
-            className="text-xs sm:text-sm font-semibold text-orange-600 hover:text-orange-700 whitespace-nowrap cursor-pointer"
+            className="min-h-[36px] text-xs sm:text-sm font-semibold text-orange-700 hover:text-orange-800 whitespace-nowrap cursor-pointer"
           >
             + Administrar puestos
           </button>
@@ -429,6 +644,7 @@ export function BossDashboard({
             const lowCount = stationRows.filter(
               (r) => r.stockLevel === 'agotado' || r.stockLevel === 'comprar',
             ).length;
+            const stAudit = openingAudit.byStation[station.id];
 
             const closeTime =
               report?.status === 'completed' ? formatTimeShort(report?.updatedAt) : null;
@@ -470,10 +686,22 @@ export function BossDashboard({
                       <span>Apertura guardada{draftTime ? ` · ${draftTime}` : ''}</span>
                     </div>
                   ) : (
-                    <div className="flex items-center gap-1.5 text-xs font-medium text-stone-500 pt-1">
+                    <div className="flex items-center gap-1.5 text-xs font-medium text-stone-600 pt-1">
                       <Clock className="w-4 h-4 shrink-0" />
                       <span>Pendiente por reportar</span>
                     </div>
+                  )}
+
+                  {stAudit && (stAudit.confirmedMatch > 0 || stAudit.adjusted > 0) && (
+                    <p className="text-xs text-stone-600 font-mono tabular-nums">
+                      Apertura: {stAudit.confirmedMatch} igual
+                      {stAudit.adjusted > 0 ? (
+                        <span className="text-amber-700 font-semibold">
+                          {' '}
+                          · {stAudit.adjusted} corregidos
+                        </span>
+                      ) : null}
+                    </p>
                   )}
 
                   {report?.notes && (
@@ -486,7 +714,7 @@ export function BossDashboard({
                 <div className="pt-3 border-t border-stone-100 flex items-center justify-between gap-2">
                   <span className="text-xs">
                     {report?.status !== 'completed' ? (
-                      <span className="text-stone-500">Sin cierre aún</span>
+                      <span className="text-stone-600">Sin cierre aún</span>
                     ) : lowCount > 0 ? (
                       <span className="text-red-700 font-semibold">
                         {lowCount} por comprar
@@ -498,7 +726,7 @@ export function BossDashboard({
                   <button
                     type="button"
                     onClick={() => onOpenStation(station.id)}
-                    className="min-h-[36px] inline-flex items-center gap-1 text-xs font-semibold text-orange-600 hover:text-orange-700 whitespace-nowrap cursor-pointer"
+                    className="min-h-[40px] inline-flex items-center gap-1 text-xs font-semibold text-orange-700 hover:text-orange-800 whitespace-nowrap cursor-pointer"
                   >
                     Ver planilla
                     <ArrowRight className="w-3.5 h-3.5" />
@@ -517,7 +745,7 @@ export function BossDashboard({
             <button
               type="button"
               onClick={() => setViewTab('compras')}
-              className={`min-h-[38px] px-3.5 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+              className={`min-h-[40px] px-3.5 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
                 viewTab === 'compras'
                   ? 'bg-white text-stone-900 shadow-sm'
                   : 'text-stone-600 hover:text-stone-900'
@@ -528,7 +756,7 @@ export function BossDashboard({
             <button
               type="button"
               onClick={() => setViewTab('completo')}
-              className={`min-h-[38px] px-3.5 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+              className={`min-h-[40px] px-3.5 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
                 viewTab === 'completo'
                   ? 'bg-white text-stone-900 shadow-sm'
                   : 'text-stone-600 hover:text-stone-900'
@@ -546,7 +774,8 @@ export function BossDashboard({
                 value={searchTerm}
                 onChange={(e) => setSearchTerm(e.target.value)}
                 placeholder="Buscar insumo..."
-                className="w-full sm:w-44 min-h-[40px] pl-9 pr-3 py-1.5 text-sm bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 focus:bg-white"
+                aria-label="Buscar insumo"
+                className="w-full sm:w-44 min-h-[42px] pl-9 pr-3 py-1.5 text-sm bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 focus:bg-white"
               />
             </div>
 
@@ -554,7 +783,7 @@ export function BossDashboard({
               aria-label="Filtrar por puesto"
               value={stationFilter}
               onChange={(e) => setStationFilter(e.target.value as 'all' | StationId)}
-              className="flex-1 sm:flex-initial min-h-[40px] px-3 py-1.5 text-sm bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 max-w-full sm:max-w-[190px]"
+              className="flex-1 sm:flex-initial min-h-[42px] px-3 py-1.5 text-sm bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 max-w-full sm:max-w-[190px]"
             >
               <option value="all">Todos los puestos</option>
               {stations.map((s) => (
@@ -568,7 +797,7 @@ export function BossDashboard({
               aria-label="Filtrar por estado"
               value={stockFilter}
               onChange={(e) => setStockFilter(e.target.value as StockFilter)}
-              className="flex-1 sm:flex-initial min-h-[40px] px-3 py-1.5 text-sm bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+              className="flex-1 sm:flex-initial min-h-[42px] px-3 py-1.5 text-sm bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
             >
               <option value="todos">Todos los estados</option>
               <option value="comprar">Solo para comprar</option>
@@ -607,6 +836,82 @@ export function BossDashboard({
               Cambia a &ldquo;Todo el inventario&rdquo; o ajusta los filtros para revisar todos los productos.
             </p>
           </div>
+        ) : viewTab === 'compras' ? (
+          /* Station-Grouped Shopping List */
+          <div className="divide-y divide-stone-200">
+            {groupedShoppingSections.map((group) => {
+              const urgentInGroup = group.rows.filter(
+                (r) => r.stockLevel === 'agotado' || r.stockLevel === 'comprar',
+              ).length;
+              return (
+                <div key={group.stationId} className="min-w-0">
+                  <div className="px-4 sm:px-5 py-3 bg-stone-50 border-b border-stone-200/80 flex flex-wrap items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <h3 className="font-display text-sm sm:text-base font-bold text-stone-900 truncate">
+                        {group.stationName}
+                      </h3>
+                      <p className="text-xs text-stone-600 truncate">
+                        Encargada: {group.workerName}
+                      </p>
+                    </div>
+                    <span className="text-xs font-semibold font-mono tabular-nums text-stone-700 whitespace-nowrap">
+                      {urgentInGroup > 0
+                        ? `${urgentInGroup} para comprar`
+                        : `${group.rows.length} por vigilar`}
+                    </span>
+                  </div>
+
+                  <div className="divide-y divide-stone-100">
+                    {group.rows.map((row) => {
+                      const meta = getStockLevelMeta(row.stockLevel);
+                      return (
+                        <div
+                          key={row.item.id}
+                          className="px-4 sm:px-5 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2 sm:gap-4 hover:bg-stone-50/70 transition-colors"
+                        >
+                          <div className="min-w-0">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <p className="text-sm sm:text-base font-semibold text-stone-900">
+                                {row.item.name}
+                              </p>
+                              <span
+                                className={`inline-flex items-center gap-1 text-xs font-semibold ${meta.textClass}`}
+                              >
+                                {(row.stockLevel === 'agotado' ||
+                                  row.stockLevel === 'comprar') && (
+                                  <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                                )}
+                                {meta.label}
+                              </span>
+                            </div>
+                            <p className="text-xs text-stone-600 font-mono tabular-nums mt-0.5">
+                              Queda:{' '}
+                              <strong className="text-stone-900">
+                                {row.currentStock} {row.item.unit}
+                              </strong>{' '}
+                              · Mínimo: {row.item.minStock} {row.item.unit}
+                            </p>
+                          </div>
+
+                          <div className="flex items-center justify-between sm:justify-end gap-3 shrink-0 font-mono tabular-nums">
+                            {row.suggestedBuy > 0 ? (
+                              <span className="text-sm font-bold text-red-700 whitespace-nowrap">
+                                Pedir +{row.suggestedBuy} {row.item.unit}
+                              </span>
+                            ) : (
+                              <span className="text-xs font-medium text-amber-800 whitespace-nowrap">
+                                Vigilar reposición
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         ) : (
           <>
             {/* Mobile Clean Card List (< md) */}
@@ -619,6 +924,12 @@ export function BossDashboard({
                   : row.isProvisional
                     ? 'Provisional (apertura)'
                     : meta.label;
+                const hasOpeningDiff =
+                  row.entry?.hasOpening &&
+                  !row.isNotApplicable &&
+                  typeof row.entry.previousClosing === 'number' &&
+                  row.entry.opening !== row.entry.previousClosing;
+
                 return (
                   <div key={row.item.id} className="p-4 space-y-2">
                     <div className="flex items-start justify-between gap-3">
@@ -626,7 +937,7 @@ export function BossDashboard({
                         <p className="text-base font-semibold text-stone-900 truncate">
                           {row.item.name}
                         </p>
-                        <p className="text-xs text-stone-500 truncate">{stName}</p>
+                        <p className="text-xs text-stone-600 truncate">{stName}</p>
                       </div>
                       <span
                         className={`inline-flex items-center gap-1 text-xs font-semibold shrink-0 pt-0.5 ${meta.textClass}`}
@@ -637,6 +948,13 @@ export function BossDashboard({
                         {statusText}
                       </span>
                     </div>
+
+                    {hasOpeningDiff && row.entry && (
+                      <p className="text-xs text-amber-800 font-mono tabular-nums">
+                        Apertura corregida: ayer {formatQty(row.entry.previousClosing as number)} → hoy{' '}
+                        {formatQty(row.entry.opening)}
+                      </p>
+                    )}
 
                     <div className="flex items-center justify-between gap-4 pt-1 text-sm font-mono tabular-nums">
                       <span className="text-stone-700">
@@ -671,14 +989,10 @@ export function BossDashboard({
                   <tr className="border-b border-stone-200 bg-stone-50 text-xs font-semibold text-stone-600">
                     <th className="py-3.5 px-5">Insumo</th>
                     <th className="py-3.5 px-4">Puesto</th>
-                    {viewTab === 'completo' && (
-                      <>
-                        <th className="py-3.5 px-4 text-right">Base / Inicio</th>
-                        <th className="py-3.5 px-4 text-right">Surtido</th>
-                      </>
-                    )}
+                    <th className="py-3.5 px-4 text-right">Base / Inicio</th>
+                    <th className="py-3.5 px-4 text-right">Surtido</th>
                     <th className="py-3.5 px-4 text-right">Quedan al cierre</th>
-                    {viewTab === 'completo' && <th className="py-3.5 px-4 text-right">Consumo</th>}
+                    <th className="py-3.5 px-4 text-right">Consumo</th>
                     <th className="py-3.5 px-4 text-right">Mínimo</th>
                     <th className="py-3.5 px-4 text-right">Pedir</th>
                     <th className="py-3.5 px-5">Estado</th>
@@ -693,6 +1007,14 @@ export function BossDashboard({
                       : row.isProvisional
                         ? 'Provisional'
                         : meta.label;
+                    const hasPrev = typeof row.entry?.previousClosing === 'number';
+                    const isAdjustedOpening =
+                      row.entry?.hasOpening &&
+                      !row.isNotApplicable &&
+                      hasPrev &&
+                      (row.entry.openingStatus === 'adjusted' ||
+                        row.entry.opening !== row.entry.previousClosing);
+
                     return (
                       <tr key={row.item.id} className="hover:bg-stone-50/80 transition-colors">
                         <td className="py-3.5 px-5">
@@ -702,21 +1024,28 @@ export function BossDashboard({
                         <td className="py-3.5 px-4 text-stone-600 whitespace-nowrap max-w-[200px] truncate">
                           {stName}
                         </td>
-                        {viewTab === 'completo' && (
-                          <>
-                            <td className="py-3.5 px-4 text-right font-mono tabular-nums text-stone-700">
-                              {row.entry?.hasOpening && !row.isNotApplicable ? row.entry.opening : '—'}
-                            </td>
-                            <td className="py-3.5 px-4 text-right font-mono tabular-nums text-stone-500">
-                              {row.entry && !row.isNotApplicable && row.entry.added > 0
-                                ? `+${row.entry.added}`
-                                : '—'}
-                            </td>
-                          </>
-                        )}
+                        <td className="py-3.5 px-4 text-right font-mono tabular-nums text-stone-700">
+                          {row.entry?.hasOpening && !row.isNotApplicable ? (
+                            <div>
+                              <span>{row.entry.opening}</span>
+                              {isAdjustedOpening && hasPrev && (
+                                <div className="text-[11px] font-semibold text-amber-700">
+                                  Ayer: {row.entry.previousClosing}
+                                </div>
+                              )}
+                            </div>
+                          ) : (
+                            '—'
+                          )}
+                        </td>
+                        <td className="py-3.5 px-4 text-right font-mono tabular-nums text-stone-600">
+                          {row.entry && !row.isNotApplicable && row.entry.added > 0
+                            ? `+${row.entry.added}`
+                            : '—'}
+                        </td>
                         <td className="py-3.5 px-4 text-right font-mono tabular-nums font-semibold text-stone-900">
                           {row.isNotApplicable ? (
-                            <span className="text-stone-400 font-normal">No aplica</span>
+                            <span className="text-stone-500 font-normal">No aplica</span>
                           ) : row.hasCountedClosing && row.currentStock !== null ? (
                             row.currentStock
                           ) : row.isProvisional && row.provisionalStock !== null ? (
@@ -727,14 +1056,12 @@ export function BossDashboard({
                               {row.provisionalStock} (prov.)
                             </span>
                           ) : (
-                            <span className="text-stone-400 font-normal">Pendiente de contar</span>
+                            <span className="text-stone-500 font-normal">Pendiente de contar</span>
                           )}
                         </td>
-                        {viewTab === 'completo' && (
-                          <td className="py-3.5 px-4 text-right font-mono tabular-nums text-stone-700">
-                            {row.consumed !== null ? row.consumed : '—'}
-                          </td>
-                        )}
+                        <td className="py-3.5 px-4 text-right font-mono tabular-nums text-stone-700">
+                          {row.consumed !== null ? row.consumed : '—'}
+                        </td>
                         <td className="py-3.5 px-4 text-right font-mono tabular-nums text-stone-600">
                           {row.item.minStock}
                         </td>
@@ -771,6 +1098,103 @@ export function BossDashboard({
             Nota: Los insumos sin cierre definitivo figuran como &ldquo;Pendiente de contar&rdquo; o &ldquo;Provisional&rdquo; y no generan alertas falsas de compra ni entran al WhatsApp.
           </div>
         )}
+      </section>
+
+      {/* Collapsible Bottom Configuration Section */}
+      <section className="bg-white border border-stone-200 rounded-2xl overflow-hidden no-print">
+        <button
+          type="button"
+          onClick={() => setConfigOpen((prev) => !prev)}
+          aria-expanded={configOpen}
+          className="w-full min-h-[54px] px-4 sm:px-5 py-3.5 flex items-center justify-between gap-3 text-left hover:bg-stone-50 transition-colors cursor-pointer"
+        >
+          <div className="flex items-center gap-2.5 min-w-0">
+            <Settings className="w-4 h-4 text-stone-600 shrink-0" />
+            <div className="min-w-0">
+              <span className="font-display text-sm sm:text-base font-bold text-stone-900">
+                Configuración del restaurante
+              </span>
+              <p className="text-xs text-stone-600 truncate">
+                {scheduleSummaryLabel} · Catálogo, equipo y códigos QR
+              </p>
+            </div>
+          </div>
+          <ChevronDown
+            className={`w-4 h-4 text-stone-600 shrink-0 transition-transform duration-200 ${
+              configOpen ? 'rotate-180' : ''
+            }`}
+          />
+        </button>
+
+        <AnimatePresence initial={false}>
+          {configOpen && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+              className="overflow-hidden border-t border-stone-200"
+            >
+              <div className="p-4 sm:p-5 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 bg-stone-50/70">
+                <button
+                  type="button"
+                  onClick={onGoToCatalog}
+                  className="min-h-[64px] bg-white border border-stone-200 rounded-xl p-3.5 text-left hover:border-orange-300 hover:bg-orange-50/40 transition-colors flex items-start gap-3 cursor-pointer"
+                >
+                  <Package className="w-5 h-5 text-orange-600 shrink-0 mt-0.5" />
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold text-stone-900">Catálogo de insumos</p>
+                    <p className="text-xs text-stone-600 mt-0.5">
+                      Editar unidades, mínimos y stock objetivo
+                    </p>
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={onGoToTeam}
+                  className="min-h-[64px] bg-white border border-stone-200 rounded-xl p-3.5 text-left hover:border-orange-300 hover:bg-orange-50/40 transition-colors flex items-start gap-3 cursor-pointer"
+                >
+                  <Users className="w-5 h-5 text-orange-600 shrink-0 mt-0.5" />
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold text-stone-900">Equipo y perfil</p>
+                    <p className="text-xs text-stone-600 mt-0.5">
+                      Accesos de trabajadoras y datos del jefe
+                    </p>
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={onGoToWorkstations}
+                  className="min-h-[64px] bg-white border border-stone-200 rounded-xl p-3.5 text-left hover:border-orange-300 hover:bg-orange-50/40 transition-colors flex items-start gap-3 cursor-pointer"
+                >
+                  <QrCode className="w-5 h-5 text-orange-600 shrink-0 mt-0.5" />
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold text-stone-900">Puestos y códigos QR</p>
+                    <p className="text-xs text-stone-600 mt-0.5">
+                      Enlaces por puesto e impresión de QR
+                    </p>
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={onOpenScheduleModal}
+                  className="min-h-[64px] bg-white border border-stone-200 rounded-xl p-3.5 text-left hover:border-orange-300 hover:bg-orange-50/40 transition-colors flex items-start gap-3 cursor-pointer"
+                >
+                  <Clock className="w-5 h-5 text-orange-600 shrink-0 mt-0.5" />
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold text-stone-900">Horarios</p>
+                    <p className="text-xs text-stone-600 mt-0.5">
+                      Ventanas de apertura y cierre (Bogotá)
+                    </p>
+                  </div>
+                </button>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </section>
     </div>
   );

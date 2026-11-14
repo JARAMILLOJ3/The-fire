@@ -148,6 +148,87 @@ export function detectReportAnomalies(
   return rows.flatMap((row) => detectEntryAnomalies(row, mode));
 }
 
+export type OpeningRowState =
+  | 'not_applicable'
+  | 'pending_confirm'
+  | 'uncounted'
+  | 'confirmed'
+  | 'adjusted'
+  | 'manual';
+
+export function computeOpeningStatusForValue(
+  openingValue: number,
+  previousClosing?: number,
+): 'confirmed_match' | 'adjusted' | 'manual' {
+  if (typeof previousClosing === 'number') {
+    return openingValue === previousClosing ? 'confirmed_match' : 'adjusted';
+  }
+  return 'manual';
+}
+
+export function getOpeningRowState(row: DraftEntryRow | undefined): OpeningRowState {
+  if (!row) return 'uncounted';
+  if (row.notApplicable) return 'not_applicable';
+  if (!row.hasOpening) {
+    return typeof row.previousClosing === 'number' ? 'pending_confirm' : 'uncounted';
+  }
+  if (
+    row.openingStatus === 'adjusted' ||
+    (typeof row.previousClosing === 'number' && row.opening !== row.previousClosing)
+  ) {
+    return 'adjusted';
+  }
+  if (
+    row.openingStatus === 'confirmed_match' ||
+    (typeof row.previousClosing === 'number' && row.opening === row.previousClosing)
+  ) {
+    return 'confirmed';
+  }
+  return 'manual';
+}
+
+export function confirmPreloadedOpeningRow(row: DraftEntryRow): DraftEntryRow {
+  const nextOpening =
+    typeof row.previousClosing === 'number' && !row.hasOpening
+      ? row.previousClosing
+      : row.opening;
+  return {
+    ...row,
+    opening: nextOpening,
+    hasOpening: true,
+    notApplicable: false,
+    openingStatus: computeOpeningStatusForValue(nextOpening, row.previousClosing),
+  };
+}
+
+export function confirmAllPendingOpeningRows(
+  rows: Record<string, DraftEntryRow>,
+  touched: Record<string, { opening?: boolean } | undefined>,
+): { nextRows: Record<string, DraftEntryRow>; confirmedIds: string[] } {
+  const nextRows: Record<string, DraftEntryRow> = { ...rows };
+  const confirmedIds: string[] = [];
+
+  Object.entries(rows).forEach(([itemId, row]) => {
+    const isUntouched = !touched[itemId]?.opening;
+    if (
+      isUntouched &&
+      !row.notApplicable &&
+      !row.hasOpening &&
+      typeof row.previousClosing === 'number'
+    ) {
+      nextRows[itemId] = {
+        ...row,
+        opening: row.previousClosing,
+        hasOpening: true,
+        openingStatus: 'confirmed_match',
+      };
+      confirmedIds.push(itemId);
+    }
+  });
+
+  return { nextRows, confirmedIds };
+}
+
 export function getStockLevel(closingQty: number, minStock: number): StockLevel {
   if (closingQty <= 0) return 'agotado';
   if (closingQty <= minStock) return 'comprar';
