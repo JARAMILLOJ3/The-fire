@@ -1,0 +1,700 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn()
+        && request.auth.token.email_verified == true
+        && request.auth.token.email is string
+        && request.auth.token.email.size() <= 120;
+    }
+
+    function isBootstrappedAdmin() {
+      return isVerifiedUser() && request.auth.token.email == 'jsjg1023.305@gmail.com';
+    }
+
+    function isStationId(val) {
+      return isValidId(val);
+    }
+
+    function isValidDateStr(val) {
+      return val is string && val.size() == 10 && val.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+    }
+
+    function isValidEmailList(listVal) {
+      return listVal is list
+        && listVal.size() >= 1
+        && listVal.size() <= 15
+        && listVal[0] is string
+        && listVal[0].size() >= 3
+        && listVal[0].size() <= 120;
+    }
+
+    function hasActiveMemberDoc() {
+      return isVerifiedUser()
+        && exists(/databases/$(database)/documents/teamMembers/$(request.auth.uid))
+        && get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.active == true;
+    }
+
+    function memberDoc() {
+      return get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data;
+    }
+
+    function canManageWorkspace(wsId) {
+      return isVerifiedUser() && (
+        (wsId == 'restaurante_principal' && isBootstrappedAdmin())
+        || wsId == 'ws_' + request.auth.uid
+        || (
+          exists(/databases/$(database)/documents/workspaces/$(wsId))
+          && get(/databases/$(database)/documents/workspaces/$(wsId)).data.ownerUid == request.auth.uid
+        )
+        || (
+          hasActiveMemberDoc()
+          && memberDoc().workspaceId == wsId
+          && memberDoc().station == 'jefe'
+        )
+      );
+    }
+
+    function canReportStation(wsId, station) {
+      return canManageWorkspace(wsId) || (
+        hasActiveMemberDoc()
+        && memberDoc().workspaceId == wsId
+        && memberDoc().station == station
+      );
+    }
+
+    function isValidWorkspace(data) {
+      return data.keys().hasAll(['name', 'ownerUid', 'ownerEmail', 'authorizedEmails', 'seeded', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['name', 'ownerUid', 'ownerEmail', 'authorizedEmails', 'seeded', 'createdAt', 'updatedAt'])
+        && data.name is string && data.name.size() >= 2 && data.name.size() <= 80
+        && isValidId(data.ownerUid)
+        && data.ownerEmail is string && data.ownerEmail.size() >= 3 && data.ownerEmail.size() <= 120
+        && isValidEmailList(data.authorizedEmails)
+        && data.seeded is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidWorkstation(data) {
+      return data.keys().hasAll([
+          'workspaceId', 'ownerUid', 'authorizedEmails', 'name', 'area',
+          'workerName', 'description', 'accessCode', 'nextItemSlot',
+          'active', 'sortOrder', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'workspaceId', 'ownerUid', 'authorizedEmails', 'name', 'area',
+          'workerName', 'description', 'accessCode', 'nextItemSlot',
+          'active', 'sortOrder', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.workspaceId)
+        && isValidId(data.ownerUid)
+        && isValidEmailList(data.authorizedEmails)
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
+        && data.area is string && data.area.size() <= 60
+        && data.workerName is string && data.workerName.size() >= 1 && data.workerName.size() <= 80
+        && data.description is string && data.description.size() <= 200
+        && isValidId(data.accessCode)
+        && data.accessCode.size() >= 6 && data.accessCode.size() <= 64
+        && data.nextItemSlot is number && data.nextItemSlot >= 1 && data.nextItemSlot <= 500
+        && data.active is bool
+        && data.sortOrder is number && data.sortOrder >= 0 && data.sortOrder <= 10000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidStationLink(data) {
+      return data.keys().hasAll([
+          'workspaceId', 'ownerUid', 'stationId', 'stationName', 'workerName', 'active', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'workspaceId', 'ownerUid', 'stationId', 'stationName', 'workerName', 'active', 'createdAt'
+        ])
+        && isValidId(data.workspaceId)
+        && isValidId(data.ownerUid)
+        && isValidId(data.stationId)
+        && data.stationName is string && data.stationName.size() >= 1 && data.stationName.size() <= 80
+        && data.workerName is string && data.workerName.size() >= 1 && data.workerName.size() <= 80
+        && data.active is bool
+        && data.createdAt is timestamp;
+    }
+
+    function isValidInventoryItem(data) {
+      return data.keys().hasAll([
+          'workspaceId', 'ownerUid', 'authorizedEmails', 'station', 'name',
+          'unit', 'minStock', 'targetStock', 'active', 'sortOrder', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'workspaceId', 'ownerUid', 'authorizedEmails', 'station', 'name',
+          'unit', 'minStock', 'targetStock', 'active', 'sortOrder', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.workspaceId)
+        && isValidId(data.ownerUid)
+        && isValidEmailList(data.authorizedEmails)
+        && isStationId(data.station)
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
+        && data.unit is string && data.unit.size() >= 1 && data.unit.size() <= 24
+        && data.minStock is number && data.minStock >= 0 && data.minStock <= 100000
+        && data.targetStock is number && data.targetStock >= 0 && data.targetStock <= 100000
+        && data.active is bool
+        && data.sortOrder is number && data.sortOrder >= 0 && data.sortOrder <= 10000
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidDailyReport(data) {
+      return data.keys().hasAll([
+          'workspaceId', 'ownerUid', 'authorizedEmails', 'date', 'station',
+          'status', 'reportedByUid', 'reportedByName', 'notes', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'workspaceId', 'ownerUid', 'authorizedEmails', 'date', 'station',
+          'status', 'reportedByUid', 'reportedByName', 'notes', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.workspaceId)
+        && isValidId(data.ownerUid)
+        && isValidEmailList(data.authorizedEmails)
+        && isValidDateStr(data.date)
+        && isStationId(data.station)
+        && data.status is string && data.status in ['open', 'opening_saved', 'completed']
+        && isValidId(data.reportedByUid)
+        && data.reportedByName is string && data.reportedByName.size() >= 1 && data.reportedByName.size() <= 80
+        && data.notes is string && data.notes.size() <= 500
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidDailyReportEntry(data) {
+      return data.keys().hasAll([
+          'workspaceId', 'ownerUid', 'authorizedEmails', 'reportId', 'itemId',
+          'station', 'date', 'itemName', 'unit', 'minStock', 'targetStock',
+          'opening', 'added', 'closing', 'hasOpening', 'hasClosing',
+          'updatedByUid', 'updatedByName', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'workspaceId', 'ownerUid', 'authorizedEmails', 'reportId', 'itemId',
+          'station', 'date', 'itemName', 'unit', 'minStock', 'targetStock',
+          'opening', 'added', 'closing', 'hasOpening', 'hasClosing',
+          'updatedByUid', 'updatedByName', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.workspaceId)
+        && isValidId(data.ownerUid)
+        && isValidEmailList(data.authorizedEmails)
+        && isValidId(data.reportId)
+        && isValidId(data.itemId)
+        && isStationId(data.station)
+        && isValidDateStr(data.date)
+        && data.itemName is string && data.itemName.size() >= 1 && data.itemName.size() <= 80
+        && data.unit is string && data.unit.size() >= 1 && data.unit.size() <= 24
+        && data.minStock is number && data.minStock >= 0 && data.minStock <= 100000
+        && data.targetStock is number && data.targetStock >= 0 && data.targetStock <= 100000
+        && data.opening is number && data.opening >= 0 && data.opening <= 100000
+        && data.added is number && data.added >= 0 && data.added <= 100000
+        && data.closing is number && data.closing >= 0 && data.closing <= 100000
+        && data.hasOpening is bool
+        && data.hasClosing is bool
+        && isValidId(data.updatedByUid)
+        && data.updatedByName is string && data.updatedByName.size() >= 1 && data.updatedByName.size() <= 80
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidInvite(data) {
+      return data.keys().hasAll(['workspaceId', 'ownerUid', 'email', 'displayName', 'station', 'createdAt'])
+        && data.keys().hasOnly(['workspaceId', 'ownerUid', 'email', 'displayName', 'station', 'createdAt'])
+        && isValidId(data.workspaceId)
+        && isValidId(data.ownerUid)
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 120
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80
+        && isStationId(data.station)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidTeamMember(data) {
+      return data.keys().hasAll([
+          'workspaceId', 'ownerUid', 'uid', 'email', 'displayName',
+          'station', 'inviteId', 'active', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'workspaceId', 'ownerUid', 'uid', 'email', 'displayName',
+          'station', 'inviteId', 'active', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.workspaceId)
+        && isValidId(data.ownerUid)
+        && isValidId(data.uid)
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 120
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80
+        && isStationId(data.station)
+        && isValidId(data.inviteId)
+        && data.active is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    match /workspaces/{workspaceId} {
+      allow get: if isValidId(workspaceId) && isVerifiedUser() && (
+        workspaceId == 'ws_' + request.auth.uid
+        || (workspaceId == 'restaurante_principal' && isBootstrappedAdmin())
+        || (
+          resource != null && (
+            existing().ownerUid == request.auth.uid
+            || request.auth.token.email in existing().authorizedEmails
+            || (hasActiveMemberDoc() && memberDoc().workspaceId == workspaceId)
+          )
+        )
+      );
+
+      allow list: if isVerifiedUser() && (
+        resource.data.ownerUid == request.auth.uid
+        || request.auth.token.email in resource.data.authorizedEmails
+      );
+
+      allow create: if isValidId(workspaceId)
+        && isVerifiedUser()
+        && isValidWorkspace(incoming())
+        && incoming().ownerUid == request.auth.uid
+        && incoming().ownerEmail == request.auth.token.email
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (
+          (workspaceId == 'restaurante_principal' && isBootstrappedAdmin())
+          || workspaceId == 'ws_' + request.auth.uid
+        );
+
+      allow update: if isValidId(workspaceId)
+        && isVerifiedUser()
+        && isValidWorkspace(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().ownerEmail == existing().ownerEmail
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && canManageWorkspace(workspaceId)
+        && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'authorizedEmails', 'seeded', 'updatedAt']);
+
+      allow delete: if false;
+    }
+
+    match /stations/{stationId} {
+      allow get: if isValidId(stationId) && isVerifiedUser() && (
+        (
+          resource == null
+          && hasActiveMemberDoc()
+          && memberDoc().station == stationId
+        )
+        || (
+          resource != null && (
+            existing().ownerUid == request.auth.uid
+            || request.auth.token.email in existing().authorizedEmails
+            || (
+              hasActiveMemberDoc()
+              && memberDoc().workspaceId == existing().workspaceId
+              && (memberDoc().station == stationId || memberDoc().station == 'jefe')
+            )
+          )
+        )
+      );
+
+      allow list: if isVerifiedUser() && (
+        resource.data.ownerUid == request.auth.uid
+        || request.auth.token.email in resource.data.authorizedEmails
+      );
+
+      allow create: if isValidId(stationId)
+        && isVerifiedUser()
+        && isValidWorkstation(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && exists(/databases/$(database)/documents/workspaces/$(incoming().workspaceId))
+        && incoming().ownerUid == get(/databases/$(database)/documents/workspaces/$(incoming().workspaceId)).data.ownerUid
+        && canManageWorkspace(incoming().workspaceId);
+
+      allow update: if isValidId(stationId)
+        && isVerifiedUser()
+        && isValidWorkstation(incoming())
+        && incoming().workspaceId == existing().workspaceId
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && canManageWorkspace(existing().workspaceId)
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'authorizedEmails', 'name', 'area', 'workerName', 'description',
+          'accessCode', 'nextItemSlot', 'active', 'sortOrder', 'updatedAt'
+        ]);
+
+      allow delete: if isValidId(stationId)
+        && isVerifiedUser()
+        && canManageWorkspace(existing().workspaceId);
+    }
+
+    match /stationLinks/{accessCode} {
+      allow get: if isValidId(accessCode) && isVerifiedUser();
+      allow list: if isVerifiedUser() && resource.data.ownerUid == request.auth.uid;
+
+      allow create: if isValidId(accessCode)
+        && accessCode.size() >= 6
+        && accessCode.size() <= 64
+        && isVerifiedUser()
+        && isValidStationLink(incoming())
+        && incoming().createdAt == request.time
+        && exists(/databases/$(database)/documents/workspaces/$(incoming().workspaceId))
+        && incoming().ownerUid == get(/databases/$(database)/documents/workspaces/$(incoming().workspaceId)).data.ownerUid
+        && canManageWorkspace(incoming().workspaceId);
+
+      allow update: if isValidId(accessCode)
+        && isVerifiedUser()
+        && isValidStationLink(incoming())
+        && incoming().workspaceId == existing().workspaceId
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().stationId == existing().stationId
+        && incoming().createdAt == existing().createdAt
+        && canManageWorkspace(existing().workspaceId)
+        && incoming().diff(existing()).affectedKeys().hasOnly(['stationName', 'workerName', 'active']);
+
+      allow delete: if isValidId(accessCode)
+        && isVerifiedUser()
+        && canManageWorkspace(existing().workspaceId);
+    }
+
+    match /items/{itemId} {
+      allow get: if isValidId(itemId) && isVerifiedUser() && (
+        (
+          resource == null
+          && hasActiveMemberDoc()
+          && itemId.matches('^' + memberDoc().station + '_[0-9]+$')
+        )
+        || (
+          resource != null && (
+            existing().ownerUid == request.auth.uid
+            || request.auth.token.email in existing().authorizedEmails
+            || (
+              hasActiveMemberDoc()
+              && memberDoc().workspaceId == existing().workspaceId
+              && (memberDoc().station == existing().station || memberDoc().station == 'jefe')
+            )
+          )
+        )
+      );
+
+      allow list: if isVerifiedUser() && (
+        resource.data.ownerUid == request.auth.uid
+        || request.auth.token.email in resource.data.authorizedEmails
+      );
+
+      allow create: if isValidId(itemId)
+        && isVerifiedUser()
+        && isValidInventoryItem(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && exists(/databases/$(database)/documents/workspaces/$(incoming().workspaceId))
+        && incoming().ownerUid == get(/databases/$(database)/documents/workspaces/$(incoming().workspaceId)).data.ownerUid
+        && canManageWorkspace(incoming().workspaceId);
+
+      allow update: if isValidId(itemId)
+        && isVerifiedUser()
+        && isValidInventoryItem(incoming())
+        && incoming().workspaceId == existing().workspaceId
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && canManageWorkspace(existing().workspaceId)
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'authorizedEmails', 'station', 'name', 'unit',
+          'minStock', 'targetStock', 'active', 'sortOrder', 'updatedAt'
+        ]);
+
+      allow delete: if isValidId(itemId)
+        && isVerifiedUser()
+        && canManageWorkspace(existing().workspaceId);
+    }
+
+    match /dailyReports/{reportId} {
+      allow get: if isValidId(reportId) && isVerifiedUser() && (
+        (
+          resource == null
+          && hasActiveMemberDoc()
+          && reportId.matches('^' + memberDoc().workspaceId + '_[0-9]{4}-[0-9]{2}-[0-9]{2}_' + memberDoc().station + '$')
+        )
+        || (
+          resource != null && (
+            existing().ownerUid == request.auth.uid
+            || request.auth.token.email in existing().authorizedEmails
+            || (
+              hasActiveMemberDoc()
+              && memberDoc().workspaceId == existing().workspaceId
+              && (memberDoc().station == existing().station || memberDoc().station == 'jefe')
+            )
+          )
+        )
+      );
+
+      allow list: if isVerifiedUser() && (
+        resource.data.ownerUid == request.auth.uid
+        || request.auth.token.email in resource.data.authorizedEmails
+      );
+
+      allow create: if isValidId(reportId)
+        && isVerifiedUser()
+        && isValidDailyReport(incoming())
+        && reportId == incoming().workspaceId + '_' + incoming().date + '_' + incoming().station
+        && incoming().reportedByUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && exists(/databases/$(database)/documents/workspaces/$(incoming().workspaceId))
+        && incoming().ownerUid == get(/databases/$(database)/documents/workspaces/$(incoming().workspaceId)).data.ownerUid
+        && canReportStation(incoming().workspaceId, incoming().station);
+
+      allow update: if isValidId(reportId)
+        && isVerifiedUser()
+        && isValidDailyReport(incoming())
+        && incoming().workspaceId == existing().workspaceId
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().date == existing().date
+        && incoming().station == existing().station
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && canReportStation(existing().workspaceId, existing().station)
+        && (
+          (
+            canManageWorkspace(existing().workspaceId)
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'authorizedEmails', 'status', 'reportedByUid', 'reportedByName', 'notes', 'updatedAt'
+            ])
+          )
+          || (
+            existing().status != 'completed'
+            && incoming().reportedByUid == request.auth.uid
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status', 'reportedByUid', 'reportedByName', 'notes', 'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isValidId(reportId)
+        && isVerifiedUser()
+        && canManageWorkspace(existing().workspaceId);
+
+      match /entries/{itemId} {
+        allow get: if isValidId(reportId)
+          && isValidId(itemId)
+          && isVerifiedUser()
+          && (
+            (
+              resource == null
+              && hasActiveMemberDoc()
+              && reportId.matches('^' + memberDoc().workspaceId + '_[0-9]{4}-[0-9]{2}-[0-9]{2}_' + memberDoc().station + '$')
+            )
+            || (
+              resource != null
+              && exists(/databases/$(database)/documents/dailyReports/$(reportId))
+              && (
+                existing().ownerUid == request.auth.uid
+                || request.auth.token.email in existing().authorizedEmails
+                || (
+                  hasActiveMemberDoc()
+                  && memberDoc().workspaceId == existing().workspaceId
+                  && (memberDoc().station == existing().station || memberDoc().station == 'jefe')
+                )
+              )
+            )
+          );
+
+        allow list: if isVerifiedUser() && (
+          resource.data.ownerUid == request.auth.uid
+          || request.auth.token.email in resource.data.authorizedEmails
+        );
+
+        allow create: if isValidId(reportId)
+          && isValidId(itemId)
+          && isVerifiedUser()
+          && isValidDailyReportEntry(incoming())
+          && incoming().reportId == reportId
+          && incoming().itemId == itemId
+          && incoming().updatedByUid == request.auth.uid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && (
+            exists(/databases/$(database)/documents/dailyReports/$(reportId))
+            || existsAfter(/databases/$(database)/documents/dailyReports/$(reportId))
+          )
+          && getAfter(/databases/$(database)/documents/dailyReports/$(reportId)).data.workspaceId == incoming().workspaceId
+          && getAfter(/databases/$(database)/documents/dailyReports/$(reportId)).data.station == incoming().station
+          && getAfter(/databases/$(database)/documents/dailyReports/$(reportId)).data.ownerUid == incoming().ownerUid
+          && canReportStation(incoming().workspaceId, incoming().station);
+
+        allow update: if isValidId(reportId)
+          && isValidId(itemId)
+          && isVerifiedUser()
+          && isValidDailyReportEntry(incoming())
+          && incoming().workspaceId == existing().workspaceId
+          && incoming().ownerUid == existing().ownerUid
+          && incoming().reportId == existing().reportId
+          && incoming().itemId == existing().itemId
+          && incoming().station == existing().station
+          && incoming().date == existing().date
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().updatedByUid == request.auth.uid
+          && exists(/databases/$(database)/documents/dailyReports/$(reportId))
+          && canReportStation(existing().workspaceId, existing().station)
+          && (
+            (
+              canManageWorkspace(existing().workspaceId)
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'authorizedEmails', 'opening', 'added', 'closing', 'hasOpening', 'hasClosing',
+                'itemName', 'unit', 'minStock', 'targetStock',
+                'updatedByUid', 'updatedByName', 'updatedAt'
+              ])
+            )
+            || (
+              get(/databases/$(database)/documents/dailyReports/$(reportId)).data.status != 'completed'
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'opening', 'added', 'closing', 'hasOpening', 'hasClosing',
+                'itemName', 'unit', 'minStock', 'targetStock',
+                'updatedByUid', 'updatedByName', 'updatedAt'
+              ])
+            )
+          );
+
+        allow delete: if isValidId(reportId)
+          && isValidId(itemId)
+          && isVerifiedUser()
+          && exists(/databases/$(database)/documents/dailyReports/$(reportId))
+          && canManageWorkspace(existing().workspaceId);
+      }
+    }
+
+    match /invites/{inviteId} {
+      allow get: if isValidId(inviteId) && isVerifiedUser() && (
+        existing().ownerUid == request.auth.uid
+        || existing().email == request.auth.token.email
+        || canManageWorkspace(existing().workspaceId)
+      );
+
+      allow list: if isVerifiedUser() && (
+        resource.data.ownerUid == request.auth.uid
+        || resource.data.email == request.auth.token.email
+      );
+
+      allow create: if isValidId(inviteId)
+        && isVerifiedUser()
+        && isValidInvite(incoming())
+        && incoming().createdAt == request.time
+        && exists(/databases/$(database)/documents/workspaces/$(incoming().workspaceId))
+        && incoming().ownerUid == get(/databases/$(database)/documents/workspaces/$(incoming().workspaceId)).data.ownerUid
+        && canManageWorkspace(incoming().workspaceId);
+
+      allow update: if isValidId(inviteId)
+        && isVerifiedUser()
+        && isValidInvite(incoming())
+        && incoming().workspaceId == existing().workspaceId
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdAt == existing().createdAt
+        && canManageWorkspace(existing().workspaceId)
+        && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'displayName', 'station']);
+
+      allow delete: if isValidId(inviteId)
+        && isVerifiedUser()
+        && canManageWorkspace(existing().workspaceId);
+    }
+
+    match /teamMembers/{memberId} {
+      allow get: if isValidId(memberId) && isVerifiedUser() && (
+        memberId == request.auth.uid
+        || (
+          resource != null && (
+            existing().ownerUid == request.auth.uid
+            || existing().uid == request.auth.uid
+            || canManageWorkspace(existing().workspaceId)
+          )
+        )
+      );
+
+      allow list: if isVerifiedUser() && (
+        resource.data.ownerUid == request.auth.uid
+        || resource.data.uid == request.auth.uid
+      );
+
+      allow create: if isValidId(memberId)
+        && isVerifiedUser()
+        && isValidTeamMember(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && exists(/databases/$(database)/documents/workspaces/$(incoming().workspaceId))
+        && incoming().ownerUid == get(/databases/$(database)/documents/workspaces/$(incoming().workspaceId)).data.ownerUid
+        && (
+          canManageWorkspace(incoming().workspaceId)
+          || (
+            memberId == request.auth.uid
+            && incoming().uid == request.auth.uid
+            && incoming().email == request.auth.token.email
+            && incoming().active == true
+            && (
+              (
+                exists(/databases/$(database)/documents/invites/$(incoming().inviteId))
+                && get(/databases/$(database)/documents/invites/$(incoming().inviteId)).data.email == request.auth.token.email
+                && get(/databases/$(database)/documents/invites/$(incoming().inviteId)).data.workspaceId == incoming().workspaceId
+                && get(/databases/$(database)/documents/invites/$(incoming().inviteId)).data.station == incoming().station
+              )
+              || (
+                exists(/databases/$(database)/documents/stationLinks/$(incoming().inviteId))
+                && get(/databases/$(database)/documents/stationLinks/$(incoming().inviteId)).data.active == true
+                && get(/databases/$(database)/documents/stationLinks/$(incoming().inviteId)).data.workspaceId == incoming().workspaceId
+                && get(/databases/$(database)/documents/stationLinks/$(incoming().inviteId)).data.stationId == incoming().station
+              )
+            )
+          )
+        );
+
+      allow update: if isValidId(memberId)
+        && isVerifiedUser()
+        && isValidTeamMember(incoming())
+        && incoming().workspaceId == existing().workspaceId
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          canManageWorkspace(existing().workspaceId)
+          || (
+            memberId == request.auth.uid
+            && incoming().uid == request.auth.uid
+            && incoming().email == request.auth.token.email
+            && incoming().active == true
+            && incoming().diff(existing()).affectedKeys().hasOnly(['station', 'inviteId', 'displayName', 'updatedAt'])
+            && exists(/databases/$(database)/documents/stationLinks/$(incoming().inviteId))
+            && get(/databases/$(database)/documents/stationLinks/$(incoming().inviteId)).data.active == true
+            && get(/databases/$(database)/documents/stationLinks/$(incoming().inviteId)).data.workspaceId == existing().workspaceId
+            && get(/databases/$(database)/documents/stationLinks/$(incoming().inviteId)).data.stationId == incoming().station
+          )
+        )
+        && (
+          !canManageWorkspace(existing().workspaceId)
+          || incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'station', 'active', 'updatedAt'])
+        );
+
+      allow delete: if isValidId(memberId)
+        && isVerifiedUser()
+        && canManageWorkspace(existing().workspaceId);
+    }
+  }
+}

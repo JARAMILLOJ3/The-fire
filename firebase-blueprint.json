@@ -1,0 +1,551 @@
+{
+  "entities": {
+    "Workspace": {
+      "title": "Workspace",
+      "description": "Configuración principal del restaurante y lista de correos autorizados.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Nombre del restaurante",
+          "minLength": 2,
+          "maxLength": 80
+        },
+        "ownerUid": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "ownerEmail": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 120
+        },
+        "authorizedEmails": {
+          "type": "array",
+          "description": "Correos autorizados para acceder al restaurante (máximo 15)"
+        },
+        "seeded": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["name", "ownerUid", "ownerEmail", "authorizedEmails", "seeded", "createdAt", "updatedAt"]
+    },
+    "Workstation": {
+      "title": "Workstation",
+      "description": "Puesto de trabajo del restaurante con trabajadora asignada y enlace/QR.",
+      "type": "object",
+      "properties": {
+        "workspaceId": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "ownerUid": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "authorizedEmails": {
+          "type": "array"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "area": {
+          "type": "string",
+          "maxLength": 60
+        },
+        "workerName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "accessCode": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 64
+        },
+        "nextItemSlot": {
+          "type": "number"
+        },
+        "active": {
+          "type": "boolean"
+        },
+        "sortOrder": {
+          "type": "number"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "ownerUid",
+        "authorizedEmails",
+        "name",
+        "area",
+        "workerName",
+        "description",
+        "accessCode",
+        "nextItemSlot",
+        "active",
+        "sortOrder",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "StationLink": {
+      "title": "StationLink",
+      "description": "Token de acceso directo por QR o enlace para ingresar a un puesto de trabajo.",
+      "type": "object",
+      "properties": {
+        "workspaceId": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "ownerUid": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "stationId": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "stationName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "workerName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "active": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "ownerUid",
+        "stationId",
+        "stationName",
+        "workerName",
+        "active",
+        "createdAt"
+      ]
+    },
+    "InventoryItem": {
+      "title": "InventoryItem",
+      "description": "Insumo del restaurante asignado a un puesto de trabajo.",
+      "type": "object",
+      "properties": {
+        "workspaceId": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "ownerUid": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "authorizedEmails": {
+          "type": "array"
+        },
+        "station": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "unit": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24
+        },
+        "minStock": {
+          "type": "number"
+        },
+        "targetStock": {
+          "type": "number"
+        },
+        "active": {
+          "type": "boolean"
+        },
+        "sortOrder": {
+          "type": "number"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "ownerUid",
+        "authorizedEmails",
+        "station",
+        "name",
+        "unit",
+        "minStock",
+        "targetStock",
+        "active",
+        "sortOrder",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "DailyReport": {
+      "title": "DailyReport",
+      "description": "Encabezado del reporte diario de inventario por fecha y puesto de trabajo.",
+      "type": "object",
+      "properties": {
+        "workspaceId": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "ownerUid": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "authorizedEmails": {
+          "type": "array"
+        },
+        "date": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+          "maxLength": 10
+        },
+        "station": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "status": {
+          "type": "string",
+          "enum": ["open", "opening_saved", "completed"]
+        },
+        "reportedByUid": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "reportedByName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "ownerUid",
+        "authorizedEmails",
+        "date",
+        "station",
+        "status",
+        "reportedByUid",
+        "reportedByName",
+        "notes",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "DailyReportEntry": {
+      "title": "DailyReportEntry",
+      "description": "Conteo diario de un insumo específico (inicio, ingresos, fin).",
+      "type": "object",
+      "properties": {
+        "workspaceId": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "ownerUid": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "authorizedEmails": {
+          "type": "array"
+        },
+        "reportId": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "itemId": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "station": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "date": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+          "maxLength": 10
+        },
+        "itemName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "unit": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 24
+        },
+        "minStock": {
+          "type": "number"
+        },
+        "targetStock": {
+          "type": "number"
+        },
+        "opening": {
+          "type": "number"
+        },
+        "added": {
+          "type": "number"
+        },
+        "closing": {
+          "type": "number"
+        },
+        "hasOpening": {
+          "type": "boolean"
+        },
+        "hasClosing": {
+          "type": "boolean"
+        },
+        "updatedByUid": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "updatedByName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "ownerUid",
+        "authorizedEmails",
+        "reportId",
+        "itemId",
+        "station",
+        "date",
+        "itemName",
+        "unit",
+        "minStock",
+        "targetStock",
+        "opening",
+        "added",
+        "closing",
+        "hasOpening",
+        "hasClosing",
+        "updatedByUid",
+        "updatedByName",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Invite": {
+      "title": "Invite",
+      "description": "Invitación por correo para una encargada o co-administrador.",
+      "type": "object",
+      "properties": {
+        "workspaceId": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "ownerUid": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 120
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "station": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["workspaceId", "ownerUid", "email", "displayName", "station", "createdAt"]
+    },
+    "TeamMember": {
+      "title": "TeamMember",
+      "description": "Miembro verificado del equipo con acceso activo a un puesto de trabajo.",
+      "type": "object",
+      "properties": {
+        "workspaceId": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "ownerUid": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "uid": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 120
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "station": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "inviteId": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        },
+        "active": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "workspaceId",
+        "ownerUid",
+        "uid",
+        "email",
+        "displayName",
+        "station",
+        "inviteId",
+        "active",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/workspaces/{workspaceId}": {
+      "schema": { "$ref": "#/entities/Workspace" },
+      "description": "Configuración del restaurante y lista de correos autorizados"
+    },
+    "/stations/{stationId}": {
+      "schema": { "$ref": "#/entities/Workstation" },
+      "description": "Puestos de trabajo configurables por el jefe"
+    },
+    "/stationLinks/{accessCode}": {
+      "schema": { "$ref": "#/entities/StationLink" },
+      "description": "Enlaces y códigos QR de acceso directo a puestos de trabajo"
+    },
+    "/items/{itemId}": {
+      "schema": { "$ref": "#/entities/InventoryItem" },
+      "description": "Catálogo de insumos por puesto de trabajo"
+    },
+    "/dailyReports/{reportId}": {
+      "schema": { "$ref": "#/entities/DailyReport" },
+      "description": "Reportes diarios de apertura y cierre por puesto de trabajo"
+    },
+    "/dailyReports/{reportId}/entries/{itemId}": {
+      "schema": { "$ref": "#/entities/DailyReportEntry" },
+      "description": "Conteo individual de cada insumo dentro del reporte diario"
+    },
+    "/invites/{inviteId}": {
+      "schema": { "$ref": "#/entities/Invite" },
+      "description": "Invitaciones enviadas por el jefe a las encargadas"
+    },
+    "/teamMembers/{memberId}": {
+      "schema": { "$ref": "#/entities/TeamMember" },
+      "description": "Perfiles verificados de integrantes del equipo"
+    }
+  }
+}

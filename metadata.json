@@ -1,0 +1,6 @@
+{
+  "name": "TurnoStock — Inventario de Restaurante",
+  "description": "Sistema digital de inventario diario por estaciones (Mesera, Hamburguesas y Salchipapas) con reportes de inicio, cierre y lista de compras para el jefe.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
