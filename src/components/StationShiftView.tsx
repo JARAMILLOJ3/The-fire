@@ -17,9 +17,11 @@ import {
   Save,
   Search,
   Sun,
+  WifiOff,
 } from 'lucide-react';
-import { MAX_NOTES_LENGTH, MAX_STOCK_VALUE } from '../constants';
+import { MAX_NOTES_LENGTH } from '../constants';
 import {
+  ConcurrencyConflictError,
   fetchStationEntriesOnce,
   reopenStationReport,
   saveStationReportBatch,
@@ -33,12 +35,17 @@ import type {
   Workstation,
 } from '../types';
 import {
+  detectEntryAnomalies,
+  detectReportAnomalies,
   formatDateHuman,
   formatTimeShort,
   getPreviousDateStr,
   getStockLevel,
   getStockLevelMeta,
   getSuggestedPurchase,
+  parseQuantityInput,
+  sanitizeStockQuantity,
+  type EntryAnomaly,
 } from '../utils/inventory';
 import type { WorkerScheduleStatus } from '../utils/schedule';
 
@@ -52,6 +59,8 @@ interface StationShiftViewProps {
   items: InventoryItem[];
   report: DailyReport | undefined;
   entriesByItemId: Record<string, DailyReportEntry>;
+  isOnline?: boolean;
+  hasPendingWrites?: boolean;
   onSaved?: () => void;
 }
 
@@ -78,6 +87,7 @@ interface StoredDraftPayload {
   touched: Record<string, TouchedFlags>;
   notes: string;
   notesTouched: boolean;
+  baselineUpdatedAtMs?: number | null;
   savedAt: number;
 }
 
@@ -104,6 +114,10 @@ function readStoredDraft(key: string): StoredDraftPayload | null {
       touched: parsed.touched && typeof parsed.touched === 'object' ? parsed.touched : {},
       notes: typeof parsed.notes === 'string' ? parsed.notes : '',
       notesTouched: Boolean(parsed.notesTouched),
+      baselineUpdatedAtMs:
+        parsed.baselineUpdatedAtMs === null || typeof parsed.baselineUpdatedAtMs === 'number'
+          ? parsed.baselineUpdatedAtMs
+          : undefined,
       savedAt: typeof parsed.savedAt === 'number' ? parsed.savedAt : Date.now(),
     };
   } catch {
@@ -182,9 +196,16 @@ function buildRowFromSources(
   };
 }
 
-function clampQty(val: number): number {
-  if (!Number.isFinite(val)) return 0;
-  return Math.max(0, Math.min(MAX_STOCK_VALUE, Math.round(val * 100) / 100));
+function hasAnyTouchedFlags(
+  touched: Record<string, TouchedFlags>,
+  notesTouched: boolean,
+): boolean {
+  return (
+    notesTouched ||
+    Object.values(touched).some(
+      (t) => t.opening || t.added || t.closing || t.notApplicable,
+    )
+  );
 }
 
 export function StationShiftView({
@@ -197,6 +218,8 @@ export function StationShiftView({
   items,
   report,
   entriesByItemId,
+  isOnline = true,
+  hasPendingWrites = false,
   onSaved,
 }: StationShiftViewProps) {
   const stationItems = useMemo(
@@ -222,25 +245,41 @@ export function StationShiftView({
   const [searchTerm, setSearchTerm] = useState('');
   const [itemFilter, setItemFilter] = useState<ItemFilter>('todos');
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [remoteChangedBy, setRemoteChangedBy] = useState<string | null>(null);
+  const [pendingConflict, setPendingConflict] = useState<{
+    mode: 'opening' | 'closing';
+    message: string;
+  } | null>(null);
+  const [pendingAnomalyConfirm, setPendingAnomalyConfirm] = useState<{
+    mode: 'opening' | 'closing';
+    anomalies: EntryAnomaly[];
+  } | null>(null);
 
   const touchedRef = useRef<Record<string, TouchedFlags>>({});
   const notesTouchedRef = useRef(false);
+  const baselineUpdatedAtRef = useRef<number | null>(
+    report?.updatedAt && typeof report.updatedAt.toMillis === 'function'
+      ? report.updatedAt.toMillis()
+      : null,
+  );
   const latestEntriesRef = useRef(entriesByItemId);
   const latestItemsRef = useRef(stationItems);
   const latestReportNotesRef = useRef(report?.notes ?? '');
+  const latestReportUpdatedAtMsRef = useRef<number | null>(null);
   const autoPreloadKeyRef = useRef<string>('');
   const listSectionRef = useRef<HTMLDivElement | null>(null);
 
   latestEntriesRef.current = entriesByItemId;
   latestItemsRef.current = stationItems;
   latestReportNotesRef.current = report?.notes ?? '';
+  latestReportUpdatedAtMsRef.current =
+    report?.updatedAt && typeof report.updatedAt.toMillis === 'function'
+      ? report.updatedAt.toMillis()
+      : null;
 
   const persistLocalDraft = useCallback(
     (nextDrafts: Record<string, DraftEntryRow>, nextNotes: string) => {
-      const hasAnyTouchedRow = Object.values(touchedRef.current).some(
-        (t) => t.opening || t.added || t.closing || t.notApplicable,
-      );
-      if (!hasAnyTouchedRow && !notesTouchedRef.current) {
+      if (!hasAnyTouchedFlags(touchedRef.current, notesTouchedRef.current)) {
         clearStoredDraft(storageKey);
         return;
       }
@@ -265,6 +304,7 @@ export function StationShiftView({
         touched: touchedRef.current,
         notes: nextNotes,
         notesTouched: notesTouchedRef.current,
+        baselineUpdatedAtMs: baselineUpdatedAtRef.current,
         savedAt: Date.now(),
       });
     },
@@ -291,15 +331,18 @@ export function StationShiftView({
       );
     });
 
-    const hasRestoredEdits =
-      Boolean(stored?.notesTouched) ||
-      Object.values(nextTouched).some(
-        (t) => t.opening || t.added || t.closing || t.notApplicable,
-      );
+    const hasRestoredEdits = hasAnyTouchedFlags(nextTouched, Boolean(stored?.notesTouched));
+    baselineUpdatedAtRef.current =
+      hasRestoredEdits && stored?.baselineUpdatedAtMs !== undefined
+        ? stored.baselineUpdatedAtMs
+        : latestReportUpdatedAtMsRef.current;
 
     setDrafts(nextDrafts);
     setNotes(stored?.notesTouched ? stored.notes : latestReportNotesRef.current);
     setRestoredFromLocal(hasRestoredEdits);
+    setRemoteChangedBy(null);
+    setPendingConflict(null);
+    setPendingAnomalyConfirm(null);
     setFeedback(null);
     setAutoLoadedPrevDate(null);
   }, [workspace.id, station.id, selectedDate, report?.id, draftMode, storageKey]);
@@ -307,6 +350,19 @@ export function StationShiftView({
   // 2. Merge remote snapshot updates WITHOUT overwriting any touched local fields
   useEffect(() => {
     const stored = readStoredDraft(storageKey);
+    const currentRemoteUpdatedAtMs =
+      report?.updatedAt && typeof report.updatedAt.toMillis === 'function'
+        ? report.updatedAt.toMillis()
+        : null;
+    const hasTouchedEdits = hasAnyTouchedFlags(touchedRef.current, notesTouchedRef.current);
+
+    if (!hasTouchedEdits) {
+      baselineUpdatedAtRef.current = currentRemoteUpdatedAtMs;
+      setRemoteChangedBy(null);
+    } else if (currentRemoteUpdatedAtMs !== baselineUpdatedAtRef.current) {
+      setRemoteChangedBy(report?.reportedByName || 'Otro dispositivo');
+    }
+
     setDrafts((prev) => {
       let changed = false;
       const next: Record<string, DraftEntryRow> = { ...prev };
@@ -400,7 +456,7 @@ export function StationShiftView({
     if (!notesTouchedRef.current) {
       setNotes(report?.notes ?? '');
     }
-  }, [stationItems, entriesByItemId, report?.notes, storageKey]);
+  }, [stationItems, entriesByItemId, report?.notes, report?.updatedAt, report?.reportedByName, storageKey]);
 
   // 3. Auto-preload yesterday's closing as today's opening if today has no report yet
   useEffect(() => {
@@ -490,9 +546,10 @@ export function StationShiftView({
     badInput: boolean,
   ) => {
     if (badInput) return;
-    const trimmed = rawValue.trim();
+    const parsed = parseQuantityInput(rawValue);
+    if (!parsed.valid) return;
 
-    if (trimmed === '') {
+    if (parsed.empty) {
       applyRowMutation(
         itemId,
         (current) => ({
@@ -506,15 +563,11 @@ export function StationShiftView({
       return;
     }
 
-    const parsed = Number(trimmed);
-    if (!Number.isFinite(parsed) || parsed < 0) return;
-    const clamped = clampQty(parsed);
-
     applyRowMutation(
       itemId,
       (current) => ({
         ...current,
-        [field]: clamped,
+        [field]: parsed.value,
         notApplicable: field === 'added' ? current.notApplicable : false,
         hasOpening: field === 'opening' ? true : current.hasOpening,
         hasClosing: field === 'closing' ? true : current.hasClosing,
@@ -539,7 +592,7 @@ export function StationShiftView({
             ? current.opening
             : 0
           : current.added;
-    const nextVal = clampQty(base + delta);
+    const nextVal = sanitizeStockQuantity(base + delta);
     applyRowMutation(
       itemId,
       (row) => ({
@@ -677,7 +730,36 @@ export function StationShiftView({
   const progressPct =
     stationItems.length > 0 ? Math.round((countedCount / stationItems.length) * 100) : 0;
 
-  const handleSave = async (mode: 'opening' | 'closing') => {
+  const syncDraftsWithServer = () => {
+    clearStoredDraft(storageKey);
+    touchedRef.current = {};
+    notesTouchedRef.current = false;
+    baselineUpdatedAtRef.current = latestReportUpdatedAtMsRef.current;
+
+    const syncedDrafts: Record<string, DraftEntryRow> = {};
+    stationItems.forEach((item) => {
+      syncedDrafts[item.id] = buildRowFromSources(
+        item,
+        entriesByItemId[item.id],
+        undefined,
+        undefined,
+      );
+    });
+    setDrafts(syncedDrafts);
+    setNotes(report?.notes ?? '');
+    setRestoredFromLocal(false);
+    setRemoteChangedBy(null);
+    setPendingConflict(null);
+    setFeedback({
+      type: 'success',
+      text: 'Planilla sincronizada con los últimos datos guardados en el servidor.',
+    });
+  };
+
+  const handleSave = async (
+    mode: 'opening' | 'closing',
+    options?: { forceOverwrite?: boolean; skipAnomalyCheck?: boolean },
+  ) => {
     if (stationItems.length === 0) return;
 
     const requiresFullCount = mode === 'closing' || isWorkerOpeningPhase;
@@ -691,11 +773,22 @@ export function StationShiftView({
       return;
     }
 
+    const rows = stationItems.map((it) => drafts[it.id]).filter(Boolean);
+
+    if (!options?.skipAnomalyCheck) {
+      const anomalies = detectReportAnomalies(rows, mode);
+      if (anomalies.length > 0) {
+        setPendingAnomalyConfirm({ mode, anomalies });
+        return;
+      }
+    }
+
+    setPendingAnomalyConfirm(null);
+    setPendingConflict(null);
     setSavingMode(mode);
     setFeedback(null);
     try {
-      const rows = stationItems.map((it) => drafts[it.id]).filter(Boolean);
-      await saveStationReportBatch({
+      const saveResult = await saveStationReportBatch({
         workspace,
         user,
         canManage,
@@ -706,22 +799,38 @@ export function StationShiftView({
         rows,
         existingReport: report,
         existingEntries: entriesByItemId,
+        expectedUpdatedAtMs: baselineUpdatedAtRef.current,
+        forceOverwrite: options?.forceOverwrite,
       });
 
       clearStoredDraft(storageKey);
       touchedRef.current = {};
       notesTouchedRef.current = false;
       setRestoredFromLocal(false);
+      setRemoteChangedBy(null);
 
       setFeedback({
         type: 'success',
-        text:
-          mode === 'opening'
+        text: saveResult.queuedOffline
+          ? mode === 'opening'
+            ? 'Sin conexión — apertura guardada en este celular. Se enviará sola al volver internet.'
+            : 'Sin conexión — cierre guardado en este celular. Se enviará al jefe en cuanto vuelva la señal.'
+          : mode === 'opening'
             ? '¡Apertura y surtido guardados! Si llegan más productos en este horario puedes volver a ajustarlo.'
             : '¡Excelente! Tu cierre fue enviado y el jefe ya puede verlo en su resumen.',
       });
       onSaved?.();
     } catch (err) {
+      if (err instanceof ConcurrencyConflictError) {
+        if (err.reason === 'completed_locked') {
+          setFeedback({ type: 'error', text: err.message });
+        } else {
+          setPendingConflict({ mode, message: err.message });
+          setFeedback({ type: 'error', text: err.message });
+        }
+        return;
+      }
+
       const rawMsg = err instanceof Error ? err.message : '';
       const isPerm = rawMsg.includes('permission') || rawMsg.includes('insufficient');
       setFeedback({
@@ -888,13 +997,53 @@ export function StationShiftView({
         </div>
       </div>
 
+      {/* Offline / Pending sync banner */}
+      {(!isOnline || hasPendingWrites) && (
+        <div
+          role="status"
+          className="px-4 py-3 rounded-2xl bg-stone-900 text-stone-100 text-xs sm:text-sm flex items-center gap-2.5"
+        >
+          <WifiOff className="w-4 h-4 text-orange-400 shrink-0" />
+          <span>
+            {!isOnline
+              ? 'Sin conexión — puedes seguir contando; al enviar se guardará aquí y se subirá solo cuando regrese internet.'
+              : 'Sincronizando cambios guardados sin conexión con el servidor...'}
+          </span>
+        </div>
+      )}
+
       {/* 10-minute grace period banner */}
       {!canManage && scheduleStatus.inGracePeriod && !isLocked && (
         <div className="px-4 py-3 rounded-2xl bg-amber-50 border border-amber-200 text-xs sm:text-sm text-amber-900 flex items-center gap-2.5">
           <Clock className="w-4 h-4 text-amber-600 shrink-0" />
           <span>
-            Estás en los <strong>10 minutos de tolerancia</strong> posteriores al horario. Envía tu registro antes de que cierre la ventana.
+            Estás en tiempo de tolerancia (
+            <strong>
+              {scheduleStatus.graceRemainingMinutes !== null
+                ? `quedan ${scheduleStatus.graceRemainingMinutes} min`
+                : 'últimos minutos'}
+            </strong>
+            ). Envía tu registro antes de que cierre la ventana.
           </span>
+        </div>
+      )}
+
+      {/* Remote concurrent edit notice */}
+      {remoteChangedBy && !isLocked && (
+        <div className="px-4 py-3 rounded-2xl bg-amber-50 border border-amber-200 text-xs sm:text-sm text-amber-900 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+            <span>
+              <strong>{remoteChangedBy}</strong> actualizó esta planilla desde otro dispositivo. Tus cambios locales siguen protegidos.
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={syncDraftsWithServer}
+            className="text-xs font-bold text-orange-700 underline hover:text-orange-900 cursor-pointer"
+          >
+            Cargar datos del servidor
+          </button>
         </div>
       )}
 
@@ -1128,6 +1277,7 @@ export function StationShiftView({
                         : 'bg-emerald-50/40 border-emerald-500 text-stone-900';
 
                 const isAccounted = isRowAccounted(row);
+                const rowAnomalies = detectEntryAnomalies(row, draftMode);
 
                 return (
                   <div
@@ -1180,6 +1330,13 @@ export function StationShiftView({
                         )}
                       </div>
                     </div>
+
+                    {rowAnomalies.length > 0 && (
+                      <div className="flex items-start gap-2 px-3 py-2 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900">
+                        <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0 mt-0.5" />
+                        <span>{rowAnomalies[0].message}</span>
+                      </div>
+                    )}
 
                     {isWorkerOpeningPhase ? (
                       /* OPENING & RESTOCK PHASE */
@@ -1549,6 +1706,8 @@ export function StationShiftView({
                       item.targetStock,
                     );
 
+                    const rowAnomalies = detectEntryAnomalies(row, draftMode);
+
                     return (
                       <tr
                         key={item.id}
@@ -1564,6 +1723,12 @@ export function StationShiftView({
                               ? ` · Base día: ${row.opening + row.added}`
                               : ''}
                           </div>
+                          {rowAnomalies.length > 0 && (
+                            <div className="inline-flex items-center gap-1 mt-1 text-xs font-medium text-amber-700">
+                              <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                              <span>{rowAnomalies[0].message}</span>
+                            </div>
+                          )}
                         </td>
 
                         {(isWorkerOpeningPhase || showOpeningDetails) && (
@@ -1841,6 +2006,82 @@ export function StationShiftView({
               className="w-full px-3.5 py-2.5 text-base sm:text-sm bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 focus:bg-white disabled:opacity-60"
             />
           </div>
+
+          {pendingConflict && !isLocked && (
+            <div className="p-4 rounded-xl bg-red-50 border border-red-200 space-y-3">
+              <div className="flex items-start gap-2.5 text-sm text-red-900">
+                <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                <div>
+                  <p className="font-semibold">Conflicto de edición concurrente</p>
+                  <p className="text-xs text-red-800 mt-0.5">{pendingConflict.message}</p>
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={syncDraftsWithServer}
+                  className="min-h-[40px] px-3.5 py-2 text-xs font-semibold text-stone-800 bg-white border border-stone-300 rounded-xl hover:bg-stone-100 cursor-pointer"
+                >
+                  Aceptar versión del servidor
+                </button>
+                <button
+                  type="button"
+                  disabled={savingMode !== null}
+                  onClick={() =>
+                    handleSave(pendingConflict.mode, {
+                      forceOverwrite: true,
+                      skipAnomalyCheck: true,
+                    })
+                  }
+                  className="min-h-[40px] px-3.5 py-2 text-xs font-semibold text-white bg-red-700 rounded-xl hover:bg-red-800 disabled:opacity-50 cursor-pointer"
+                >
+                  Sobrescribir con mis conteos
+                </button>
+              </div>
+            </div>
+          )}
+
+          {pendingAnomalyConfirm && !isLocked && (
+            <div className="p-4 rounded-xl bg-amber-50 border border-amber-200 space-y-3">
+              <div className="flex items-start gap-2.5 text-sm text-amber-950">
+                <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                <div className="space-y-1">
+                  <p className="font-semibold">
+                    Verifica {pendingAnomalyConfirm.anomalies.length}{' '}
+                    {pendingAnomalyConfirm.anomalies.length === 1 ? 'cantidad inusual' : 'cantidades inusuales'} antes de enviar
+                  </p>
+                  <ul className="text-xs text-amber-900 space-y-1 list-disc pl-4">
+                    {pendingAnomalyConfirm.anomalies.slice(0, 5).map((a) => (
+                      <li key={`${a.itemId}-${a.type}`}>
+                        <strong>{a.itemName}:</strong> {a.message}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => setPendingAnomalyConfirm(null)}
+                  className="min-h-[40px] px-3.5 py-2 text-xs font-semibold text-stone-800 bg-white border border-stone-300 rounded-xl hover:bg-stone-100 cursor-pointer"
+                >
+                  Revisar conteos
+                </button>
+                <button
+                  type="button"
+                  disabled={savingMode !== null}
+                  onClick={() =>
+                    handleSave(pendingAnomalyConfirm.mode, {
+                      skipAnomalyCheck: true,
+                    })
+                  }
+                  className="min-h-[40px] px-3.5 py-2 text-xs font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 disabled:opacity-50 cursor-pointer"
+                >
+                  Confirmar y enviar así
+                </button>
+              </div>
+            </div>
+          )}
 
           {!isLocked && !allAccounted && (
             <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2.5 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900">

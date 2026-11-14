@@ -7,6 +7,7 @@ export type WorkerSchedulePhase = 'opening' | 'closing' | 'outside' | 'unrestric
 export interface WorkerScheduleStatus {
   phase: WorkerSchedulePhase;
   inGracePeriod: boolean;
+  graceRemainingMinutes: number | null;
   operationalDate: string;
   schedule: ShiftSchedule;
   openingRangeLabel: string;
@@ -67,12 +68,17 @@ export function isTimeInWindow(
   startHHMM: string,
   endHHMM: string,
   graceMinutes = 0,
-): { inWindow: boolean; inGrace: boolean; wrappedToPreviousDay: boolean } {
+): {
+  inWindow: boolean;
+  inGrace: boolean;
+  wrappedToPreviousDay: boolean;
+  graceRemainingMinutes: number | null;
+} {
   const start = parseTimeToMinutes(startHHMM);
   const end = parseTimeToMinutes(endHHMM);
 
   if (start === end) {
-    return { inWindow: false, inGrace: false, wrappedToPreviousDay: false };
+    return { inWindow: false, inGrace: false, wrappedToPreviousDay: false, graceRemainingMinutes: null };
   }
 
   const span = (end - start + 1440) % 1440;
@@ -80,7 +86,7 @@ export function isTimeInWindow(
 
   if (elapsed < span) {
     const wrappedToPreviousDay = start > end && nowMinutes < end;
-    return { inWindow: true, inGrace: false, wrappedToPreviousDay };
+    return { inWindow: true, inGrace: false, wrappedToPreviousDay, graceRemainingMinutes: null };
   }
 
   if (graceMinutes > 0 && elapsed < span + graceMinutes) {
@@ -88,10 +94,15 @@ export function isTimeInWindow(
     const wrappedToPreviousDay =
       (start > end && nowMinutes < endWithGrace) ||
       (start < end && end + graceMinutes >= 1440 && nowMinutes < endWithGrace);
-    return { inWindow: true, inGrace: true, wrappedToPreviousDay };
+    return {
+      inWindow: true,
+      inGrace: true,
+      wrappedToPreviousDay,
+      graceRemainingMinutes: span + graceMinutes - elapsed,
+    };
   }
 
-  return { inWindow: false, inGrace: false, wrappedToPreviousDay: false };
+  return { inWindow: false, inGrace: false, wrappedToPreviousDay: false, graceRemainingMinutes: null };
 }
 
 export function validateShiftSchedule(schedule: ShiftSchedule): ShiftScheduleValidation {
@@ -172,6 +183,7 @@ export function resolveWorkerScheduleStatus(
     return {
       phase: 'unrestricted',
       inGracePeriod: false,
+      graceRemainingMinutes: null,
       operationalDate: operationalToday,
       schedule,
       openingRangeLabel,
@@ -190,6 +202,7 @@ export function resolveWorkerScheduleStatus(
     return {
       phase: 'opening',
       inGracePeriod: openingCheck.inGrace,
+      graceRemainingMinutes: openingCheck.graceRemainingMinutes,
       operationalDate: openingCheck.wrappedToPreviousDay
         ? getPreviousDateStr(bogota.dateStr)
         : operationalToday,
@@ -210,6 +223,7 @@ export function resolveWorkerScheduleStatus(
     return {
       phase: 'closing',
       inGracePeriod: closingCheck.inGrace,
+      graceRemainingMinutes: closingCheck.graceRemainingMinutes,
       operationalDate: closingCheck.wrappedToPreviousDay
         ? getPreviousDateStr(bogota.dateStr)
         : operationalToday,
@@ -223,6 +237,7 @@ export function resolveWorkerScheduleStatus(
   return {
     phase: 'outside',
     inGracePeriod: false,
+    graceRemainingMinutes: null,
     operationalDate: operationalToday,
     schedule,
     openingRangeLabel,

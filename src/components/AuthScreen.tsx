@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { motion } from 'motion/react';
 import { ClipboardCheck, QrCode, ShoppingCart, Store, UtensilsCrossed } from 'lucide-react';
-import heroPhoto from '../assets/images/restaurant_prep_hero_1794616390901.jpg';
+import heroPhoto from '../assets/images/restaurant_prep_hero.webp';
 import type { StationLink } from '../types';
 import { BrandLogo } from './BrandLogo';
 
@@ -173,6 +173,8 @@ export function AuthScreen({
                 <img
                   src={heroPhoto}
                   alt="Estación de preparación y nevera de bebidas en restaurante The Fire"
+                  loading="lazy"
+                  decoding="async"
                   referrerPolicy="no-referrer"
                   onError={() => setImgFailed(true)}
                   className="w-full h-full object-cover"

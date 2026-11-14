@@ -9,11 +9,41 @@ export default defineConfig(() => {
     resolve: {
       dedupe: ['react', 'react-dom'],
       alias: {
-        '@': path.resolve(__dirname, '.'),
+        '@': path.resolve(import.meta.dirname, '.'),
       },
     },
     optimizeDeps: {
       include: ['react', 'react-dom', 'react-dom/client', 'motion/react', 'lucide-react'],
+    },
+    build: {
+      rolldownOptions: {
+        output: {
+          manualChunks(id) {
+            if (id.includes('node_modules/react/') || id.includes('node_modules/react-dom/')) {
+              return 'react-vendor';
+            }
+            if (
+              id.includes('node_modules/@firebase/firestore') ||
+              id.includes('node_modules/firebase/firestore')
+            ) {
+              return 'firebase-firestore-vendor';
+            }
+            if (id.includes('node_modules/firebase/') || id.includes('node_modules/@firebase/')) {
+              return 'firebase-auth-vendor';
+            }
+            if (id.includes('node_modules/motion')) {
+              return 'motion-vendor';
+            }
+            if (id.includes('node_modules/qrcode')) {
+              return 'qrcode-vendor';
+            }
+            if (id.includes('node_modules/lucide-react')) {
+              return 'icons-vendor';
+            }
+            return undefined;
+          },
+        },
+      },
     },
     server: {
       // HMR is disabled in AI Studio via DISABLE_HMR env var.

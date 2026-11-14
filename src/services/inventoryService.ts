@@ -41,6 +41,7 @@ import type {
   Workspace,
   Workstation,
 } from '../types';
+import { sanitizeStockQuantity } from '../utils/inventory';
 import { validateShiftSchedule } from '../utils/schedule';
 
 export interface ResolvedSession {
@@ -56,6 +57,101 @@ export class SessionAccessError extends Error {
     super(message);
     this.name = 'SessionAccessError';
   }
+}
+
+export class ConcurrencyConflictError extends Error {
+  readonly reason: 'completed_locked' | 'concurrent_create' | 'concurrent_update';
+  readonly serverUpdatedByName?: string;
+  readonly serverStatus?: ReportStatus;
+
+  constructor(
+    message: string,
+    reason: 'completed_locked' | 'concurrent_create' | 'concurrent_update',
+    details?: { serverUpdatedByName?: string; serverStatus?: ReportStatus },
+  ) {
+    super(message);
+    this.name = 'ConcurrencyConflictError';
+    this.reason = reason;
+    this.serverUpdatedByName = details?.serverUpdatedByName;
+    this.serverStatus = details?.serverStatus;
+  }
+}
+
+export function evaluateReportSaveGuard(params: {
+  mode: 'opening' | 'closing';
+  canManage: boolean;
+  expectedUpdatedAtMs?: number | null;
+  forceOverwrite?: boolean;
+  serverExists: boolean;
+  serverStatus?: ReportStatus;
+  serverUpdatedAtMs?: number | null;
+  serverUpdatedByName?: string;
+}):
+  | {
+      ok: true;
+      effectiveStatus: ReportStatus;
+    }
+  | {
+      ok: false;
+      reason: 'completed_locked' | 'concurrent_create' | 'concurrent_update';
+      message: string;
+    } {
+  const {
+    mode,
+    canManage,
+    expectedUpdatedAtMs,
+    forceOverwrite,
+    serverExists,
+    serverStatus,
+    serverUpdatedAtMs,
+    serverUpdatedByName,
+  } = params;
+
+  const requestedStatus: ReportStatus = mode === 'closing' ? 'completed' : 'opening_saved';
+
+  // Downgrade protection: never allow workers to edit/reopen a completed report,
+  // and never let boss opening adjustments silently downgrade a completed status.
+  if (serverExists && serverStatus === 'completed') {
+    if (!canManage) {
+      return {
+        ok: false,
+        reason: 'completed_locked',
+        message:
+          'Este cierre ya fue enviado al jefe. Pídele que reabra la planilla si necesitas corregirlo.',
+      };
+    }
+  }
+
+  const effectiveStatus: ReportStatus =
+    serverExists && serverStatus === 'completed' ? 'completed' : requestedStatus;
+
+  if (!forceOverwrite && expectedUpdatedAtMs !== undefined) {
+    if (expectedUpdatedAtMs === null && serverExists) {
+      return {
+        ok: false,
+        reason: 'concurrent_create',
+        message: `${serverUpdatedByName || 'Otra persona'} acaba de guardar esta planilla desde otro dispositivo. Revisa los cambios antes de sobrescribir.`,
+      };
+    }
+
+    if (
+      typeof expectedUpdatedAtMs === 'number' &&
+      serverExists &&
+      typeof serverUpdatedAtMs === 'number' &&
+      serverUpdatedAtMs !== expectedUpdatedAtMs
+    ) {
+      return {
+        ok: false,
+        reason: 'concurrent_update',
+        message: `${serverUpdatedByName || 'Otra persona'} actualizó esta planilla después de que la abriste. Revisa los cambios o confirma si deseas sobrescribir.`,
+      };
+    }
+  }
+
+  return {
+    ok: true,
+    effectiveStatus,
+  };
 }
 
 const BASE62_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
@@ -75,8 +171,7 @@ function clampString(val: string, maxLen: number): string {
 }
 
 function clampNumber(val: number): number {
-  if (!Number.isFinite(val) || val < 0) return 0;
-  return Math.min(MAX_STOCK_VALUE, Math.round(val * 100) / 100);
+  return sanitizeStockQuantity(val);
 }
 
 function makeCleanId(prefix: string): string {
@@ -1020,23 +1115,113 @@ export async function saveStationReportBatch(params: {
   rows: DraftEntryRow[];
   existingReport: DailyReport | undefined;
   existingEntries: Record<string, DailyReportEntry>;
-}): Promise<void> {
-  const { workspace, user, canManage, date, station, mode, notes, rows, existingReport, existingEntries } = params;
+  expectedUpdatedAtMs?: number | null;
+  forceOverwrite?: boolean;
+}): Promise<{ queuedOffline: boolean }> {
+  const {
+    workspace,
+    user,
+    canManage,
+    date,
+    station,
+    mode,
+    notes,
+    rows,
+    existingReport,
+    existingEntries,
+    expectedUpdatedAtMs,
+    forceOverwrite,
+  } = params;
   const reportId = `${workspace.id}_${date}_${station}`;
   const reporterName = clampString(
     user.displayName || user.email?.split('@')[0] || 'Encargada',
     MAX_NAME_LENGTH,
   );
-  const nextStatus: ReportStatus = mode === 'closing' ? 'completed' : 'opening_saved';
   const cleanNotes = clampString(notes, MAX_NOTES_LENGTH);
   const authorizedEmails = workspace.authorizedEmails.slice(0, 15);
-
-  const batch = writeBatch(db);
   const reportRef = doc(db, 'dailyReports', reportId);
 
-  if (existingReport) {
+  let detectedOffline = typeof navigator !== 'undefined' && !navigator.onLine;
+  let serverExists = Boolean(existingReport);
+  let serverStatus: ReportStatus | undefined = existingReport?.status;
+  let serverUpdatedAtMs: number | null = existingReport?.updatedAt?.toMillis?.() ?? null;
+  let serverUpdatedByName: string | undefined = existingReport?.reportedByName;
+
+  if (!detectedOffline) {
+    try {
+      const serverSnap = await getDoc(reportRef);
+      serverExists = serverSnap.exists();
+      if (serverExists) {
+        const data = serverSnap.data() as Partial<DailyReport>;
+        serverStatus = data.status;
+        serverUpdatedAtMs =
+          data.updatedAt && typeof data.updatedAt.toMillis === 'function'
+            ? data.updatedAt.toMillis()
+            : null;
+        serverUpdatedByName = data.reportedByName;
+      } else {
+        serverStatus = undefined;
+        serverUpdatedAtMs = null;
+        serverUpdatedByName = undefined;
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message.toLowerCase() : '';
+      const isOffline = msg.includes('offline') || msg.includes('unavailable');
+      if (isOffline) {
+        detectedOffline = true;
+      } else {
+        handleFirestoreError(err, OperationType.GET, `dailyReports/${reportId}`);
+      }
+    }
+  }
+
+  const guard = evaluateReportSaveGuard({
+    mode,
+    canManage,
+    expectedUpdatedAtMs,
+    forceOverwrite,
+    serverExists,
+    serverStatus,
+    serverUpdatedAtMs,
+    serverUpdatedByName,
+  });
+
+  if (!guard.ok) {
+    throw new ConcurrencyConflictError(guard.message, guard.reason, {
+      serverUpdatedByName,
+      serverStatus,
+    });
+  }
+
+  // Merge any remote entries created concurrently so we use batch.update instead of batch.set
+  const mergedExistingEntries: Record<string, DailyReportEntry> = { ...existingEntries };
+  const clientUpdatedAtMs = existingReport?.updatedAt?.toMillis?.() ?? null;
+  if (!detectedOffline && serverExists && (!existingReport || serverUpdatedAtMs !== clientUpdatedAtMs)) {
+    const missingIds = rows
+      .map((r) => r.itemId)
+      .filter((id) => !mergedExistingEntries[id]);
+    if (missingIds.length > 0) {
+      try {
+        const fetched = await Promise.all(
+          missingIds.map((itemId) => getDoc(doc(db, 'dailyReports', reportId, 'entries', itemId))),
+        );
+        fetched.forEach((snap) => {
+          if (snap.exists()) {
+            const entry = { id: snap.id, ...snap.data() } as DailyReportEntry;
+            mergedExistingEntries[entry.itemId] = entry;
+          }
+        });
+      } catch {
+        // Proceed with client snapshot if offline
+      }
+    }
+  }
+
+  const batch = writeBatch(db);
+
+  if (serverExists) {
     batch.update(reportRef, {
-      status: nextStatus,
+      status: guard.effectiveStatus,
       reportedByUid: user.uid,
       reportedByName: reporterName,
       notes: cleanNotes,
@@ -1049,7 +1234,7 @@ export async function saveStationReportBatch(params: {
       authorizedEmails,
       date,
       station,
-      status: nextStatus,
+      status: guard.effectiveStatus,
       reportedByUid: user.uid,
       reportedByName: reporterName,
       notes: cleanNotes,
@@ -1059,7 +1244,7 @@ export async function saveStationReportBatch(params: {
   }
 
   rows.forEach((row) => {
-    const prev = existingEntries[row.itemId];
+    const prev = mergedExistingEntries[row.itemId];
     const notApplicable = Boolean(row.notApplicable);
     const hasOpening = notApplicable
       ? false
@@ -1127,8 +1312,19 @@ export async function saveStationReportBatch(params: {
     }
   });
 
+  if (detectedOffline) {
+    // Firestore persistentLocalCache durably queues the batch in IndexedDB; resolve once queued
+    const commitPromise = batch.commit();
+    commitPromise.catch((error) => {
+      console.error('Error al sincronizar envío offline al reconectar:', error);
+    });
+    await new Promise((resolve) => window.setTimeout(resolve, 120));
+    return { queuedOffline: true };
+  }
+
   try {
     await batch.commit();
+    return { queuedOffline: false };
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, `dailyReports/${reportId}`);
   }

@@ -1,8 +1,10 @@
 import type { Timestamp } from 'firebase/firestore';
+import { MAX_STOCK_VALUE } from '../constants';
 import type {
   ConsolidatedItemRow,
   DailyReport,
   DailyReportEntry,
+  DraftEntryRow,
   InventoryItem,
   StockLevel,
   Workstation,
@@ -43,6 +45,107 @@ export function formatTimeShort(ts?: Timestamp): string | null {
   } catch {
     return null;
   }
+}
+
+export function sanitizeStockQuantity(val: unknown): number {
+  const num = typeof val === 'number' ? val : Number(val);
+  if (!Number.isFinite(num) || num < 0) return 0;
+  return Math.min(MAX_STOCK_VALUE, Math.round(num * 100) / 100);
+}
+
+export function parseQuantityInput(rawValue: string): {
+  valid: boolean;
+  value: number;
+  empty: boolean;
+  error?: string;
+} {
+  const normalized = rawValue.trim().replace(',', '.');
+  if (normalized === '') {
+    return { valid: true, value: 0, empty: true };
+  }
+  if (!/^[+-]?(\d+(\.\d*)?|\.\d+)$/.test(normalized)) {
+    return { valid: false, value: 0, empty: false, error: 'Ingresa un número válido.' };
+  }
+  const parsed = Number(normalized);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return { valid: false, value: 0, empty: false, error: 'No se permiten valores negativos.' };
+  }
+  if (parsed > MAX_STOCK_VALUE) {
+    return {
+      valid: false,
+      value: MAX_STOCK_VALUE,
+      empty: false,
+      error: `El máximo permitido es ${MAX_STOCK_VALUE}.`,
+    };
+  }
+  return {
+    valid: true,
+    value: sanitizeStockQuantity(parsed),
+    empty: false,
+  };
+}
+
+export type EntryAnomalyType = 'closing_exceeds_available' | 'extreme_stock_spike';
+
+export interface EntryAnomaly {
+  itemId: string;
+  itemName: string;
+  unit: string;
+  type: EntryAnomalyType;
+  message: string;
+}
+
+export function detectEntryAnomalies(
+  row: DraftEntryRow,
+  mode: 'opening' | 'closing',
+): EntryAnomaly[] {
+  if (row.notApplicable) return [];
+  const anomalies: EntryAnomaly[] = [];
+  const spikeThreshold = Math.max(row.targetStock * 3, row.minStock * 5, 500);
+
+  if (mode === 'closing' && row.hasClosing) {
+    if (row.hasOpening) {
+      const available = sanitizeStockQuantity(row.opening + row.added);
+      if (row.closing > available) {
+        anomalies.push({
+          itemId: row.itemId,
+          itemName: row.itemName,
+          unit: row.unit,
+          type: 'closing_exceeds_available',
+          message: `Cierre (${row.closing}) mayor a inicio + surtido (${available} ${row.unit}). ¿Faltó anotar surtido?`,
+        });
+      }
+    }
+    if (row.closing > spikeThreshold) {
+      anomalies.push({
+        itemId: row.itemId,
+        itemName: row.itemName,
+        unit: row.unit,
+        type: 'extreme_stock_spike',
+        message: `Cantidad muy alta (${row.closing} ${row.unit}). Verifica si hubo un error de digitación.`,
+      });
+    }
+  } else if (mode === 'opening' && row.hasOpening) {
+    const totalAvailable = sanitizeStockQuantity(row.opening + row.added);
+    if (totalAvailable > spikeThreshold) {
+      anomalies.push({
+        itemId: row.itemId,
+        itemName: row.itemName,
+        unit: row.unit,
+        type: 'extreme_stock_spike',
+        message: `Total disponible muy alto (${totalAvailable} ${row.unit}). Verifica si hubo un error de digitación.`,
+      });
+    }
+  }
+
+  return anomalies;
+}
+
+export function detectReportAnomalies(
+  rows: DraftEntryRow[],
+  mode: 'opening' | 'closing',
+): EntryAnomaly[] {
+  return rows.flatMap((row) => detectEntryAnomalies(row, mode));
 }
 
 export function getStockLevel(closingQty: number, minStock: number): StockLevel {

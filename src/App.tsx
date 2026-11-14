@@ -1,13 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import {
-  getRedirectResult,
-  onAuthStateChanged,
-  signInWithPopup,
-  signInWithRedirect,
-  signOut,
-  type User,
-} from 'firebase/auth';
-import { collection, doc, onSnapshot, query, where } from 'firebase/firestore';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion, MotionConfig } from 'motion/react';
 import {
   Calendar,
@@ -23,40 +14,39 @@ import {
   QrCode,
   Users,
   UtensilsCrossed,
+  WifiOff,
   X,
 } from 'lucide-react';
 import { AuthScreen } from './components/AuthScreen';
-import { BossDashboard } from './components/BossDashboard';
-import { BossWelcomeModal } from './components/BossWelcomeModal';
 import { BrandLogo } from './components/BrandLogo';
-import { CatalogManager } from './components/CatalogManager';
-import { ShiftScheduleModal } from './components/ShiftScheduleModal';
-import { StationShiftView } from './components/StationShiftView';
-import { TeamManager } from './components/TeamManager';
-import { WorkstationsManager } from './components/WorkstationsManager';
-import { auth, db, googleProvider, handleFirestoreError, OperationType } from './firebase';
-import {
-  ensureWorkstationsForExistingWorkspace,
-  fetchStationLinkPreview,
-  loadWorkerStationFallback,
-  resolveUserWorkspace,
-  SessionAccessError,
-  syncAuthorizedEmailsAcrossWorkspace,
-} from './services/inventoryService';
-import type {
-  DailyReport,
-  DailyReportEntry,
-  InventoryItem,
-  Invite,
-  StationId,
-  StationLink,
-  TeamMember,
-  TeamStationId,
-  Workspace,
-  Workstation,
-} from './types';
-import { getPreviousDateStr, getTodayDateStr } from './utils/inventory';
-import { resolveWorkerScheduleStatus } from './utils/schedule';
+import { useOnlineStatus } from './hooks/useOnlineStatus';
+import { useShiftClock } from './hooks/useShiftClock';
+import { useStationData } from './hooks/useStationData';
+import { useWorkspaceSession } from './hooks/useWorkspaceSession';
+import type { DailyReport, DailyReportEntry, StationId } from './types';
+
+// Lazy-load role-specific views so worker QR sessions skip boss dashboards, QR generators & modals
+const StationShiftView = lazy(() =>
+  import('./components/StationShiftView').then((m) => ({ default: m.StationShiftView })),
+);
+const BossDashboard = lazy(() =>
+  import('./components/BossDashboard').then((m) => ({ default: m.BossDashboard })),
+);
+const WorkstationsManager = lazy(() =>
+  import('./components/WorkstationsManager').then((m) => ({ default: m.WorkstationsManager })),
+);
+const CatalogManager = lazy(() =>
+  import('./components/CatalogManager').then((m) => ({ default: m.CatalogManager })),
+);
+const TeamManager = lazy(() =>
+  import('./components/TeamManager').then((m) => ({ default: m.TeamManager })),
+);
+const BossWelcomeModal = lazy(() =>
+  import('./components/BossWelcomeModal').then((m) => ({ default: m.BossWelcomeModal })),
+);
+const ShiftScheduleModal = lazy(() =>
+  import('./components/ShiftScheduleModal').then((m) => ({ default: m.ShiftScheduleModal })),
+);
 
 type ActiveSection = 'jefe' | 'puestos' | 'catalogo' | 'equipo' | StationId;
 
@@ -77,221 +67,63 @@ function getStationIcon(stationId: string) {
   }
 }
 
-function normalizeStation(raw: string): StationId {
-  if (raw === 'hamburguesas') return 'comida_rapida';
-  return raw;
-}
-
-function normalizeTeamRole(raw: string): TeamStationId {
-  if (raw === 'jefe') return 'jefe';
-  return normalizeStation(raw);
-}
-
-function formatGoogleAuthError(error: unknown): string {
-  const code = (error as { code?: string } | null)?.code ?? '';
-  const host = typeof window !== 'undefined' ? window.location.hostname : '';
-  switch (code) {
-    case 'auth/unauthorized-domain':
-      return `El dominio "${host}" aún no está autorizado en Firebase. Agrégalo en Firebase Console → Authentication → Settings → Authorized domains.`;
-    case 'auth/popup-blocked':
-      return 'Tu navegador bloqueó la ventana emergente de Google. Permite ventanas emergentes o abre la app en Chrome o Safari.';
-    case 'auth/popup-closed-by-user':
-    case 'auth/cancelled-popup-request':
-      return 'Se cerró la ventana de Google antes de completar el ingreso. Intenta nuevamente.';
-    case 'auth/network-request-failed':
-      return 'Error de conexión con Google. Verifica tu internet e intenta de nuevo.';
-    case 'auth/operation-not-allowed':
-      return 'El inicio de sesión con Google no está habilitado en Firebase Authentication.';
-    default:
-      return code
-        ? `No se pudo iniciar sesión con Google (${code}).`
-        : 'No se pudo completar el inicio de sesión con Google.';
-  }
-}
-
-interface WorkerFallbackState {
-  station: Workstation | null;
-  items: InventoryItem[];
-  report: DailyReport | undefined;
-  entries: Record<string, DailyReportEntry>;
+function ViewSkeleton() {
+  return (
+    <div className="space-y-4">
+      <div className="h-8 w-64 bg-stone-200 rounded-xl animate-pulse" />
+      <div className="h-28 w-full bg-white border border-stone-200 rounded-2xl animate-pulse" />
+      <div className="h-64 w-full bg-white border border-stone-200 rounded-2xl animate-pulse" />
+    </div>
+  );
 }
 
 export default function App() {
-  const [linkParams] = useState(() => {
-    if (typeof window === 'undefined') {
-      return { stationId: null as string | null, accessCode: null as string | null };
-    }
-    const sp = new URLSearchParams(window.location.search);
-    return {
-      stationId: sp.get('puesto'),
-      accessCode: sp.get('codigo'),
-    };
-  });
+  const isOnline = useOnlineStatus();
+  const {
+    linkParams,
+    pendingLink,
+    user,
+    authReady,
+    authLoading,
+    authError,
+    workspace,
+    role,
+    canManage,
+    sessionLoading,
+    sessionError,
+    initialActiveSection,
+    handleSignIn,
+    handleSignOut,
+  } = useWorkspaceSession();
 
-  const [pendingLink, setPendingLink] = useState<StationLink | null>(null);
-  const [user, setUser] = useState<User | null>(null);
-  const [authReady, setAuthReady] = useState(false);
-  const [authLoading, setAuthLoading] = useState(false);
-  const [authError, setAuthError] = useState<string | null>(null);
-
-  const [workspace, setWorkspace] = useState<Workspace | null>(null);
-  const [role, setRole] = useState<TeamStationId>('jefe');
-  const [isOwner, setIsOwner] = useState(false);
-  const [sessionLoading, setSessionLoading] = useState(false);
-  const [sessionError, setSessionError] = useState<string | null>(null);
+  const { scheduleStatus: workerScheduleStatus, todayStr, yesterdayStr } = useShiftClock(
+    workspace?.shiftSchedule,
+  );
 
   const [activeSection, setActiveSection] = useState<ActiveSection>('jefe');
   const [catalogFilterStation, setCatalogFilterStation] = useState<string>('all');
-  const [selectedDate, setSelectedDate] = useState<string>(() => getTodayDateStr());
+  const [selectedDate, setSelectedDate] = useState<string>(() => todayStr);
   const [autoSelectedYesterday, setAutoSelectedYesterday] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [scheduleModalOpen, setScheduleModalOpen] = useState(false);
-  const [now, setNow] = useState<Date>(() => new Date());
 
-  const [stations, setStations] = useState<Workstation[]>([]);
-  const [stationsLoaded, setStationsLoaded] = useState(false);
-  const [items, setItems] = useState<InventoryItem[]>([]);
-  const [itemsLoaded, setItemsLoaded] = useState(false);
-  const [allReports, setAllReports] = useState<DailyReport[]>([]);
-  const [reportsLoaded, setReportsLoaded] = useState(false);
-  const [entriesByReportId, setEntriesByReportId] = useState<
-    Record<string, Record<string, DailyReportEntry>>
-  >({});
-  const [invites, setInvites] = useState<Invite[]>([]);
-  const [members, setMembers] = useState<TeamMember[]>([]);
-  const [stationLinksByCode, setStationLinksByCode] = useState<Record<string, StationLink>>({});
-  const [workerFallback, setWorkerFallback] = useState<WorkerFallbackState | null>(null);
-
-  const migrationAttemptedRef = useRef<string | null>(null);
-  const syncingEmailsKeyRef = useRef<string>('');
   const manualDatePickedRef = useRef(false);
   const autoDateCheckedRef = useRef<string | null>(null);
-  const prevTodayRef = useRef<string>(getTodayDateStr());
-
-  const canManage = isOwner || role === 'jefe';
-  const userEmail = (user?.email ?? '').trim().toLowerCase();
+  const prevTodayRef = useRef<string>(todayStr);
 
   useEffect(() => {
-    const id = window.setInterval(() => {
-      setNow(new Date());
-    }, 30000);
-    return () => window.clearInterval(id);
-  }, []);
+    if (initialActiveSection) {
+      setActiveSection(initialActiveSection);
+    }
+  }, [initialActiveSection]);
 
-  const workerScheduleStatus = useMemo(
-    () => resolveWorkerScheduleStatus(now, workspace?.shiftSchedule),
-    [now, workspace?.shiftSchedule],
-  );
-  const effectiveSelectedDate = canManage
-    ? selectedDate
-    : workerScheduleStatus.operationalDate;
-
+  // Reset date selection cleanly on sign-out
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, (nextUser) => {
-      setUser(nextUser);
-      setAuthReady(true);
-      if (!nextUser) {
-        setWorkspace(null);
-        setStations([]);
-        setStationsLoaded(false);
-        setItems([]);
-        setItemsLoaded(false);
-        setAllReports([]);
-        setReportsLoaded(false);
-        setAutoSelectedYesterday(false);
-        manualDatePickedRef.current = false;
-        autoDateCheckedRef.current = null;
-        setEntriesByReportId({});
-        setInvites([]);
-        setMembers([]);
-        setStationLinksByCode({});
-        setWorkerFallback(null);
-      }
-    });
-
-    getRedirectResult(auth).catch((error) => {
-      console.error('Redirect auth error:', error);
-      setAuthError(formatGoogleAuthError(error));
-    });
-
-    return () => unsub();
-  }, []);
-
-  useEffect(() => {
-    if (!authReady || user || !linkParams.accessCode) return;
-    let cancelled = false;
-    fetchStationLinkPreview(linkParams.accessCode).then((preview) => {
-      if (!cancelled && preview) {
-        setPendingLink(preview);
-      }
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [authReady, user, linkParams.accessCode]);
-
-  useEffect(() => {
-    if (!authReady || !user) return;
-    let cancelled = false;
-    setSessionLoading(true);
-    setSessionError(null);
-
-    resolveUserWorkspace(user, linkParams)
-      .then((resolved) => {
-        if (cancelled) return;
-        const normalizedRole = normalizeTeamRole(resolved.role);
-        setWorkspace(resolved.workspace);
-        setRole(normalizedRole);
-        setIsOwner(resolved.isOwner);
-        if (resolved.stationLinkInfo) {
-          setPendingLink(resolved.stationLinkInfo);
-        }
-        if (resolved.initialStation) {
-          setActiveSection(normalizeStation(resolved.initialStation));
-        } else {
-          setActiveSection(
-            resolved.isOwner || normalizedRole === 'jefe' ? 'jefe' : normalizedRole,
-          );
-        }
-      })
-      .catch((err) => {
-        if (cancelled) return;
-        console.error(err);
-        if (err instanceof SessionAccessError) {
-          setSessionError(err.message);
-        } else {
-          setSessionError(
-            'No se pudo inicializar el espacio del restaurante. Verifica tu sesión e intenta nuevamente.',
-          );
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setSessionLoading(false);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [authReady, user, linkParams]);
-
-  // Listen to workspace document
-  useEffect(() => {
-    if (!authReady || !user || !workspace?.id) return;
-    const wsPath = `workspaces/${workspace.id}`;
-    const unsub = onSnapshot(
-      doc(db, 'workspaces', workspace.id),
-      (snap) => {
-        if (snap.exists()) {
-          setWorkspace({ id: snap.id, ...snap.data() } as Workspace);
-        }
-      },
-      (err) => handleFirestoreError(err, OperationType.GET, wsPath),
-    );
-    return () => unsub();
-  }, [authReady, user, workspace?.id]);
-
-  const todayStr = useMemo(() => getTodayDateStr(now), [now]);
-  const yesterdayStr = useMemo(() => getPreviousDateStr(todayStr), [todayStr]);
+    if (user) return;
+    setAutoSelectedYesterday(false);
+    manualDatePickedRef.current = false;
+    autoDateCheckedRef.current = null;
+  }, [user]);
 
   // Recalculate dashboard "today" cleanly across midnight / 6 AM operational cutoff
   useEffect(() => {
@@ -304,226 +136,36 @@ export default function App() {
     }
   }, [todayStr]);
 
-  // Listen to workstations, inventory items, and dailyReports (Managers use authorizedEmails queries; Workers strictly use single-station document listeners)
-  useEffect(() => {
-    if (!authReady || !user || !workspace?.id) return;
-    setStationsLoaded(false);
-    setItemsLoaded(false);
-    setReportsLoaded(false);
+  const effectiveSelectedDate = canManage
+    ? selectedDate
+    : workerScheduleStatus.operationalDate;
 
-    if (canManage && userEmail) {
-      const stationsQuery = query(
-        collection(db, 'stations'),
-        where('authorizedEmails', 'array-contains', userEmail),
-      );
-      const unsubStations = onSnapshot(
-        stationsQuery,
-        (snap) => {
-          const list: Workstation[] = [];
-          snap.forEach((d) => {
-            const st = { id: d.id, ...d.data() } as Workstation;
-            if (st.workspaceId === workspace.id && st.active) {
-              list.push(st);
-            }
-          });
-          list.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name));
-          setStations(list);
-          setStationsLoaded(true);
-        },
-        (err) => handleFirestoreError(err, OperationType.LIST, 'stations'),
-      );
-
-      const itemsQuery = query(
-        collection(db, 'items'),
-        where('authorizedEmails', 'array-contains', userEmail),
-      );
-      const unsubItems = onSnapshot(
-        itemsQuery,
-        (snap) => {
-          const list: InventoryItem[] = [];
-          snap.forEach((d) => {
-            const raw = d.data() as Omit<InventoryItem, 'id'>;
-            const item: InventoryItem = {
-              ...raw,
-              id: d.id,
-              station: normalizeStation(raw.station),
-            };
-            if (item.workspaceId === workspace.id) {
-              list.push(item);
-            }
-          });
-          list.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name));
-          setItems(list);
-          setItemsLoaded(true);
-        },
-        (err) => handleFirestoreError(err, OperationType.LIST, 'items'),
-      );
-
-      const reportsQuery = query(
-        collection(db, 'dailyReports'),
-        where('authorizedEmails', 'array-contains', userEmail),
-      );
-      const unsubReports = onSnapshot(
-        reportsQuery,
-        (snap) => {
-          const list: DailyReport[] = [];
-          snap.forEach((d) => {
-            const raw = d.data() as Omit<DailyReport, 'id'>;
-            const rep: DailyReport = {
-              ...raw,
-              id: d.id,
-              station: normalizeStation(raw.station),
-            };
-            if (rep.workspaceId === workspace.id) {
-              list.push(rep);
-            }
-          });
-          setAllReports(list);
-          setReportsLoaded(true);
-        },
-        (err) => handleFirestoreError(err, OperationType.LIST, 'dailyReports'),
-      );
-
-      return () => {
-        unsubStations();
-        unsubItems();
-        unsubReports();
-      };
-    }
-
-    // Worker mode: strict single-station document listeners (no collection list queries)
-    if (role === 'jefe') return;
-    const stationDocPath = `stations/${role}`;
-    const unsubStation = onSnapshot(
-      doc(db, 'stations', role),
-      (snap) => {
-        if (snap.exists()) {
-          const st = { id: snap.id, ...snap.data() } as Workstation;
-          setStations(st.workspaceId === workspace.id && st.active ? [st] : []);
-        } else {
-          setStations([]);
-        }
-        setStationsLoaded(true);
-      },
-      (err) => handleFirestoreError(err, OperationType.GET, stationDocPath),
-    );
-
-    const reportId = `${workspace.id}_${effectiveSelectedDate}_${role}`;
-    const reportDocPath = `dailyReports/${reportId}`;
-    const unsubReport = onSnapshot(
-      doc(db, 'dailyReports', reportId),
-      (snap) => {
-        if (snap.exists()) {
-          const raw = snap.data() as Omit<DailyReport, 'id'>;
-          setAllReports([
-            {
-              ...raw,
-              id: snap.id,
-              station: normalizeStation(raw.station),
-            },
-          ]);
-        } else {
-          setAllReports([]);
-        }
-        setReportsLoaded(true);
-      },
-      (err) => handleFirestoreError(err, OperationType.GET, reportDocPath),
-    );
-
-    // Live check on worker's own teamMembers/{uid} for instant revocation / reassignment
-    const unsubSelfMember = onSnapshot(
-      doc(db, 'teamMembers', user.uid),
-      (snap) => {
-        if (!snap.exists()) {
-          setSessionError('Tu acceso fue removido por el jefe.');
-          return;
-        }
-        const m = snap.data() as TeamMember;
-        if (!m.active) {
-          setSessionError('Tu acceso a este restaurante fue desactivado por el jefe.');
-          return;
-        }
-        if (normalizeTeamRole(m.station) !== role) {
-          const nextRole = normalizeTeamRole(m.station);
-          setRole(nextRole);
-          setActiveSection(nextRole === 'jefe' ? 'jefe' : nextRole);
-        }
-      },
-      () => {
-        // Ignore transient offline listener issues
-      },
-    );
-
-    return () => {
-      unsubStation();
-      unsubReport();
-      unsubSelfMember();
-    };
-  }, [authReady, user, workspace?.id, canManage, userEmail, role, effectiveSelectedDate]);
-
-  // Worker mode: real-time document-level listeners on worker's own station items
-  const workerNextSlot = useMemo(() => {
-    if (canManage || role === 'jefe' || !stationsLoaded) return 0;
-    const st = stations.find((s) => s.id === role);
-    return st ? Math.min(200, Math.max(1, st.nextItemSlot)) : 1;
-  }, [canManage, role, stationsLoaded, stations]);
-
-  useEffect(() => {
-    if (!authReady || !user || !workspace?.id || canManage || role === 'jefe' || !stationsLoaded) {
-      return;
-    }
-
-    if (workerNextSlot <= 1) {
-      setItems([]);
-      setItemsLoaded(true);
-      return;
-    }
-
-    const itemsMap = new Map<string, InventoryItem>();
-    const unsubs: Array<() => void> = [];
-    let resolvedCount = 0;
-    const totalSlots = workerNextSlot - 1;
-
-    for (let slot = 1; slot < workerNextSlot; slot++) {
-      const itemId = `${role}_${slot}`;
-      const unsub = onSnapshot(
-        doc(db, 'items', itemId),
-        (snap) => {
-          resolvedCount += 1;
-          if (snap.exists()) {
-            const raw = snap.data() as Omit<InventoryItem, 'id'>;
-            if (raw.workspaceId === workspace.id && normalizeStation(raw.station) === role) {
-              itemsMap.set(itemId, {
-                ...raw,
-                id: snap.id,
-                station: normalizeStation(raw.station),
-              });
-            } else {
-              itemsMap.delete(itemId);
-            }
-          } else {
-            itemsMap.delete(itemId);
-          }
-          const list = Array.from(itemsMap.values()).sort(
-            (a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name),
-          );
-          setItems(list);
-          if (resolvedCount >= totalSlots) {
-            setItemsLoaded(true);
-          }
-        },
-        (err) => handleFirestoreError(err, OperationType.GET, `items/${itemId}`),
-      );
-      unsubs.push(unsub);
-    }
-
-    const fallbackTimer = window.setTimeout(() => setItemsLoaded(true), 800);
-
-    return () => {
-      window.clearTimeout(fallbackTimer);
-      unsubs.forEach((u) => u());
-    };
-  }, [authReady, user, workspace?.id, canManage, role, workerNextSlot]);
+  const {
+    stationsLoaded,
+    itemsLoaded,
+    reportsLoaded,
+    reportHasPendingWrites,
+    allReports,
+    effectiveStations,
+    effectiveItems,
+    reportsForSelectedDate,
+    effectiveEntriesByReportId,
+    consolidatedEntriesByItemId,
+    todayAllEntries,
+    invites,
+    members,
+    stationLinksByCode,
+    yesterdayHasReports,
+    refreshWorkerFallback,
+  } = useStationData({
+    authReady,
+    user,
+    workspace,
+    canManage,
+    role,
+    effectiveSelectedDate,
+    yesterdayStr,
+  });
 
   // Smart morning review: if Boss logs in when today has 0 reports and yesterday has reports, auto-show yesterday
   useEffect(() => {
@@ -544,297 +186,6 @@ export default function App() {
       setAutoSelectedYesterday(true);
     }
   }, [canManage, workspace?.id, reportsLoaded, allReports, todayStr, yesterdayStr]);
-
-  // Auto-migrate existing workspace without stations doc into dynamic Workstations
-  useEffect(() => {
-    if (
-      !canManage ||
-      !workspace?.id ||
-      !stationsLoaded ||
-      !itemsLoaded ||
-      stations.length > 0 ||
-      migrationAttemptedRef.current === workspace.id
-    ) {
-      return;
-    }
-    migrationAttemptedRef.current = workspace.id;
-    ensureWorkstationsForExistingWorkspace(workspace, stations, items).catch((err) => {
-      console.error('Error migrating workstations:', err);
-    });
-  }, [canManage, workspace, stationsLoaded, itemsLoaded, stations, items]);
-
-  const refreshWorkerFallback = useCallback(async () => {
-    if (!workspace?.id || canManage || role === 'jefe') return;
-    try {
-      const fb = await loadWorkerStationFallback({
-        workspaceId: workspace.id,
-        stationId: role,
-        dateStr: effectiveSelectedDate,
-      });
-      setWorkerFallback(fb);
-    } catch (err) {
-      console.error('Error loading station fallback:', err);
-    }
-  }, [workspace?.id, canManage, role, effectiveSelectedDate]);
-
-  const effectiveStations = useMemo(() => {
-    if (stations.length > 0) return stations;
-    if (!canManage && workerFallback?.station) return [workerFallback.station];
-    return stations;
-  }, [stations, canManage, workerFallback?.station]);
-
-  const effectiveItems = useMemo(() => {
-    if (items.length > 0) return items;
-    if (!canManage && workerFallback?.items.length) return workerFallback.items;
-    return items;
-  }, [items, canManage, workerFallback?.items]);
-
-  const reportsForSelectedDate = useMemo(() => {
-    const map: Record<string, DailyReport | undefined> = {};
-    allReports.forEach((rep) => {
-      if (rep.date === effectiveSelectedDate) {
-        map[rep.station] = rep;
-      }
-    });
-    if (
-      !canManage &&
-      role !== 'jefe' &&
-      !map[role] &&
-      workerFallback?.report?.date === effectiveSelectedDate
-    ) {
-      map[role] = workerFallback.report;
-    }
-    return map;
-  }, [allReports, effectiveSelectedDate, canManage, role, workerFallback?.report]);
-
-  // Listen to entries subcollections for existing reports on selectedDate
-  const existingReportIdsKey = useMemo(() => {
-    return Object.values(reportsForSelectedDate)
-      .map((r) => r?.id ?? '')
-      .filter(Boolean)
-      .sort()
-      .join('|');
-  }, [reportsForSelectedDate]);
-
-  const workerStationItemIdsKey = useMemo(() => {
-    if (canManage || role === 'jefe') return '';
-    return effectiveItems
-      .filter((it) => it.station === role)
-      .map((it) => it.id)
-      .join('|');
-  }, [canManage, role, effectiveItems]);
-
-  useEffect(() => {
-    if (!authReady || !user || !workspace?.id) return;
-    const reportIds = existingReportIdsKey ? existingReportIdsKey.split('|') : [];
-    if (reportIds.length === 0) {
-      setEntriesByReportId({});
-      return;
-    }
-
-    if (canManage && userEmail) {
-      const unsubs = reportIds.map((repId) => {
-        const entriesPath = `dailyReports/${repId}/entries`;
-        const q = query(
-          collection(db, 'dailyReports', repId, 'entries'),
-          where('authorizedEmails', 'array-contains', userEmail),
-        );
-        return onSnapshot(
-          q,
-          (snap) => {
-            const map: Record<string, DailyReportEntry> = {};
-            snap.forEach((d) => {
-              const entry = { id: d.id, ...d.data() } as DailyReportEntry;
-              map[entry.itemId] = entry;
-            });
-            setEntriesByReportId((prev) => ({
-              ...prev,
-              [repId]: map,
-            }));
-          },
-          (err) => handleFirestoreError(err, OperationType.LIST, entriesPath),
-        );
-      });
-
-      return () => {
-        unsubs.forEach((u) => u());
-      };
-    }
-
-    // Worker mode: document-level entry listeners via allow get
-    if (role === 'jefe') return;
-    const targetReportId = reportIds[0];
-    const itemIds = workerStationItemIdsKey ? workerStationItemIdsKey.split('|') : [];
-    if (!targetReportId || itemIds.length === 0) return;
-
-    const entryMap: Record<string, DailyReportEntry> = {};
-    const unsubs = itemIds.map((itemId) =>
-      onSnapshot(
-        doc(db, 'dailyReports', targetReportId, 'entries', itemId),
-        (snap) => {
-          if (snap.exists()) {
-            entryMap[itemId] = { id: snap.id, ...snap.data() } as DailyReportEntry;
-          } else {
-            delete entryMap[itemId];
-          }
-          setEntriesByReportId((prev) => ({
-            ...prev,
-            [targetReportId]: { ...entryMap },
-          }));
-        },
-        (err) =>
-          handleFirestoreError(
-            err,
-            OperationType.GET,
-            `dailyReports/${targetReportId}/entries/${itemId}`,
-          ),
-      ),
-    );
-
-    return () => {
-      unsubs.forEach((u) => u());
-    };
-  }, [
-    authReady,
-    user,
-    userEmail,
-    workspace?.id,
-    canManage,
-    role,
-    existingReportIdsKey,
-    workerStationItemIdsKey,
-  ]);
-
-  // Listen to invites, teamMembers, and stationLinks for managers
-  useEffect(() => {
-    if (!authReady || !user || !workspace?.id || !canManage) return;
-
-    const invitesQuery = query(
-      collection(db, 'invites'),
-      where('ownerUid', '==', workspace.ownerUid),
-    );
-    const unsubInvites = onSnapshot(
-      invitesQuery,
-      (snap) => {
-        const list: Invite[] = [];
-        snap.forEach((d) => {
-          const inv = { id: d.id, ...d.data() } as Invite;
-          if (inv.workspaceId === workspace.id) list.push(inv);
-        });
-        setInvites(list);
-      },
-      (err) => handleFirestoreError(err, OperationType.LIST, 'invites'),
-    );
-
-    const membersQuery = query(
-      collection(db, 'teamMembers'),
-      where('ownerUid', '==', workspace.ownerUid),
-    );
-    const unsubMembers = onSnapshot(
-      membersQuery,
-      (snap) => {
-        const list: TeamMember[] = [];
-        snap.forEach((d) => {
-          const mem = { id: d.id, ...d.data() } as TeamMember;
-          if (mem.workspaceId === workspace.id) list.push(mem);
-        });
-        setMembers(list);
-      },
-      (err) => handleFirestoreError(err, OperationType.LIST, 'teamMembers'),
-    );
-
-    const linksQuery = query(
-      collection(db, 'stationLinks'),
-      where('ownerUid', '==', workspace.ownerUid),
-    );
-    const unsubLinks = onSnapshot(
-      linksQuery,
-      (snap) => {
-        const map: Record<string, StationLink> = {};
-        snap.forEach((d) => {
-          const link = { id: d.id, ...d.data() } as StationLink;
-          if (link.workspaceId === workspace.id) {
-            map[d.id] = link;
-          }
-        });
-        setStationLinksByCode(map);
-      },
-      (err) => handleFirestoreError(err, OperationType.LIST, 'stationLinks'),
-    );
-
-    return () => {
-      unsubInvites();
-      unsubMembers();
-      unsubLinks();
-    };
-  }, [authReady, user, workspace?.id, workspace?.ownerUid, canManage]);
-
-  const effectiveEntriesByReportId = useMemo(() => {
-    if (canManage || !workerFallback?.report) return entriesByReportId;
-    const repId = workerFallback.report.id;
-    const live = entriesByReportId[repId];
-    if (live && Object.keys(live).length > 0) return entriesByReportId;
-    return {
-      ...entriesByReportId,
-      [repId]: workerFallback.entries,
-    };
-  }, [canManage, entriesByReportId, workerFallback]);
-
-  const consolidatedEntriesByItemId = useMemo(() => {
-    const merged: Record<string, DailyReportEntry> = {};
-    Object.values(reportsForSelectedDate).forEach((rep) => {
-      if (!rep) return;
-      const entries = effectiveEntriesByReportId[rep.id];
-      if (!entries) return;
-      Object.values(entries).forEach((entry) => {
-        merged[entry.itemId] = entry;
-      });
-    });
-    return merged;
-  }, [reportsForSelectedDate, effectiveEntriesByReportId]);
-
-  const todayAllEntries = useMemo(() => {
-    return Object.values(consolidatedEntriesByItemId);
-  }, [consolidatedEntriesByItemId]);
-
-  // Keep authorizedEmails limited strictly to owner + active co-admins ('jefe'), never workers
-  useEffect(() => {
-    if (!canManage || !workspace || !stationsLoaded || !itemsLoaded) return;
-    const coAdminEmails = members
-      .filter((m) => m.active && m.station === 'jefe' && m.email)
-      .map((m) => m.email.trim().toLowerCase());
-    const desiredEmails = Array.from(
-      new Set([workspace.ownerEmail.trim().toLowerCase(), ...coAdminEmails]),
-    )
-      .filter(Boolean)
-      .slice(0, 15);
-
-    const unchanged =
-      desiredEmails.length === workspace.authorizedEmails.length &&
-      desiredEmails.every((e, i) => workspace.authorizedEmails[i] === e);
-    if (unchanged) return;
-
-    const syncKey = `${workspace.id}:${desiredEmails.sort().join(',')}`;
-    if (syncingEmailsKeyRef.current === syncKey) return;
-    syncingEmailsKeyRef.current = syncKey;
-
-    syncAuthorizedEmailsAcrossWorkspace({
-      workspace,
-      coAdminEmails,
-      stations,
-      items,
-      reports: allReports,
-      entries: todayAllEntries,
-    }).catch((err) => {
-      console.error('Error syncing co-admin access emails:', err);
-      syncingEmailsKeyRef.current = '';
-    });
-  }, [canManage, workspace, stationsLoaded, itemsLoaded, members, stations, items, allReports, todayAllEntries]);
-
-  const yesterdayHasReports = useMemo(
-    () => allReports.some((r) => r.date === yesterdayStr),
-    [allReports, yesterdayStr],
-  );
 
   const visibleStations = useMemo(
     () =>
@@ -867,41 +218,17 @@ export default function App() {
     }
   }, [canManage, refreshWorkerFallback]);
 
-  const handleSignIn = async () => {
-    setAuthLoading(true);
-    setAuthError(null);
-    try {
-      await signInWithPopup(auth, googleProvider);
-    } catch (error) {
-      console.error('Google Sign-In error:', error);
-      const code = (error as { code?: string } | null)?.code ?? '';
-      const isStandaloneWindow =
-        typeof window !== 'undefined' && window.self === window.top;
+  const handleSelectDate = useCallback((nextDate: string) => {
+    if (!nextDate) return;
+    manualDatePickedRef.current = true;
+    setAutoSelectedYesterday(false);
+    setSelectedDate(nextDate);
+  }, []);
 
-      if (
-        isStandaloneWindow &&
-        (code === 'auth/popup-blocked' ||
-          code === 'auth/operation-not-supported-in-this-environment')
-      ) {
-        try {
-          await signInWithRedirect(auth, googleProvider);
-          return;
-        } catch (redirectError) {
-          console.error('Google Redirect Sign-In error:', redirectError);
-          setAuthError(formatGoogleAuthError(redirectError));
-          return;
-        }
-      }
-
-      setAuthError(formatGoogleAuthError(error));
-    } finally {
-      setAuthLoading(false);
-    }
-  };
-
-  const handleSignOut = async () => {
-    await signOut(auth);
-  };
+  const navigateTo = useCallback((section: ActiveSection) => {
+    setActiveSection(section);
+    setMobileNavOpen(false);
+  }, []);
 
   if (!authReady) {
     return (
@@ -959,13 +286,6 @@ export default function App() {
   const dataLoading = !stationsLoaded || !itemsLoaded;
   const needsOwnerNameOnboarding = canManage && !workspace.ownerName?.trim();
 
-  const handleSelectDate = (nextDate: string) => {
-    if (!nextDate) return;
-    manualDatePickedRef.current = true;
-    setAutoSelectedYesterday(false);
-    setSelectedDate(nextDate);
-  };
-
   const sectionBreadcrumb =
     activeSection === 'jefe'
       ? 'Resumen y Compras'
@@ -976,11 +296,6 @@ export default function App() {
           : activeSection === 'equipo'
             ? 'Equipo'
             : currentStation?.name ?? 'Puesto';
-
-  const navigateTo = (section: ActiveSection) => {
-    setActiveSection(section);
-    setMobileNavOpen(false);
-  };
 
   const displayAccountName =
     canManage && workspace.ownerName?.trim()
@@ -1194,6 +509,15 @@ export default function App() {
 
             {canManage ? (
               <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+                {!isOnline && (
+                  <span
+                    role="status"
+                    className="inline-flex items-center gap-1 px-2 py-1 text-xs font-semibold text-amber-800 bg-amber-50 border border-amber-200 rounded-lg"
+                  >
+                    <WifiOff className="w-3.5 h-3.5 shrink-0" />
+                    <span className="hidden sm:inline">Sin señal</span>
+                  </span>
+                )}
                 <div className="flex items-center gap-0.5 p-0.5 sm:p-1 bg-stone-100 rounded-xl">
                   <button
                     type="button"
@@ -1232,6 +556,15 @@ export default function App() {
               </div>
             ) : (
               <div className="flex items-center gap-2 shrink-0">
+                {!isOnline && (
+                  <span
+                    role="status"
+                    className="inline-flex items-center gap-1 px-2 py-1 text-xs font-semibold text-amber-800 bg-amber-50 border border-amber-200 rounded-lg"
+                  >
+                    <WifiOff className="w-3.5 h-3.5 shrink-0" />
+                    <span className="hidden sm:inline">Sin señal</span>
+                  </span>
+                )}
                 <div
                   className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-semibold border ${
                     workerScheduleStatus.phase === 'opening'
@@ -1261,127 +594,131 @@ export default function App() {
           {/* Workspace Viewport */}
           <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-5 sm:py-8 min-w-0">
             {dataLoading ? (
-              <div className="space-y-4">
-                <div className="h-8 w-64 bg-stone-200 rounded-xl animate-pulse" />
-                <div className="h-28 w-full bg-white border border-stone-200 rounded-2xl animate-pulse" />
-                <div className="h-64 w-full bg-white border border-stone-200 rounded-2xl animate-pulse" />
-              </div>
+              <ViewSkeleton />
             ) : (
-              <AnimatePresence mode="wait">
-                <motion.div
-                  key={activeSection}
-                  initial={{ opacity: 0, y: 8 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -4 }}
-                  transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
-                  className="min-w-0"
-                >
-                  {activeSection === 'jefe' && canManage ? (
-                    <BossDashboard
-                      workspaceName={workspace.name}
-                      ownerName={workspace.ownerName}
-                      shiftSchedule={workspace.shiftSchedule}
-                      selectedDate={selectedDate}
-                      todayStr={todayStr}
-                      yesterdayStr={yesterdayStr}
-                      yesterdayHasReports={yesterdayHasReports}
-                      autoSelectedYesterday={autoSelectedYesterday}
-                      stations={effectiveStations}
-                      items={effectiveItems}
-                      reportsByStation={reportsForSelectedDate}
-                      entriesByItemId={consolidatedEntriesByItemId}
-                      onSelectDate={handleSelectDate}
-                      onOpenStation={(stId) => navigateTo(stId)}
-                      onGoToWorkstations={() => navigateTo('puestos')}
-                      onGoToCatalog={() => {
-                        setCatalogFilterStation('all');
-                        navigateTo('catalogo');
-                      }}
-                      onOpenScheduleModal={() => setScheduleModalOpen(true)}
-                    />
-                  ) : activeSection === 'puestos' && canManage ? (
-                    <WorkstationsManager
-                      workspace={workspace}
-                      stations={effectiveStations}
-                      items={effectiveItems}
-                      stationLinksByCode={stationLinksByCode}
-                      onOpenStationSheet={(stId) => navigateTo(stId)}
-                      onOpenStationCatalog={(stId) => {
-                        setCatalogFilterStation(stId);
-                        navigateTo('catalogo');
-                      }}
-                    />
-                  ) : activeSection === 'catalogo' && canManage ? (
-                    <CatalogManager
-                      workspace={workspace}
-                      stations={effectiveStations}
-                      items={effectiveItems}
-                      initialFilterStation={catalogFilterStation}
-                    />
-                  ) : activeSection === 'equipo' && canManage ? (
-                    <TeamManager
-                      workspace={workspace}
-                      stations={effectiveStations}
-                      items={effectiveItems}
-                      todayReports={Object.values(reportsForSelectedDate).filter(
-                        (r): r is DailyReport => Boolean(r),
-                      )}
-                      todayEntries={todayAllEntries}
-                      invites={invites}
-                      members={members}
-                    />
-                  ) : currentStation ? (
-                    <StationShiftView
-                      workspace={workspace}
-                      user={user}
-                      canManage={canManage}
-                      scheduleStatus={workerScheduleStatus}
-                      station={currentStation}
-                      selectedDate={effectiveSelectedDate}
-                      items={effectiveItems}
-                      report={reportsForSelectedDate[currentStation.id]}
-                      entriesByItemId={currentStationEntries}
-                      onSaved={handleStationSaved}
-                    />
-                  ) : (
-                    <div className="bg-white border border-stone-200 rounded-2xl p-10 text-center space-y-3">
-                      <p className="font-display text-lg font-semibold text-stone-900">
-                        No hay puestos de trabajo disponibles
-                      </p>
-                      <p className="text-sm text-stone-600 max-w-md mx-auto">
-                        {canManage
-                          ? 'Crea un puesto de trabajo para comenzar a gestionar los insumos y generar su código QR.'
-                          : 'Solicita al jefe que te comparta el enlace o código QR de tu puesto de trabajo.'}
-                      </p>
-                      {canManage && (
-                        <button
-                          type="button"
-                          onClick={() => navigateTo('puestos')}
-                          className="min-h-[42px] px-4 py-2 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 cursor-pointer"
-                        >
-                          Ir a Puestos de Trabajo
-                        </button>
-                      )}
-                    </div>
-                  )}
-                </motion.div>
-              </AnimatePresence>
+              <Suspense fallback={<ViewSkeleton />}>
+                <AnimatePresence mode="wait">
+                  <motion.div
+                    key={activeSection}
+                    initial={{ opacity: 0, y: 8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -4 }}
+                    transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+                    className="min-w-0"
+                  >
+                    {activeSection === 'jefe' && canManage ? (
+                      <BossDashboard
+                        workspaceName={workspace.name}
+                        ownerName={workspace.ownerName}
+                        shiftSchedule={workspace.shiftSchedule}
+                        selectedDate={selectedDate}
+                        todayStr={todayStr}
+                        yesterdayStr={yesterdayStr}
+                        yesterdayHasReports={yesterdayHasReports}
+                        autoSelectedYesterday={autoSelectedYesterday}
+                        stations={effectiveStations}
+                        items={effectiveItems}
+                        reportsByStation={reportsForSelectedDate}
+                        entriesByItemId={consolidatedEntriesByItemId}
+                        onSelectDate={handleSelectDate}
+                        onOpenStation={(stId) => navigateTo(stId)}
+                        onGoToWorkstations={() => navigateTo('puestos')}
+                        onGoToCatalog={() => {
+                          setCatalogFilterStation('all');
+                          navigateTo('catalogo');
+                        }}
+                        onOpenScheduleModal={() => setScheduleModalOpen(true)}
+                      />
+                    ) : activeSection === 'puestos' && canManage ? (
+                      <WorkstationsManager
+                        workspace={workspace}
+                        stations={effectiveStations}
+                        items={effectiveItems}
+                        stationLinksByCode={stationLinksByCode}
+                        onOpenStationSheet={(stId) => navigateTo(stId)}
+                        onOpenStationCatalog={(stId) => {
+                          setCatalogFilterStation(stId);
+                          navigateTo('catalogo');
+                        }}
+                      />
+                    ) : activeSection === 'catalogo' && canManage ? (
+                      <CatalogManager
+                        workspace={workspace}
+                        stations={effectiveStations}
+                        items={effectiveItems}
+                        initialFilterStation={catalogFilterStation}
+                      />
+                    ) : activeSection === 'equipo' && canManage ? (
+                      <TeamManager
+                        workspace={workspace}
+                        stations={effectiveStations}
+                        items={effectiveItems}
+                        todayReports={Object.values(reportsForSelectedDate).filter(
+                          (r): r is DailyReport => Boolean(r),
+                        )}
+                        todayEntries={todayAllEntries}
+                        invites={invites}
+                        members={members}
+                      />
+                    ) : currentStation ? (
+                      <StationShiftView
+                        workspace={workspace}
+                        user={user}
+                        canManage={canManage}
+                        scheduleStatus={workerScheduleStatus}
+                        station={currentStation}
+                        selectedDate={effectiveSelectedDate}
+                        items={effectiveItems}
+                        report={reportsForSelectedDate[currentStation.id]}
+                        entriesByItemId={currentStationEntries}
+                        isOnline={isOnline}
+                        hasPendingWrites={reportHasPendingWrites}
+                        onSaved={handleStationSaved}
+                      />
+                    ) : (
+                      <div className="bg-white border border-stone-200 rounded-2xl p-10 text-center space-y-3">
+                        <p className="font-display text-lg font-semibold text-stone-900">
+                          No hay puestos de trabajo disponibles
+                        </p>
+                        <p className="text-sm text-stone-600 max-w-md mx-auto">
+                          {canManage
+                            ? 'Crea un puesto de trabajo para comenzar a gestionar los insumos y generar su código QR.'
+                            : 'Solicita al jefe que te comparta el enlace o código QR de tu puesto de trabajo.'}
+                        </p>
+                        {canManage && (
+                          <button
+                            type="button"
+                            onClick={() => navigateTo('puestos')}
+                            className="min-h-[42px] px-4 py-2 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 cursor-pointer"
+                          >
+                            Ir a Puestos de Trabajo
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </motion.div>
+                </AnimatePresence>
+              </Suspense>
             )}
           </main>
         </div>
 
         {/* First-Time Boss Onboarding Name Prompt */}
         {needsOwnerNameOnboarding && (
-          <BossWelcomeModal workspace={workspace} suggestedName={user.displayName} />
+          <Suspense fallback={null}>
+            <BossWelcomeModal workspace={workspace} suggestedName={user.displayName} />
+          </Suspense>
         )}
 
         {/* Boss Shift Schedule Config Modal */}
-        {canManage && (
-          <ShiftScheduleModal
-            workspace={workspace}
-            open={scheduleModalOpen}
-            onClose={() => setScheduleModalOpen(false)}
-          />
+        {canManage && scheduleModalOpen && (
+          <Suspense fallback={null}>
+            <ShiftScheduleModal
+              workspace={workspace}
+              open={scheduleModalOpen}
+              onClose={() => setScheduleModalOpen(false)}
+            />
+          </Suspense>
         )}
       </div>
     </MotionConfig>
