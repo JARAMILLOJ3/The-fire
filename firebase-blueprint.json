@@ -27,6 +27,10 @@
           "minLength": 1,
           "maxLength": 80
         },
+        "shiftSchedule": {
+          "type": "object",
+          "description": "Horarios de apertura (inicio/surtido) y cierre permitidos para las trabajadoras"
+        },
         "authorizedEmails": {
           "type": "array",
           "description": "Correos autorizados para acceder al restaurante (máximo 15)"

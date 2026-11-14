@@ -9,6 +9,7 @@ import {
   Clock,
   Copy,
   Download,
+  MessageSquareText,
   Printer,
   QrCode,
   Search,
@@ -19,6 +20,7 @@ import type {
   DailyReport,
   DailyReportEntry,
   InventoryItem,
+  ShiftSchedule,
   StationId,
   Workstation,
 } from '../types';
@@ -30,10 +32,12 @@ import {
   formatTimeShort,
   getStockLevelMeta,
 } from '../utils/inventory';
+import { formatTime12h, normalizeShiftSchedule } from '../utils/schedule';
 
 interface BossDashboardProps {
   workspaceName: string;
   ownerName?: string;
+  shiftSchedule?: ShiftSchedule;
   selectedDate: string;
   todayStr: string;
   yesterdayStr: string;
@@ -47,6 +51,7 @@ interface BossDashboardProps {
   onOpenStation: (stationId: StationId) => void;
   onGoToWorkstations: () => void;
   onGoToCatalog: () => void;
+  onOpenScheduleModal: () => void;
 }
 
 type ViewTab = 'compras' | 'completo';
@@ -62,6 +67,7 @@ function getTimeGreeting(): string {
 export function BossDashboard({
   workspaceName,
   ownerName,
+  shiftSchedule,
   selectedDate,
   todayStr,
   yesterdayStr,
@@ -75,12 +81,18 @@ export function BossDashboard({
   onOpenStation,
   onGoToWorkstations,
   onGoToCatalog,
+  onOpenScheduleModal,
 }: BossDashboardProps) {
   const [viewTab, setViewTab] = useState<ViewTab>('compras');
   const [stationFilter, setStationFilter] = useState<'all' | StationId>('all');
   const [stockFilter, setStockFilter] = useState<StockFilter>('todos');
   const [searchTerm, setSearchTerm] = useState('');
   const [copiedToast, setCopiedToast] = useState(false);
+
+  const normalizedSchedule = useMemo(
+    () => normalizeShiftSchedule(shiftSchedule),
+    [shiftSchedule],
+  );
 
   const stationMap = useMemo(() => {
     const map: Record<string, Workstation> = {};
@@ -116,6 +128,16 @@ export function BossDashboard({
       sufficient,
     };
   }, [consolidatedRows, reportsByStation, stations]);
+
+  const stationNotes = useMemo(() => {
+    return stations
+      .map((st) => {
+        const rep = reportsByStation[st.id];
+        if (!rep?.notes?.trim()) return null;
+        return { stationName: st.name, workerName: st.workerName, notes: rep.notes.trim() };
+      })
+      .filter((n): n is { stationName: string; workerName: string; notes: string } => Boolean(n));
+  }, [stations, reportsByStation]);
 
   const filteredRows = useMemo(() => {
     const term = searchTerm.trim().toLowerCase();
@@ -182,6 +204,10 @@ export function BossDashboard({
     ? `${getTimeGreeting()}, ${ownerName.trim()}`
     : `${getTimeGreeting()} · ${workspaceName}`;
 
+  const scheduleSummaryLabel = normalizedSchedule.enabled
+    ? `Apertura ${formatTime12h(normalizedSchedule.openingStart)}–${formatTime12h(normalizedSchedule.openingEnd)} · Cierre ${formatTime12h(normalizedSchedule.closingStart)}–${formatTime12h(normalizedSchedule.closingEnd)}`
+    : 'Horarios sin restricción';
+
   return (
     <div className="space-y-6 sm:space-y-7 print-full min-w-0">
       {/* Clean Personalized Header */}
@@ -195,7 +221,7 @@ export function BossDashboard({
             {greetingTitle}
           </h1>
           <p className="text-sm text-stone-600 mt-1">
-            Control de cierres por puesto y lista de compras del día.
+            Control de apertura, cierres del día y lista de compras.
           </p>
         </div>
 
@@ -207,6 +233,14 @@ export function BossDashboard({
           >
             {copiedToast ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
             {copiedToast ? 'Lista copiada' : 'Copiar lista WhatsApp'}
+          </button>
+          <button
+            type="button"
+            onClick={onOpenScheduleModal}
+            className="min-h-[42px] inline-flex items-center gap-2 px-3.5 py-2 text-sm font-medium text-stone-800 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            <Clock className="w-4 h-4 text-orange-600" />
+            Horarios
           </button>
           <button
             type="button"
@@ -235,6 +269,23 @@ export function BossDashboard({
             <span className="hidden sm:inline">Imprimir</span>
           </button>
         </div>
+      </div>
+
+      {/* Compact Worker Schedule Bar */}
+      <div className="bg-white border border-stone-200 rounded-2xl px-4 py-3 flex flex-wrap items-center justify-between gap-2 text-xs sm:text-sm no-print">
+        <div className="flex items-center gap-2 text-stone-700 min-w-0">
+          <Clock className="w-4 h-4 text-orange-600 shrink-0" />
+          <span className="font-medium truncate">
+            Horario trabajadoras: <strong className="text-stone-900">{scheduleSummaryLabel}</strong>
+          </span>
+        </div>
+        <button
+          type="button"
+          onClick={onOpenScheduleModal}
+          className="text-xs font-semibold text-orange-600 hover:text-orange-700 whitespace-nowrap shrink-0 cursor-pointer"
+        >
+          Configurar horarios
+        </button>
       </div>
 
       {/* Single Clean Contextual Date Banner (only shown when helpful) */}
@@ -322,6 +373,30 @@ export function BossDashboard({
         </div>
       </motion.section>
 
+      {/* Actionable Daily Highlights: Notes & Things to Keep in Mind */}
+      {stationNotes.length > 0 && (
+        <section className="bg-amber-50/70 border border-amber-200 rounded-2xl p-4 sm:p-5 space-y-2.5">
+          <div className="flex items-center gap-2 text-sm font-bold text-amber-950">
+            <MessageSquareText className="w-4 h-4 text-amber-700 shrink-0" />
+            <span>Novedades y notas dejadas por las trabajadoras</span>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+            {stationNotes.map((item) => (
+              <div
+                key={item.stationName}
+                className="bg-white/90 border border-amber-200/80 rounded-xl px-3.5 py-2.5 text-sm"
+              >
+                <p className="text-xs font-semibold text-stone-900">
+                  {item.stationName}{' '}
+                  <span className="font-normal text-stone-500">· {item.workerName}</span>
+                </p>
+                <p className="text-xs text-stone-700 mt-0.5">&ldquo;{item.notes}&rdquo;</p>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
       {/* Dynamic Stations Overview */}
       <section className="space-y-3 no-print">
         <div className="flex items-center justify-between gap-2">
@@ -382,12 +457,12 @@ export function BossDashboard({
                   ) : report?.status === 'opening_saved' ? (
                     <div className="flex items-center gap-1.5 text-xs font-semibold text-amber-700 pt-1">
                       <Clock className="w-4 h-4 shrink-0" />
-                      <span>Avance guardado{draftTime ? ` · ${draftTime}` : ''}</span>
+                      <span>Apertura guardada{draftTime ? ` · ${draftTime}` : ''}</span>
                     </div>
                   ) : (
                     <div className="flex items-center gap-1.5 text-xs font-medium text-stone-500 pt-1">
                       <Clock className="w-4 h-4 shrink-0" />
-                      <span>Pendiente por cerrar</span>
+                      <span>Pendiente por reportar</span>
                     </div>
                   )}
 

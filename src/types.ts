@@ -5,10 +5,19 @@ export type TeamStationId = StationId | 'jefe';
 export type ReportStatus = 'open' | 'opening_saved' | 'completed';
 export type StockLevel = 'agotado' | 'comprar' | 'medio' | 'suficiente';
 
+export interface ShiftSchedule {
+  enabled: boolean;
+  openingStart: string; // HH:mm 24h e.g. "16:00"
+  openingEnd: string;   // HH:mm 24h e.g. "19:00"
+  closingStart: string; // HH:mm 24h e.g. "23:00"
+  closingEnd: string;   // HH:mm 24h e.g. "02:00"
+}
+
 export interface Workspace {
   id: string;
   name: string;
   ownerName?: string;
+  shiftSchedule?: ShiftSchedule;
   ownerUid: string;
   ownerEmail: string;
   authorizedEmails: string[];

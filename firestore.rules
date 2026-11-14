@@ -41,6 +41,21 @@ service cloud.firestore {
       return val is string && val.size() == 10 && val.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
     }
 
+    function isValidTimeStr(val) {
+      return val is string && val.size() == 5 && val.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$');
+    }
+
+    function isValidShiftSchedule(s) {
+      return s is map
+        && s.keys().hasAll(['enabled', 'openingStart', 'openingEnd', 'closingStart', 'closingEnd'])
+        && s.keys().hasOnly(['enabled', 'openingStart', 'openingEnd', 'closingStart', 'closingEnd'])
+        && s.enabled is bool
+        && isValidTimeStr(s.openingStart)
+        && isValidTimeStr(s.openingEnd)
+        && isValidTimeStr(s.closingStart)
+        && isValidTimeStr(s.closingEnd);
+    }
+
     function isValidEmailList(listVal) {
       return listVal is list
         && listVal.size() >= 1
@@ -86,11 +101,12 @@ service cloud.firestore {
 
     function isValidWorkspace(data) {
       return data.keys().hasAll(['name', 'ownerUid', 'ownerEmail', 'authorizedEmails', 'seeded', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['name', 'ownerUid', 'ownerEmail', 'ownerName', 'authorizedEmails', 'seeded', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['name', 'ownerUid', 'ownerEmail', 'ownerName', 'shiftSchedule', 'authorizedEmails', 'seeded', 'createdAt', 'updatedAt'])
         && data.name is string && data.name.size() >= 2 && data.name.size() <= 80
         && isValidId(data.ownerUid)
         && data.ownerEmail is string && data.ownerEmail.size() >= 3 && data.ownerEmail.size() <= 120
         && (!('ownerName' in data) || (data.ownerName is string && data.ownerName.size() >= 1 && data.ownerName.size() <= 80))
+        && (!('shiftSchedule' in data) || isValidShiftSchedule(data.shiftSchedule))
         && isValidEmailList(data.authorizedEmails)
         && data.seeded is bool
         && data.createdAt is timestamp
@@ -290,7 +306,7 @@ service cloud.firestore {
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && canManageWorkspace(workspaceId)
-        && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'ownerName', 'authorizedEmails', 'seeded', 'updatedAt']);
+        && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'ownerName', 'shiftSchedule', 'authorizedEmails', 'seeded', 'updatedAt']);
 
       allow delete: if false;
     }

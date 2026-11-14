@@ -6,13 +6,16 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronUp,
+  Clock,
   History,
   Lock,
   Minus,
+  Moon,
   Plus,
   RotateCcw,
   Save,
   Search,
+  Sun,
 } from 'lucide-react';
 import { MAX_NOTES_LENGTH, MAX_STOCK_VALUE } from '../constants';
 import {
@@ -36,11 +39,13 @@ import {
   getStockLevelMeta,
   getSuggestedPurchase,
 } from '../utils/inventory';
+import type { WorkerScheduleStatus } from '../utils/schedule';
 
 interface StationShiftViewProps {
   workspace: Workspace;
   user: User;
   canManage: boolean;
+  scheduleStatus: WorkerScheduleStatus;
   station: Workstation;
   selectedDate: string;
   items: InventoryItem[];
@@ -55,6 +60,7 @@ export function StationShiftView({
   workspace,
   user,
   canManage,
+  scheduleStatus,
   station,
   selectedDate,
   items,
@@ -82,6 +88,8 @@ export function StationShiftView({
 
   const isCompleted = report?.status === 'completed';
   const isLocked = isCompleted && !canManage;
+  const isWorkerOpeningPhase = !canManage && scheduleStatus.phase === 'opening';
+  const isWorkerOutsideHours = !canManage && scheduleStatus.phase === 'outside';
 
   useEffect(() => {
     const nextDrafts: Record<string, DraftEntryRow> = {};
@@ -108,7 +116,7 @@ export function StationShiftView({
 
   // Auto-preload yesterday's closing as today's opening if today has no report yet
   useEffect(() => {
-    if (report || stationItems.length === 0) return;
+    if (isWorkerOutsideHours || report || stationItems.length === 0) return;
     const key = `${workspace.id}_${selectedDate}_${station.id}_${stationItems.length}`;
     if (autoPreloadKeyRef.current === key) return;
     autoPreloadKeyRef.current = key;
@@ -147,7 +155,7 @@ export function StationShiftView({
     return () => {
       cancelled = true;
     };
-  }, [report, workspace.id, selectedDate, station.id, stationItems]);
+  }, [isWorkerOutsideHours, report, workspace.id, selectedDate, station.id, stationItems]);
 
   const updateField = (
     itemId: string,
@@ -165,7 +173,7 @@ export function StationShiftView({
         [itemId]: {
           ...current,
           [field]: clamped,
-          hasOpening: field === 'opening' ? true : current.hasOpening,
+          hasOpening: field === 'opening' || field === 'added' ? true : current.hasOpening,
           hasClosing: field === 'closing' ? true : current.hasClosing,
         },
       };
@@ -215,7 +223,7 @@ export function StationShiftView({
       setAutoLoadedPrevDate(prevDate);
       setFeedback({
         type: 'success',
-        text: `Se cargó el cierre del ${formatDateHuman(prevDate)} como base inicial.`,
+        text: `Se cargó el cierre del ${formatDateHuman(prevDate)} como base de apertura.`,
       });
     } catch {
       setFeedback({
@@ -248,8 +256,8 @@ export function StationShiftView({
         type: 'success',
         text:
           mode === 'opening'
-            ? 'Avance guardado. Puedes seguir contando cuando quieras.'
-            : '¡Excelente! Tu cierre fue enviado y el jefe ya puede verlo.',
+            ? '¡Apertura y surtido guardados! Si llegan más productos en este horario puedes volver a ajustarlo.'
+            : '¡Excelente! Tu cierre fue enviado y el jefe ya puede verlo en su resumen.',
       });
       onSaved?.();
     } catch {
@@ -285,14 +293,20 @@ export function StationShiftView({
 
   const countedCount = stationItems.filter((it) => {
     const row = drafts[it.id];
+    if (isWorkerOpeningPhase) {
+      return Boolean(row?.hasOpening || report?.status === 'opening_saved' || isCompleted);
+    }
     return Boolean(row?.hasClosing || isCompleted);
   }).length;
 
   const lowCount = stationItems.filter((it) => {
     const row = drafts[it.id];
     if (!row) return false;
-    const lvl = getStockLevel(row.closing, it.minStock);
-    return (row.hasClosing || isCompleted) && (lvl === 'agotado' || lvl === 'comprar' || lvl === 'medio');
+    const lvl = getStockLevel(isWorkerOpeningPhase ? row.opening + row.added : row.closing, it.minStock);
+    return (
+      (isWorkerOpeningPhase ? row.hasOpening : row.hasClosing || isCompleted) &&
+      (lvl === 'agotado' || lvl === 'comprar' || lvl === 'medio')
+    );
   }).length;
 
   const progressPct =
@@ -304,18 +318,80 @@ export function StationShiftView({
       if (q && !item.name.toLowerCase().includes(q)) return false;
       const row = drafts[item.id];
       if (itemFilter === 'pendientes') {
+        if (isWorkerOpeningPhase) {
+          return !row?.hasOpening && report?.status !== 'opening_saved' && !isCompleted;
+        }
         return !row?.hasClosing && !isCompleted;
       }
       if (itemFilter === 'bajos') {
-        const lvl = getStockLevel(row?.closing ?? 0, item.minStock);
+        const val = isWorkerOpeningPhase ? (row?.opening ?? 0) + (row?.added ?? 0) : row?.closing ?? 0;
+        const lvl = getStockLevel(val, item.minStock);
         return lvl === 'agotado' || lvl === 'comprar' || lvl === 'medio';
       }
       return true;
     });
-  }, [stationItems, searchTerm, itemFilter, drafts, isCompleted]);
+  }, [stationItems, searchTerm, itemFilter, drafts, isCompleted, isWorkerOpeningPhase, report?.status]);
 
   const closingTime = report?.status === 'completed' ? formatTimeShort(report?.updatedAt) : null;
   const draftTime = report?.status === 'opening_saved' ? formatTimeShort(report?.updatedAt) : null;
+
+  // Outside Allowed Shift Schedule (Workers only) -> Render nothing from inventory
+  if (isWorkerOutsideHours) {
+    return (
+      <div className="py-8 sm:py-12 flex items-center justify-center">
+        <motion.div
+          initial={{ opacity: 0, y: 12 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.28 }}
+          className="w-full max-w-lg bg-white border border-stone-200 rounded-2xl p-6 sm:p-8 text-center space-y-5 shadow-xs"
+        >
+          <div className="w-12 h-12 rounded-2xl bg-stone-100 text-stone-700 flex items-center justify-center mx-auto">
+            <Clock className="w-6 h-6" />
+          </div>
+
+          <div className="space-y-1.5">
+            <p className="text-xs font-semibold text-orange-600">
+              ¡Hola, {station.workerName}! · {station.name}
+            </p>
+            <h1 className="font-display text-2xl font-bold text-stone-900">
+              Fuera de horario de inventario
+            </h1>
+            <p className="text-sm text-stone-600 leading-relaxed">
+              En este momento la planilla está cerrada. Tu espacio solo se habilita en los horarios definidos por el jefe:
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-left">
+            <div className="p-4 rounded-xl bg-orange-50/70 border border-orange-200/80 space-y-1">
+              <div className="flex items-center gap-1.5 text-xs font-bold text-orange-800">
+                <Sun className="w-4 h-4 shrink-0" />
+                <span>Apertura y surtido</span>
+              </div>
+              <p className="font-mono text-sm font-bold text-stone-900">
+                {scheduleStatus.openingRangeLabel}
+              </p>
+              <p className="text-xs text-stone-600">Inicio del turno y llegada de productos</p>
+            </div>
+
+            <div className="p-4 rounded-xl bg-stone-100 border border-stone-200 space-y-1">
+              <div className="flex items-center gap-1.5 text-xs font-bold text-stone-800">
+                <Moon className="w-4 h-4 shrink-0" />
+                <span>Cierre del día</span>
+              </div>
+              <p className="font-mono text-sm font-bold text-stone-900">
+                {scheduleStatus.closingRangeLabel}
+              </p>
+              <p className="text-xs text-stone-600">Conteo final al terminar la jornada</p>
+            </div>
+          </div>
+
+          <p className="text-xs font-mono text-stone-500 pt-1">
+            Hora actual: {scheduleStatus.currentTimeLabel}
+          </p>
+        </motion.div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-5 pb-8 min-w-0">
@@ -330,23 +406,29 @@ export function StationShiftView({
             {station.name}
           </h1>
           <p className="text-sm text-stone-600 mt-1">
-            Toca + o − en cada insumo para anotar cuánto quedó al terminar el turno.
+            {isWorkerOpeningPhase
+              ? `Horario de apertura (${scheduleStatus.openingRangeLabel}): confirma con cuánto inicia el puesto y anota si llegaron productos.`
+              : !canManage && scheduleStatus.phase === 'closing'
+                ? `Horario de cierre (${scheduleStatus.closingRangeLabel}): anota cuántas unidades quedaron hoy al terminar el turno.`
+                : 'Registra apertura, surtido o cierre diario del puesto.'}
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setShowOpeningDetails((v) => !v)}
-            className="min-h-[42px] inline-flex items-center gap-2 px-3.5 py-2 text-xs sm:text-sm font-medium text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            {showOpeningDetails ? (
-              <ChevronUp className="w-4 h-4" />
-            ) : (
-              <ChevronDown className="w-4 h-4" />
-            )}
-            {showOpeningDetails ? 'Ocultar inicio y surtido' : 'Ajustar inicio / surtido'}
-          </button>
+          {!isWorkerOpeningPhase && (
+            <button
+              type="button"
+              onClick={() => setShowOpeningDetails((v) => !v)}
+              className="min-h-[42px] inline-flex items-center gap-2 px-3.5 py-2 text-xs sm:text-sm font-medium text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              {showOpeningDetails ? (
+                <ChevronUp className="w-4 h-4" />
+              ) : (
+                <ChevronDown className="w-4 h-4" />
+              )}
+              {showOpeningDetails ? 'Ocultar inicio y surtido' : 'Ver / ajustar inicio y surtido'}
+            </button>
+          )}
 
           {isCompleted && canManage && (
             <button
@@ -367,7 +449,9 @@ export function StationShiftView({
         className={`rounded-2xl border p-4 sm:p-5 space-y-3 transition-colors ${
           isCompleted
             ? 'bg-emerald-50/70 border-emerald-200'
-            : 'bg-white border-stone-200'
+            : isWorkerOpeningPhase
+              ? 'bg-orange-50/40 border-orange-200/80'
+              : 'bg-white border-stone-200'
         }`}
       >
         <div className="flex flex-wrap items-center justify-between gap-2">
@@ -379,25 +463,35 @@ export function StationShiftView({
                   ¡Cierre enviado al jefe!{closingTime ? ` (${closingTime})` : ''}
                 </span>
               </>
+            ) : isWorkerOpeningPhase ? (
+              <>
+                <Sun className="w-5 h-5 text-orange-600 shrink-0" />
+                <span className="font-semibold text-stone-900">
+                  {report?.status === 'opening_saved'
+                    ? `Apertura guardada${draftTime ? ` (${draftTime})` : ''} · Puedes ajustar si llega más mercancía`
+                    : 'Registro de apertura y llegada de productos'}
+                </span>
+              </>
             ) : report?.status === 'opening_saved' ? (
               <>
                 <Save className="w-5 h-5 text-amber-600 shrink-0" />
                 <span className="font-semibold text-amber-900">
-                  Avance guardado{draftTime ? ` (${draftTime})` : ''} · Falta enviar cierre
+                  Apertura lista{draftTime ? ` (${draftTime})` : ''} · Falta enviar cierre final
                 </span>
               </>
             ) : (
               <>
-                <CheckCircle2 className="w-5 h-5 text-orange-600 shrink-0" />
+                <Moon className="w-5 h-5 text-orange-600 shrink-0" />
                 <span className="font-semibold text-stone-900">
-                  Tu conteo de cierre de hoy
+                  Conteo de cierre del día
                 </span>
               </>
             )}
           </div>
 
           <div className="text-sm font-mono tabular-nums font-bold text-stone-800 shrink-0">
-            {countedCount} / {stationItems.length} contados
+            {countedCount} / {stationItems.length}{' '}
+            {isWorkerOpeningPhase ? 'confirmados' : 'contados'}
           </div>
         </div>
 
@@ -415,8 +509,10 @@ export function StationShiftView({
         <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-stone-600">
           <span>
             {autoLoadedPrevDate
-              ? `Base inicial lista con el cierre de ${formatDateHuman(autoLoadedPrevDate)}.`
-              : 'Cuando termines de contar, toca el botón verde/naranja de abajo para enviárselo al jefe.'}
+              ? `Base inicial cargada automáticamente con el cierre de ${formatDateHuman(autoLoadedPrevDate)}.`
+              : isWorkerOpeningPhase
+                ? 'Revisa con cuánto abres y suma en "Surtido (+)" lo que haya llegado hoy.'
+                : 'Cuando termines de contar, presiona "Enviar cierre del día al jefe".'}
           </span>
           {!isLocked && stationItems.length > 0 && (
             <button
@@ -550,8 +646,9 @@ export function StationShiftView({
                   hasOpening: false,
                   hasClosing: false,
                 };
-                const hasValue = row.hasClosing || isCompleted;
-                const level = getStockLevel(row.closing, item.minStock);
+                const hasClosingVal = row.hasClosing || isCompleted;
+                const activeStockVal = isWorkerOpeningPhase ? row.opening + row.added : row.closing;
+                const level = getStockLevel(activeStockVal, item.minStock);
                 const meta = getStockLevelMeta(level);
                 const suggestBuy = getSuggestedPurchase(
                   row.closing,
@@ -559,7 +656,7 @@ export function StationShiftView({
                   item.targetStock,
                 );
 
-                const inputBorderClass = !hasValue
+                const inputBorderClass = !hasClosingVal
                   ? 'bg-stone-50 border-stone-300 text-stone-800'
                   : level === 'agotado' || level === 'comprar'
                     ? 'bg-red-50/40 border-red-400 text-stone-900'
@@ -571,7 +668,9 @@ export function StationShiftView({
                   <div
                     key={item.id}
                     className={`p-4 sm:p-5 space-y-3.5 transition-colors ${
-                      hasValue ? 'bg-white' : 'bg-stone-50/40'
+                      (isWorkerOpeningPhase ? row.hasOpening : hasClosingVal)
+                        ? 'bg-white'
+                        : 'bg-stone-50/40'
                     }`}
                   >
                     <div className="flex items-start justify-between gap-3">
@@ -581,14 +680,18 @@ export function StationShiftView({
                         </h3>
                         <p className="text-xs text-stone-500 mt-0.5 font-mono tabular-nums">
                           {item.unit} · Mínimo: {item.minStock}
-                          {row.hasOpening && !showOpeningDetails
+                          {!isWorkerOpeningPhase && row.hasOpening && !showOpeningDetails
                             ? ` · Base: ${row.opening + row.added}`
                             : ''}
                         </p>
                       </div>
 
                       <div className="shrink-0 text-right">
-                        {!hasValue ? (
+                        {isWorkerOpeningPhase ? (
+                          <span className="text-xs font-mono font-bold text-orange-700">
+                            Total: {row.opening + row.added} {item.unit}
+                          </span>
+                        ) : !hasClosingVal ? (
                           <span className="text-xs font-semibold text-stone-400">
                             Por contar
                           </span>
@@ -605,140 +708,226 @@ export function StationShiftView({
                       </div>
                     </div>
 
-                    {/* Big Thumb-Friendly Closing Stepper */}
-                    <div className="space-y-1.5">
-                      <label
-                        htmlFor={`mobile-close-${item.id}`}
-                        className="block text-xs font-semibold text-stone-600"
-                      >
-                        ¿Cuánto quedó hoy al cerrar? ({item.unit})
-                      </label>
-                      <div className="flex items-center gap-2">
-                        <motion.button
-                          whileTap={{ scale: 0.93 }}
-                          type="button"
-                          disabled={isLocked}
-                          onClick={() => stepField(item.id, 'closing', -1)}
-                          aria-label={`Restar ${item.name}`}
-                          className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                        >
-                          <Minus className="w-5 h-5" />
-                        </motion.button>
-                        <input
-                          id={`mobile-close-${item.id}`}
-                          type="number"
-                          inputMode="decimal"
-                          min={0}
-                          step="any"
-                          disabled={isLocked}
-                          value={row.closing}
-                          onChange={(e) =>
-                            updateField(item.id, 'closing', parseFloat(e.target.value))
-                          }
-                          className={`min-w-0 flex-1 h-12 text-center font-mono tabular-nums text-xl font-bold rounded-xl border focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:opacity-60 transition-colors ${inputBorderClass}`}
-                        />
-                        <motion.button
-                          whileTap={{ scale: 0.93 }}
-                          type="button"
-                          disabled={isLocked}
-                          onClick={() => stepField(item.id, 'closing', 1)}
-                          aria-label={`Sumar ${item.name}`}
-                          className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                        >
-                          <Plus className="w-5 h-5" />
-                        </motion.button>
-                      </div>
-                    </div>
-
-                    {/* Optional Opening & Restock Adjusters */}
-                    <AnimatePresence initial={false}>
-                      {showOpeningDetails && (
-                        <motion.div
-                          initial={{ opacity: 0, height: 0 }}
-                          animate={{ opacity: 1, height: 'auto' }}
-                          exit={{ opacity: 0, height: 0 }}
-                          className="overflow-hidden"
-                        >
-                          <div className="pt-2.5 border-t border-stone-100 grid grid-cols-2 gap-3">
-                            <div className="min-w-0">
-                              <label className="block text-xs font-medium text-stone-600 mb-1">
-                                Inicio del día
-                              </label>
-                              <div className="flex items-center gap-1">
-                                <button
-                                  type="button"
-                                  disabled={isLocked}
-                                  onClick={() => stepField(item.id, 'opening', -1)}
-                                  aria-label={`Restar inicio ${item.name}`}
-                                  className="w-9 h-10 shrink-0 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 disabled:opacity-40 cursor-pointer"
-                                >
-                                  <Minus className="w-3.5 h-3.5" />
-                                </button>
-                                <input
-                                  type="number"
-                                  inputMode="decimal"
-                                  min={0}
-                                  step="any"
-                                  disabled={isLocked}
-                                  value={row.opening}
-                                  onChange={(e) =>
-                                    updateField(item.id, 'opening', parseFloat(e.target.value))
-                                  }
-                                  className="min-w-0 w-full h-10 text-center font-mono tabular-nums text-sm font-semibold bg-stone-50 border border-stone-200 rounded-lg"
-                                />
-                                <button
-                                  type="button"
-                                  disabled={isLocked}
-                                  onClick={() => stepField(item.id, 'opening', 1)}
-                                  aria-label={`Sumar inicio ${item.name}`}
-                                  className="w-9 h-10 shrink-0 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 disabled:opacity-40 cursor-pointer"
-                                >
-                                  <Plus className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
-                            </div>
-
-                            <div className="min-w-0">
-                              <label className="block text-xs font-medium text-stone-600 mb-1">
-                                Surtido hoy (+)
-                              </label>
-                              <div className="flex items-center gap-1">
-                                <button
-                                  type="button"
-                                  disabled={isLocked}
-                                  onClick={() => stepField(item.id, 'added', -1)}
-                                  aria-label={`Restar surtido ${item.name}`}
-                                  className="w-9 h-10 shrink-0 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 disabled:opacity-40 cursor-pointer"
-                                >
-                                  <Minus className="w-3.5 h-3.5" />
-                                </button>
-                                <input
-                                  type="number"
-                                  inputMode="decimal"
-                                  min={0}
-                                  step="any"
-                                  disabled={isLocked}
-                                  value={row.added}
-                                  onChange={(e) =>
-                                    updateField(item.id, 'added', parseFloat(e.target.value))
-                                  }
-                                  className="min-w-0 w-full h-10 text-center font-mono tabular-nums text-sm font-semibold bg-stone-50 border border-stone-200 rounded-lg"
-                                />
-                                <button
-                                  type="button"
-                                  disabled={isLocked}
-                                  onClick={() => stepField(item.id, 'added', 1)}
-                                  aria-label={`Sumar surtido ${item.name}`}
-                                  className="w-9 h-10 shrink-0 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 disabled:opacity-40 cursor-pointer"
-                                >
-                                  <Plus className="w-3.5 h-3.5" />
-                                </button>
-                              </div>
-                            </div>
+                    {isWorkerOpeningPhase ? (
+                      /* OPENING & RESTOCK PHASE (4 PM - 7 PM) */
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div className="space-y-1.5">
+                          <label className="block text-xs font-semibold text-stone-700">
+                            Con cuánto abre ({item.unit})
+                          </label>
+                          <div className="flex items-center gap-2">
+                            <motion.button
+                              whileTap={{ scale: 0.93 }}
+                              type="button"
+                              disabled={isLocked}
+                              onClick={() => stepField(item.id, 'opening', -1)}
+                              aria-label={`Restar inicio ${item.name}`}
+                              className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
+                            >
+                              <Minus className="w-5 h-5" />
+                            </motion.button>
+                            <input
+                              type="number"
+                              inputMode="decimal"
+                              min={0}
+                              step="any"
+                              disabled={isLocked}
+                              value={row.opening}
+                              onChange={(e) =>
+                                updateField(item.id, 'opening', parseFloat(e.target.value))
+                              }
+                              className="min-w-0 flex-1 h-12 text-center font-mono tabular-nums text-xl font-bold rounded-xl border border-stone-300 bg-white text-stone-900 focus:outline-none focus:ring-2 focus:ring-orange-500"
+                            />
+                            <motion.button
+                              whileTap={{ scale: 0.93 }}
+                              type="button"
+                              disabled={isLocked}
+                              onClick={() => stepField(item.id, 'opening', 1)}
+                              aria-label={`Sumar inicio ${item.name}`}
+                              className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
+                            >
+                              <Plus className="w-5 h-5" />
+                            </motion.button>
                           </div>
-                        </motion.div>
-                      )}
-                    </AnimatePresence>
+                        </div>
+
+                        <div className="space-y-1.5">
+                          <label className="block text-xs font-semibold text-orange-700">
+                            ¿Llegó producto hoy? / Surtido (+)
+                          </label>
+                          <div className="flex items-center gap-2">
+                            <motion.button
+                              whileTap={{ scale: 0.93 }}
+                              type="button"
+                              disabled={isLocked}
+                              onClick={() => stepField(item.id, 'added', -1)}
+                              aria-label={`Restar surtido ${item.name}`}
+                              className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-orange-200 bg-orange-50 text-orange-800 hover:bg-orange-100 disabled:opacity-40 cursor-pointer"
+                            >
+                              <Minus className="w-5 h-5" />
+                            </motion.button>
+                            <input
+                              type="number"
+                              inputMode="decimal"
+                              min={0}
+                              step="any"
+                              disabled={isLocked}
+                              value={row.added}
+                              onChange={(e) =>
+                                updateField(item.id, 'added', parseFloat(e.target.value))
+                              }
+                              className="min-w-0 flex-1 h-12 text-center font-mono tabular-nums text-xl font-bold rounded-xl border border-orange-300 bg-orange-50/40 text-stone-900 focus:outline-none focus:ring-2 focus:ring-orange-500"
+                            />
+                            <motion.button
+                              whileTap={{ scale: 0.93 }}
+                              type="button"
+                              disabled={isLocked}
+                              onClick={() => stepField(item.id, 'added', 1)}
+                              aria-label={`Sumar surtido ${item.name}`}
+                              className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-orange-200 bg-orange-50 text-orange-800 hover:bg-orange-100 disabled:opacity-40 cursor-pointer"
+                            >
+                              <Plus className="w-5 h-5" />
+                            </motion.button>
+                          </div>
+                        </div>
+                      </div>
+                    ) : (
+                      /* CLOSING PHASE (11 PM - 2 AM or Boss View) */
+                      <>
+                        <div className="space-y-1.5">
+                          <label
+                            htmlFor={`mobile-close-${item.id}`}
+                            className="block text-xs font-semibold text-stone-600"
+                          >
+                            ¿Cuánto quedó hoy al cerrar? ({item.unit})
+                          </label>
+                          <div className="flex items-center gap-2">
+                            <motion.button
+                              whileTap={{ scale: 0.93 }}
+                              type="button"
+                              disabled={isLocked}
+                              onClick={() => stepField(item.id, 'closing', -1)}
+                              aria-label={`Restar ${item.name}`}
+                              className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
+                            >
+                              <Minus className="w-5 h-5" />
+                            </motion.button>
+                            <input
+                              id={`mobile-close-${item.id}`}
+                              type="number"
+                              inputMode="decimal"
+                              min={0}
+                              step="any"
+                              disabled={isLocked}
+                              value={row.closing}
+                              onChange={(e) =>
+                                updateField(item.id, 'closing', parseFloat(e.target.value))
+                              }
+                              className={`min-w-0 flex-1 h-12 text-center font-mono tabular-nums text-xl font-bold rounded-xl border focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:opacity-60 transition-colors ${inputBorderClass}`}
+                            />
+                            <motion.button
+                              whileTap={{ scale: 0.93 }}
+                              type="button"
+                              disabled={isLocked}
+                              onClick={() => stepField(item.id, 'closing', 1)}
+                              aria-label={`Sumar ${item.name}`}
+                              className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
+                            >
+                              <Plus className="w-5 h-5" />
+                            </motion.button>
+                          </div>
+                        </div>
+
+                        <AnimatePresence initial={false}>
+                          {showOpeningDetails && (
+                            <motion.div
+                              initial={{ opacity: 0, height: 0 }}
+                              animate={{ opacity: 1, height: 'auto' }}
+                              exit={{ opacity: 0, height: 0 }}
+                              className="overflow-hidden"
+                            >
+                              <div className="pt-2.5 border-t border-stone-100 grid grid-cols-2 gap-3">
+                                <div className="min-w-0">
+                                  <label className="block text-xs font-medium text-stone-600 mb-1">
+                                    Inicio del día
+                                  </label>
+                                  <div className="flex items-center gap-1">
+                                    <button
+                                      type="button"
+                                      disabled={isLocked}
+                                      onClick={() => stepField(item.id, 'opening', -1)}
+                                      aria-label={`Restar inicio ${item.name}`}
+                                      className="w-9 h-10 shrink-0 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 disabled:opacity-40 cursor-pointer"
+                                    >
+                                      <Minus className="w-3.5 h-3.5" />
+                                    </button>
+                                    <input
+                                      type="number"
+                                      inputMode="decimal"
+                                      min={0}
+                                      step="any"
+                                      disabled={isLocked}
+                                      value={row.opening}
+                                      onChange={(e) =>
+                                        updateField(item.id, 'opening', parseFloat(e.target.value))
+                                      }
+                                      className="min-w-0 w-full h-10 text-center font-mono tabular-nums text-sm font-semibold bg-stone-50 border border-stone-200 rounded-lg"
+                                    />
+                                    <button
+                                      type="button"
+                                      disabled={isLocked}
+                                      onClick={() => stepField(item.id, 'opening', 1)}
+                                      aria-label={`Sumar inicio ${item.name}`}
+                                      className="w-9 h-10 shrink-0 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 disabled:opacity-40 cursor-pointer"
+                                    >
+                                      <Plus className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
+                                </div>
+
+                                <div className="min-w-0">
+                                  <label className="block text-xs font-medium text-stone-600 mb-1">
+                                    Surtido hoy (+)
+                                  </label>
+                                  <div className="flex items-center gap-1">
+                                    <button
+                                      type="button"
+                                      disabled={isLocked}
+                                      onClick={() => stepField(item.id, 'added', -1)}
+                                      aria-label={`Restar surtido ${item.name}`}
+                                      className="w-9 h-10 shrink-0 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 disabled:opacity-40 cursor-pointer"
+                                    >
+                                      <Minus className="w-3.5 h-3.5" />
+                                    </button>
+                                    <input
+                                      type="number"
+                                      inputMode="decimal"
+                                      min={0}
+                                      step="any"
+                                      disabled={isLocked}
+                                      value={row.added}
+                                      onChange={(e) =>
+                                        updateField(item.id, 'added', parseFloat(e.target.value))
+                                      }
+                                      className="min-w-0 w-full h-10 text-center font-mono tabular-nums text-sm font-semibold bg-stone-50 border border-stone-200 rounded-lg"
+                                    />
+                                    <button
+                                      type="button"
+                                      disabled={isLocked}
+                                      onClick={() => stepField(item.id, 'added', 1)}
+                                      aria-label={`Sumar surtido ${item.name}`}
+                                      className="w-9 h-10 shrink-0 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 disabled:opacity-40 cursor-pointer"
+                                    >
+                                      <Plus className="w-3.5 h-3.5" />
+                                    </button>
+                                  </div>
+                                </div>
+                              </div>
+                            </motion.div>
+                          )}
+                        </AnimatePresence>
+                      </>
+                    )}
                   </div>
                 );
               })}
@@ -750,15 +939,21 @@ export function StationShiftView({
                 <thead>
                   <tr className="border-b border-stone-200 bg-stone-50 text-xs font-semibold text-stone-600">
                     <th className="py-3.5 px-5 min-w-[220px]">Insumo</th>
-                    {showOpeningDetails && (
+                    {(isWorkerOpeningPhase || showOpeningDetails) && (
                       <>
-                        <th className="py-3.5 px-3 text-center">Inicio</th>
+                        <th className="py-3.5 px-3 text-center">Inicio del día</th>
                         <th className="py-3.5 px-3 text-center">Surtido (+)</th>
                       </>
                     )}
-                    <th className="py-3.5 px-4 text-center">¿Cuánto quedó hoy? (Cierre)</th>
-                    {showOpeningDetails && <th className="py-3.5 px-4 text-right">Consumo</th>}
-                    <th className="py-3.5 px-5">Estado / Alerta</th>
+                    {isWorkerOpeningPhase ? (
+                      <th className="py-3.5 px-5 text-right">Total disponible</th>
+                    ) : (
+                      <>
+                        <th className="py-3.5 px-4 text-center">¿Cuánto quedó hoy? (Cierre)</th>
+                        {showOpeningDetails && <th className="py-3.5 px-4 text-right">Consumo</th>}
+                        <th className="py-3.5 px-5">Estado / Alerta</th>
+                      </>
+                    )}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-stone-100 text-sm">
@@ -793,13 +988,13 @@ export function StationShiftView({
                           </div>
                           <div className="text-xs text-stone-500 font-mono tabular-nums mt-0.5">
                             {item.unit} · Mínimo: {item.minStock}
-                            {!showOpeningDetails && row.hasOpening
+                            {!isWorkerOpeningPhase && !showOpeningDetails && row.hasOpening
                               ? ` · Base día: ${row.opening + row.added}`
                               : ''}
                           </div>
                         </td>
 
-                        {showOpeningDetails && (
+                        {(isWorkerOpeningPhase || showOpeningDetails) && (
                           <>
                             <td className="py-4 px-3">
                               <div className="flex items-center justify-center gap-1">
@@ -873,76 +1068,84 @@ export function StationShiftView({
                           </>
                         )}
 
-                        <td className="py-4 px-4">
-                          <div className="flex items-center justify-center gap-1.5">
-                            <motion.button
-                              whileTap={{ scale: 0.93 }}
-                              type="button"
-                              disabled={isLocked}
-                              onClick={() => stepField(item.id, 'closing', -1)}
-                              aria-label={`Restar cierre de ${item.name}`}
-                              className="w-11 h-11 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                            >
-                              <Minus className="w-4 h-4" />
-                            </motion.button>
-                            <input
-                              type="number"
-                              min={0}
-                              step="any"
-                              disabled={isLocked}
-                              aria-label={`Cierre de ${item.name}`}
-                              value={row.closing}
-                              onChange={(e) =>
-                                updateField(item.id, 'closing', parseFloat(e.target.value))
-                              }
-                              className={`w-20 h-11 text-center font-mono tabular-nums text-base font-bold rounded-xl border focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:opacity-60 transition-colors ${
-                                hasValue
-                                  ? 'bg-white border-orange-500 text-stone-900'
-                                  : 'bg-stone-50 border-stone-300 text-stone-800'
-                              }`}
-                            />
-                            <motion.button
-                              whileTap={{ scale: 0.93 }}
-                              type="button"
-                              disabled={isLocked}
-                              onClick={() => stepField(item.id, 'closing', 1)}
-                              aria-label={`Sumar cierre de ${item.name}`}
-                              className="w-11 h-11 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                            >
-                              <Plus className="w-4 h-4" />
-                            </motion.button>
-                          </div>
-                        </td>
-
-                        {showOpeningDetails && (
-                          <td className="py-4 px-4 text-right font-mono tabular-nums text-stone-700">
-                            {consumed} {item.unit}
+                        {isWorkerOpeningPhase ? (
+                          <td className="py-4 px-5 text-right font-mono tabular-nums font-bold text-stone-900">
+                            {row.opening + row.added} {item.unit}
                           </td>
-                        )}
+                        ) : (
+                          <>
+                            <td className="py-4 px-4">
+                              <div className="flex items-center justify-center gap-1.5">
+                                <motion.button
+                                  whileTap={{ scale: 0.93 }}
+                                  type="button"
+                                  disabled={isLocked}
+                                  onClick={() => stepField(item.id, 'closing', -1)}
+                                  aria-label={`Restar cierre de ${item.name}`}
+                                  className="w-11 h-11 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
+                                >
+                                  <Minus className="w-4 h-4" />
+                                </motion.button>
+                                <input
+                                  type="number"
+                                  min={0}
+                                  step="any"
+                                  disabled={isLocked}
+                                  aria-label={`Cierre de ${item.name}`}
+                                  value={row.closing}
+                                  onChange={(e) =>
+                                    updateField(item.id, 'closing', parseFloat(e.target.value))
+                                  }
+                                  className={`w-20 h-11 text-center font-mono tabular-nums text-base font-bold rounded-xl border focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:opacity-60 transition-colors ${
+                                    hasValue
+                                      ? 'bg-white border-orange-500 text-stone-900'
+                                      : 'bg-stone-50 border-stone-300 text-stone-800'
+                                  }`}
+                                />
+                                <motion.button
+                                  whileTap={{ scale: 0.93 }}
+                                  type="button"
+                                  disabled={isLocked}
+                                  onClick={() => stepField(item.id, 'closing', 1)}
+                                  aria-label={`Sumar cierre de ${item.name}`}
+                                  className="w-11 h-11 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
+                                >
+                                  <Plus className="w-4 h-4" />
+                                </motion.button>
+                              </div>
+                            </td>
 
-                        <td className="py-4 px-5 whitespace-nowrap">
-                          {!hasValue ? (
-                            <span className="text-xs font-medium text-stone-400">
-                              Por contar
-                            </span>
-                          ) : (
-                            <div className="space-y-0.5">
-                              <span
-                                className={`inline-flex items-center gap-1.5 text-sm font-semibold ${meta.textClass}`}
-                              >
-                                {(level === 'agotado' || level === 'comprar') && (
-                                  <AlertTriangle className="w-4 h-4 shrink-0" />
-                                )}
-                                {meta.label}
-                              </span>
-                              {suggestBuy > 0 && (
-                                <p className="text-xs font-mono tabular-nums text-red-700">
-                                  Sugerido pedir: +{suggestBuy} {item.unit}
-                                </p>
+                            {showOpeningDetails && (
+                              <td className="py-4 px-4 text-right font-mono tabular-nums text-stone-700">
+                                {consumed} {item.unit}
+                              </td>
+                            )}
+
+                            <td className="py-4 px-5 whitespace-nowrap">
+                              {!hasValue ? (
+                                <span className="text-xs font-medium text-stone-400">
+                                  Por contar
+                                </span>
+                              ) : (
+                                <div className="space-y-0.5">
+                                  <span
+                                    className={`inline-flex items-center gap-1.5 text-sm font-semibold ${meta.textClass}`}
+                                  >
+                                    {(level === 'agotado' || level === 'comprar') && (
+                                      <AlertTriangle className="w-4 h-4 shrink-0" />
+                                    )}
+                                    {meta.label}
+                                  </span>
+                                  {suggestBuy > 0 && (
+                                    <p className="text-xs font-mono tabular-nums text-red-700">
+                                      Sugerido pedir: +{suggestBuy} {item.unit}
+                                    </p>
+                                  )}
+                                </div>
                               )}
-                            </div>
-                          )}
-                        </td>
+                            </td>
+                          </>
+                        )}
                       </tr>
                     );
                   })}
@@ -961,7 +1164,9 @@ export function StationShiftView({
               htmlFor={`notes-${station.id}`}
               className="block text-sm font-semibold text-stone-800 mb-1.5"
             >
-              Notas del cierre para el jefe (opcional)
+              {isWorkerOpeningPhase
+                ? 'Notas de apertura o llegada de mercancía (opcional)'
+                : 'Notas del cierre para el jefe (opcional)'}
             </label>
             <textarea
               id={`notes-${station.id}`}
@@ -970,31 +1175,51 @@ export function StationShiftView({
               disabled={isLocked}
               value={notes}
               onChange={(e) => setNotes(e.target.value)}
-              placeholder="Ej: Llegó pedido de gaseosas hoy, o falta comprar hielo urgente..."
+              placeholder={
+                isWorkerOpeningPhase
+                  ? 'Ej: Llegaron 2 cajas de gaseosa y 3 bolsas de papa...'
+                  : 'Ej: Llegó pedido de gaseosas hoy, o falta comprar hielo urgente...'
+              }
               className="w-full px-3.5 py-2.5 text-sm bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 focus:bg-white disabled:opacity-60"
             />
           </div>
 
           <div className="flex flex-col-reverse sm:flex-row sm:items-center justify-end gap-3">
-            <button
-              type="button"
-              disabled={isLocked || savingMode !== null}
-              onClick={() => handleSave('opening')}
-              className="min-h-[48px] inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-semibold text-stone-700 bg-white border border-stone-300 rounded-xl hover:bg-stone-100 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              <Save className="w-4 h-4" />
-              {savingMode === 'opening' ? 'Guardando avance...' : 'Guardar avance'}
-            </button>
+            {isWorkerOpeningPhase ? (
+              <button
+                type="button"
+                disabled={isLocked || savingMode !== null}
+                onClick={() => handleSave('opening')}
+                className="min-h-[48px] inline-flex items-center justify-center gap-2 px-6 py-3 text-sm sm:text-base font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.99] disabled:opacity-50 transition-all whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <Save className="w-5 h-5" />
+                {savingMode === 'opening' ? 'Guardando apertura...' : 'Guardar apertura y surtido'}
+              </button>
+            ) : (
+              <>
+                {(canManage || scheduleStatus.phase === 'unrestricted') && (
+                  <button
+                    type="button"
+                    disabled={isLocked || savingMode !== null}
+                    onClick={() => handleSave('opening')}
+                    className="min-h-[48px] inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-semibold text-stone-700 bg-white border border-stone-300 rounded-xl hover:bg-stone-100 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Save className="w-4 h-4" />
+                    {savingMode === 'opening' ? 'Guardando avance...' : 'Guardar avance'}
+                  </button>
+                )}
 
-            <button
-              type="button"
-              disabled={isLocked || savingMode !== null}
-              onClick={() => handleSave('closing')}
-              className="min-h-[48px] inline-flex items-center justify-center gap-2 px-6 py-3 text-sm sm:text-base font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.99] disabled:opacity-50 transition-all whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              <CheckCircle2 className="w-5 h-5" />
-              {savingMode === 'closing' ? 'Enviando cierre...' : 'Enviar cierre del día al jefe'}
-            </button>
+                <button
+                  type="button"
+                  disabled={isLocked || savingMode !== null}
+                  onClick={() => handleSave('closing')}
+                  className="min-h-[48px] inline-flex items-center justify-center gap-2 px-6 py-3 text-sm sm:text-base font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.99] disabled:opacity-50 transition-all whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <CheckCircle2 className="w-5 h-5" />
+                  {savingMode === 'closing' ? 'Enviando cierre...' : 'Enviar cierre del día al jefe'}
+                </button>
+              </>
+            )}
           </div>
         </div>
       )}

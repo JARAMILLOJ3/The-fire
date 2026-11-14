@@ -1,3 +1,5 @@
+import type { ShiftSchedule } from './types';
+
 export const BOOTSTRAPPED_ADMIN_EMAIL = 'jsjg1023.305@gmail.com';
 export const MAIN_WORKSPACE_ID = 'restaurante_principal';
 export const APP_BRAND_NAME = 'The Fire Inventario';
@@ -11,6 +13,15 @@ export const MAX_EMAIL_LENGTH = 120;
 export const MAX_STOCK_VALUE = 100000;
 export const ID_PATTERN = /^[a-zA-Z0-9_\-]+$/;
 export const DATE_PATTERN = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/;
+export const TIME_PATTERN = /^([01][0-9]|2[0-3]):[0-5][0-9]$/;
+
+export const DEFAULT_SHIFT_SCHEDULE: ShiftSchedule = {
+  enabled: true,
+  openingStart: '16:00', // 4:00 PM
+  openingEnd: '19:00',   // 7:00 PM
+  closingStart: '23:00', // 11:00 PM
+  closingEnd: '02:00',   // 2:00 AM
+};
 
 export interface DefaultStationTemplate {
   id: string;

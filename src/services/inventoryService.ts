@@ -15,6 +15,7 @@ import {
 import {
   BOOTSTRAPPED_ADMIN_EMAIL,
   DEFAULT_CATALOG_ITEMS,
+  DEFAULT_SHIFT_SCHEDULE,
   DEFAULT_STATIONS,
   MAIN_WORKSPACE_ID,
   MAX_AREA_LENGTH,
@@ -24,6 +25,7 @@ import {
   MAX_NOTES_LENGTH,
   MAX_STOCK_VALUE,
   MAX_UNIT_LENGTH,
+  TIME_PATTERN,
 } from '../constants';
 import { db, handleFirestoreError, OperationType } from '../firebase';
 import type {
@@ -33,6 +35,7 @@ import type {
   InventoryItem,
   Invite,
   ReportStatus,
+  ShiftSchedule,
   StationId,
   StationLink,
   TeamMember,
@@ -238,6 +241,7 @@ export async function resolveUserWorkspace(
 
     const newWorkspaceData = {
       name: 'The Fire',
+      shiftSchedule: DEFAULT_SHIFT_SCHEDULE,
       ownerUid: user.uid,
       ownerEmail: email,
       authorizedEmails: [email],
@@ -624,6 +628,35 @@ export async function updateWorkspaceProfile(
 
   try {
     await updateDoc(doc(db, 'workspaces', workspaceId), updates);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `workspaces/${workspaceId}`);
+  }
+}
+
+export async function updateWorkspaceShiftSchedule(
+  workspaceId: string,
+  schedule: ShiftSchedule,
+): Promise<void> {
+  if (
+    !TIME_PATTERN.test(schedule.openingStart) ||
+    !TIME_PATTERN.test(schedule.openingEnd) ||
+    !TIME_PATTERN.test(schedule.closingStart) ||
+    !TIME_PATTERN.test(schedule.closingEnd)
+  ) {
+    throw new Error('Formato de hora inválido.');
+  }
+
+  try {
+    await updateDoc(doc(db, 'workspaces', workspaceId), {
+      shiftSchedule: {
+        enabled: Boolean(schedule.enabled),
+        openingStart: schedule.openingStart,
+        openingEnd: schedule.openingEnd,
+        closingStart: schedule.closingStart,
+        closingEnd: schedule.closingEnd,
+      },
+      updatedAt: serverTimestamp(),
+    });
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, `workspaces/${workspaceId}`);
   }

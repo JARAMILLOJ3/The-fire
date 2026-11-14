@@ -13,6 +13,7 @@ import {
   Calendar,
   Citrus,
   ClipboardList,
+  Clock,
   CupSoda,
   Flame,
   LayoutDashboard,
@@ -29,6 +30,7 @@ import { BossDashboard } from './components/BossDashboard';
 import { BossWelcomeModal } from './components/BossWelcomeModal';
 import { BrandLogo } from './components/BrandLogo';
 import { CatalogManager } from './components/CatalogManager';
+import { ShiftScheduleModal } from './components/ShiftScheduleModal';
 import { StationShiftView } from './components/StationShiftView';
 import { TeamManager } from './components/TeamManager';
 import { WorkstationsManager } from './components/WorkstationsManager';
@@ -53,6 +55,7 @@ import type {
   Workstation,
 } from './types';
 import { getPreviousDateStr, getTodayDateStr } from './utils/inventory';
+import { resolveWorkerScheduleStatus } from './utils/schedule';
 
 type ActiveSection = 'jefe' | 'puestos' | 'catalogo' | 'equipo' | StationId;
 
@@ -139,6 +142,8 @@ export default function App() {
   const [selectedDate, setSelectedDate] = useState<string>(() => getTodayDateStr());
   const [autoSelectedYesterday, setAutoSelectedYesterday] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [scheduleModalOpen, setScheduleModalOpen] = useState(false);
+  const [now, setNow] = useState<Date>(() => new Date());
 
   const [stations, setStations] = useState<Workstation[]>([]);
   const [stationsLoaded, setStationsLoaded] = useState(false);
@@ -160,6 +165,21 @@ export default function App() {
 
   const canManage = isOwner || role === 'jefe';
   const userEmail = (user?.email ?? '').trim().toLowerCase();
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      setNow(new Date());
+    }, 30000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const workerScheduleStatus = useMemo(
+    () => resolveWorkerScheduleStatus(now, workspace?.shiftSchedule),
+    [now, workspace?.shiftSchedule],
+  );
+  const effectiveSelectedDate = canManage
+    ? selectedDate
+    : workerScheduleStatus.operationalDate;
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (nextUser) => {
@@ -392,13 +412,13 @@ export default function App() {
       const fb = await loadWorkerStationFallback({
         workspaceId: workspace.id,
         stationId: role,
-        dateStr: selectedDate,
+        dateStr: effectiveSelectedDate,
       });
       setWorkerFallback(fb);
     } catch (err) {
       console.error('Error loading station fallback:', err);
     }
-  }, [workspace?.id, canManage, role, selectedDate]);
+  }, [workspace?.id, canManage, role, effectiveSelectedDate]);
 
   // Fallback for QR-linked workers before Boss syncs authorizedEmails
   useEffect(() => {
@@ -418,7 +438,7 @@ export default function App() {
     itemsLoaded,
     stations,
     items,
-    selectedDate,
+    effectiveSelectedDate,
     refreshWorkerFallback,
   ]);
 
@@ -437,15 +457,20 @@ export default function App() {
   const reportsForSelectedDate = useMemo(() => {
     const map: Record<string, DailyReport | undefined> = {};
     allReports.forEach((rep) => {
-      if (rep.date === selectedDate) {
+      if (rep.date === effectiveSelectedDate) {
         map[rep.station] = rep;
       }
     });
-    if (!canManage && role !== 'jefe' && !map[role] && workerFallback?.report?.date === selectedDate) {
+    if (
+      !canManage &&
+      role !== 'jefe' &&
+      !map[role] &&
+      workerFallback?.report?.date === effectiveSelectedDate
+    ) {
       map[role] = workerFallback.report;
     }
     return map;
-  }, [allReports, selectedDate, canManage, role, workerFallback?.report]);
+  }, [allReports, effectiveSelectedDate, canManage, role, workerFallback?.report]);
 
   // Listen to entries subcollections for existing reports on selectedDate
   const existingReportIdsKey = useMemo(() => {
@@ -775,21 +800,23 @@ export default function App() {
                   <Icon className="w-4 h-4 shrink-0" />
                   <span className="truncate">{st.name}</span>
                 </span>
-                <span
-                  className={`text-xs font-mono shrink-0 ${
-                    rep?.status === 'completed'
-                      ? 'text-emerald-400'
+                {(canManage || workerScheduleStatus.phase !== 'outside') && (
+                  <span
+                    className={`text-xs font-mono shrink-0 ${
+                      rep?.status === 'completed'
+                        ? 'text-emerald-400'
+                        : rep?.status === 'opening_saved'
+                          ? 'text-amber-400'
+                          : 'text-stone-500'
+                    }`}
+                  >
+                    {rep?.status === 'completed'
+                      ? 'Listo'
                       : rep?.status === 'opening_saved'
-                        ? 'text-amber-400'
-                        : 'text-stone-500'
-                  }`}
-                >
-                  {rep?.status === 'completed'
-                    ? 'Listo'
-                    : rep?.status === 'opening_saved'
-                      ? 'Avance'
-                      : '—'}
-                </span>
+                        ? 'Avance'
+                        : '—'}
+                  </span>
+                )}
               </button>
             );
           })}
@@ -929,43 +956,70 @@ export default function App() {
               </div>
             </div>
 
-            <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-              <div className="flex items-center gap-0.5 p-0.5 sm:p-1 bg-stone-100 rounded-xl">
-                <button
-                  type="button"
-                  onClick={() => handleSelectDate(yesterdayStr)}
-                  className={`min-h-[32px] px-2 sm:px-2.5 py-1 text-xs font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
-                    selectedDate === yesterdayStr
-                      ? 'bg-white text-stone-900 shadow-sm'
-                      : 'text-stone-600 hover:text-stone-900'
-                  }`}
-                >
-                  Ayer
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleSelectDate(todayStr)}
-                  className={`min-h-[32px] px-2 sm:px-2.5 py-1 text-xs font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
-                    selectedDate === todayStr
-                      ? 'bg-white text-stone-900 shadow-sm'
-                      : 'text-stone-600 hover:text-stone-900'
-                  }`}
-                >
-                  Hoy
-                </button>
-              </div>
+            {canManage ? (
+              <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+                <div className="flex items-center gap-0.5 p-0.5 sm:p-1 bg-stone-100 rounded-xl">
+                  <button
+                    type="button"
+                    onClick={() => handleSelectDate(yesterdayStr)}
+                    className={`min-h-[32px] px-2 sm:px-2.5 py-1 text-xs font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+                      selectedDate === yesterdayStr
+                        ? 'bg-white text-stone-900 shadow-sm'
+                        : 'text-stone-600 hover:text-stone-900'
+                    }`}
+                  >
+                    Ayer
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleSelectDate(todayStr)}
+                    className={`min-h-[32px] px-2 sm:px-2.5 py-1 text-xs font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+                      selectedDate === todayStr
+                        ? 'bg-white text-stone-900 shadow-sm'
+                        : 'text-stone-600 hover:text-stone-900'
+                    }`}
+                  >
+                    Hoy
+                  </button>
+                </div>
 
-              <div className="relative flex items-center">
-                <Calendar className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-stone-500 absolute left-2 sm:left-2.5 pointer-events-none" />
-                <input
-                  type="date"
-                  aria-label="Seleccionar fecha del reporte"
-                  value={selectedDate}
-                  onChange={(e) => e.target.value && handleSelectDate(e.target.value)}
-                  className="min-h-[36px] pl-7 sm:pl-8 pr-1.5 sm:pr-2.5 py-1 text-xs sm:text-sm font-mono tabular-nums bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 w-[112px] sm:w-auto"
-                />
+                <div className="relative flex items-center">
+                  <Calendar className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-stone-500 absolute left-2 sm:left-2.5 pointer-events-none" />
+                  <input
+                    type="date"
+                    aria-label="Seleccionar fecha del reporte"
+                    value={selectedDate}
+                    onChange={(e) => e.target.value && handleSelectDate(e.target.value)}
+                    className="min-h-[36px] pl-7 sm:pl-8 pr-1.5 sm:pr-2.5 py-1 text-xs sm:text-sm font-mono tabular-nums bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 w-[112px] sm:w-auto"
+                  />
+                </div>
               </div>
-            </div>
+            ) : (
+              <div className="flex items-center gap-2 shrink-0">
+                <div
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-semibold border ${
+                    workerScheduleStatus.phase === 'opening'
+                      ? 'bg-orange-50 text-orange-800 border-orange-200'
+                      : workerScheduleStatus.phase === 'closing'
+                        ? 'bg-stone-950 text-white border-stone-950'
+                        : workerScheduleStatus.phase === 'unrestricted'
+                          ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                          : 'bg-stone-100 text-stone-600 border-stone-200'
+                  }`}
+                >
+                  <Clock className="w-3.5 h-3.5 shrink-0" />
+                  <span className="whitespace-nowrap">
+                    {workerScheduleStatus.phase === 'opening'
+                      ? 'Horario: Apertura'
+                      : workerScheduleStatus.phase === 'closing'
+                        ? 'Horario: Cierre'
+                        : workerScheduleStatus.phase === 'unrestricted'
+                          ? 'Acceso activo'
+                          : 'Fuera de horario'}
+                  </span>
+                </div>
+              </div>
+            )}
           </header>
 
           {/* Workspace Viewport */}
@@ -990,6 +1044,7 @@ export default function App() {
                     <BossDashboard
                       workspaceName={workspace.name}
                       ownerName={workspace.ownerName}
+                      shiftSchedule={workspace.shiftSchedule}
                       selectedDate={selectedDate}
                       todayStr={todayStr}
                       yesterdayStr={yesterdayStr}
@@ -1006,6 +1061,7 @@ export default function App() {
                         setCatalogFilterStation('all');
                         navigateTo('catalogo');
                       }}
+                      onOpenScheduleModal={() => setScheduleModalOpen(true)}
                     />
                   ) : activeSection === 'puestos' && canManage ? (
                     <WorkstationsManager
@@ -1042,8 +1098,9 @@ export default function App() {
                       workspace={workspace}
                       user={user}
                       canManage={canManage}
+                      scheduleStatus={workerScheduleStatus}
                       station={currentStation}
-                      selectedDate={selectedDate}
+                      selectedDate={effectiveSelectedDate}
                       items={effectiveItems}
                       report={reportsForSelectedDate[currentStation.id]}
                       entriesByItemId={
@@ -1087,6 +1144,15 @@ export default function App() {
         {/* First-Time Boss Onboarding Name Prompt */}
         {needsOwnerNameOnboarding && (
           <BossWelcomeModal workspace={workspace} suggestedName={user.displayName} />
+        )}
+
+        {/* Boss Shift Schedule Config Modal */}
+        {canManage && (
+          <ShiftScheduleModal
+            workspace={workspace}
+            open={scheduleModalOpen}
+            onClose={() => setScheduleModalOpen(false)}
+          />
         )}
       </div>
     </MotionConfig>
