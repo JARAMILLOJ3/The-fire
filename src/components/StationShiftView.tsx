@@ -698,6 +698,7 @@ export function StationShiftView({
       await saveStationReportBatch({
         workspace,
         user,
+        canManage,
         date: selectedDate,
         station: station.id,
         mode,
@@ -720,10 +721,14 @@ export function StationShiftView({
             : '¡Excelente! Tu cierre fue enviado y el jefe ya puede verlo en su resumen.',
       });
       onSaved?.();
-    } catch {
+    } catch (err) {
+      const rawMsg = err instanceof Error ? err.message : '';
+      const isPerm = rawMsg.includes('permission') || rawMsg.includes('insufficient');
       setFeedback({
         type: 'error',
-        text: 'Ocurrió un error al guardar el inventario. Tu borrador sigue guardado en este celular.',
+        text: isPerm
+          ? 'No se pudo guardar porque el horario ya terminó o el cierre ya fue enviado. Pídele al jefe revisar la planilla. Tu borrador sigue guardado aquí.'
+          : 'Ocurrió un error al guardar el inventario. Tu borrador sigue guardado en este celular.',
       });
     } finally {
       setSavingMode(null);
@@ -882,6 +887,16 @@ export function StationShiftView({
           )}
         </div>
       </div>
+
+      {/* 10-minute grace period banner */}
+      {!canManage && scheduleStatus.inGracePeriod && !isLocked && (
+        <div className="px-4 py-3 rounded-2xl bg-amber-50 border border-amber-200 text-xs sm:text-sm text-amber-900 flex items-center gap-2.5">
+          <Clock className="w-4 h-4 text-amber-600 shrink-0" />
+          <span>
+            Estás en los <strong>10 minutos de tolerancia</strong> posteriores al horario. Envía tu registro antes de que cierre la ventana.
+          </span>
+        </div>
+      )}
 
       {/* Progress & Status Card */}
       <div

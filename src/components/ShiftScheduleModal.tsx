@@ -1,10 +1,10 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { Clock, RotateCcw, Sun, Moon, X } from 'lucide-react';
-import { DEFAULT_SHIFT_SCHEDULE } from '../constants';
+import { AlertTriangle, Clock, RotateCcw, Sun, Moon, X } from 'lucide-react';
+import { DEFAULT_SHIFT_SCHEDULE, WORKER_GRACE_MINUTES } from '../constants';
 import { updateWorkspaceShiftSchedule } from '../services/inventoryService';
 import type { ShiftSchedule, Workspace } from '../types';
-import { formatTime12h, normalizeShiftSchedule } from '../utils/schedule';
+import { formatTime12h, normalizeShiftSchedule, validateShiftSchedule } from '../utils/schedule';
 
 interface ShiftScheduleModalProps {
   workspace: Workspace;
@@ -33,6 +33,18 @@ export function ShiftScheduleModal({ workspace, open, onClose }: ShiftScheduleMo
     setErrorMsg(null);
   }, [open, workspace.shiftSchedule]);
 
+  const validation = useMemo(
+    () =>
+      validateShiftSchedule({
+        enabled,
+        openingStart,
+        openingEnd,
+        closingStart,
+        closingEnd,
+      }),
+    [enabled, openingStart, openingEnd, closingStart, closingEnd],
+  );
+
   const handleResetDefault = () => {
     setEnabled(DEFAULT_SHIFT_SCHEDULE.enabled);
     setOpeningStart(DEFAULT_SHIFT_SCHEDULE.openingStart);
@@ -44,6 +56,11 @@ export function ShiftScheduleModal({ workspace, open, onClose }: ShiftScheduleMo
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
+    if (!validation.valid) {
+      setErrorMsg(validation.errors[0] ?? 'Horario inválido.');
+      return;
+    }
+
     setSaving(true);
     setErrorMsg(null);
     try {
@@ -56,8 +73,12 @@ export function ShiftScheduleModal({ workspace, open, onClose }: ShiftScheduleMo
       };
       await updateWorkspaceShiftSchedule(workspace.id, next);
       onClose();
-    } catch {
-      setErrorMsg('No se pudieron guardar los horarios. Verifica las horas e intenta nuevamente.');
+    } catch (err) {
+      setErrorMsg(
+        err instanceof Error && err.message
+          ? err.message
+          : 'No se pudieron guardar los horarios. Verifica las horas e intenta nuevamente.',
+      );
     } finally {
       setSaving(false);
     }
@@ -90,7 +111,7 @@ export function ShiftScheduleModal({ workspace, open, onClose }: ShiftScheduleMo
                     Horarios de Apertura y Cierre
                   </h2>
                   <p className="text-xs text-stone-400 truncate">
-                    Controla cuándo pueden registrar inventario las trabajadoras
+                    Hora oficial Colombia (Bogotá) · +{WORKER_GRACE_MINUTES} min de tolerancia al cerrar
                   </p>
                 </div>
               </div>
@@ -105,9 +126,16 @@ export function ShiftScheduleModal({ workspace, open, onClose }: ShiftScheduleMo
             </div>
 
             <form onSubmit={handleSubmit} className="p-5 sm:p-6 space-y-5">
-              {errorMsg && (
+              {(errorMsg || validation.errors.length > 0) && (
                 <div className="p-3 text-xs text-red-700 bg-red-50 border border-red-200 rounded-xl">
-                  {errorMsg}
+                  {errorMsg ?? validation.errors[0]}
+                </div>
+              )}
+
+              {validation.errors.length === 0 && validation.warnings.length > 0 && (
+                <div className="p-3 text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                  <span>{validation.warnings[0]}</span>
                 </div>
               )}
 
@@ -123,7 +151,7 @@ export function ShiftScheduleModal({ workspace, open, onClose }: ShiftScheduleMo
                     Activar acceso solo en estos horarios
                   </p>
                   <p className="text-xs text-stone-600 mt-0.5">
-                    Fuera de estos rangos, las trabajadoras no verán ninguna planilla. Tú como jefe siempre tienes acceso total.
+                    Fuera de estos rangos (+{WORKER_GRACE_MINUTES} min de gracia), las trabajadoras no podrán guardar planillas. Tú como jefe siempre tienes acceso total.
                   </p>
                 </div>
               </label>
@@ -141,7 +169,7 @@ export function ShiftScheduleModal({ workspace, open, onClose }: ShiftScheduleMo
                     </span>
                   </div>
                   <p className="text-xs text-stone-600">
-                    Para registrar con cuánto abren el día y anotar si llegaron productos nuevos.
+                    Para registrar con cuánto abren el día y anotar si llegaron productos nuevos (cierra justo a la hora &ldquo;Hasta&rdquo;).
                   </p>
                   <div className="grid grid-cols-2 gap-3">
                     <div>
@@ -158,7 +186,7 @@ export function ShiftScheduleModal({ workspace, open, onClose }: ShiftScheduleMo
                     </div>
                     <div>
                       <label className="block text-xs font-semibold text-stone-700 mb-1">
-                        Hasta
+                        Hasta (límite exacto)
                       </label>
                       <input
                         type="time"
@@ -200,7 +228,7 @@ export function ShiftScheduleModal({ workspace, open, onClose }: ShiftScheduleMo
                     </div>
                     <div>
                       <label className="block text-xs font-semibold text-stone-700 mb-1">
-                        Hasta
+                        Hasta (límite exacto)
                       </label>
                       <input
                         type="time"
@@ -221,7 +249,7 @@ export function ShiftScheduleModal({ workspace, open, onClose }: ShiftScheduleMo
                   className="inline-flex items-center gap-1.5 text-xs font-semibold text-stone-600 hover:text-orange-600 cursor-pointer"
                 >
                   <RotateCcw className="w-3.5 h-3.5" />
-                  Restaurar 4–7 PM / 11 PM–2 AM
+                  Restaurar 4–6 PM / 11 PM–2 AM
                 </button>
 
                 <div className="flex items-center gap-2 ml-auto">
@@ -234,7 +262,7 @@ export function ShiftScheduleModal({ workspace, open, onClose }: ShiftScheduleMo
                   </button>
                   <button
                     type="submit"
-                    disabled={saving}
+                    disabled={saving || !validation.valid}
                     className="min-h-[42px] px-4 py-2 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 disabled:opacity-60 cursor-pointer"
                   >
                     {saving ? 'Guardando...' : 'Guardar horarios'}

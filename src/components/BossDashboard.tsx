@@ -32,6 +32,7 @@ import {
   formatTimeShort,
   getStockLevelMeta,
 } from '../utils/inventory';
+import { getBogotaNowParts } from '../utils/date';
 import { formatTime12h, normalizeShiftSchedule } from '../utils/schedule';
 
 interface BossDashboardProps {
@@ -58,7 +59,7 @@ type ViewTab = 'compras' | 'completo';
 type StockFilter = 'todos' | 'comprar' | 'medio' | 'suficiente' | 'sin_dato';
 
 function getTimeGreeting(): string {
-  const hour = new Date().getHours();
+  const hour = getBogotaNowParts().hour;
   if (hour < 12) return 'Buenos días';
   if (hour < 19) return 'Buenas tardes';
   return 'Buenas noches';

@@ -1,5 +1,18 @@
 {
   "entities": {
+    "Admin": {
+      "title": "Admin",
+      "description": "Documento de administrador global autorizado para administrar el restaurante principal.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "maxLength": 128
+        }
+      },
+      "required": ["uid"]
+    },
     "Workspace": {
       "title": "Workspace",
       "description": "Configuración principal del restaurante y lista de correos autorizados.",
@@ -528,6 +541,10 @@
     }
   },
   "firestore": {
+    "/admins/{adminUid}": {
+      "schema": { "$ref": "#/entities/Admin" },
+      "description": "Administradores principales verificados por UID"
+    },
     "/workspaces/{workspaceId}": {
       "schema": { "$ref": "#/entities/Workspace" },
       "description": "Configuración del restaurante y lista de correos autorizados"

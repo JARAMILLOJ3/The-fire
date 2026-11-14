@@ -8,7 +8,7 @@ export type StockLevel = 'agotado' | 'comprar' | 'medio' | 'suficiente' | 'sin_d
 export interface ShiftSchedule {
   enabled: boolean;
   openingStart: string; // HH:mm 24h e.g. "16:00"
-  openingEnd: string;   // HH:mm 24h e.g. "19:00"
+  openingEnd: string;   // HH:mm 24h e.g. "18:00"
   closingStart: string; // HH:mm 24h e.g. "23:00"
   closingEnd: string;   // HH:mm 24h e.g. "02:00"
 }

@@ -7,30 +7,24 @@ import type {
   StockLevel,
   Workstation,
 } from '../types';
+import {
+  BOGOTA_TIME_ZONE,
+  getOperationalDateStr,
+  getPreviousDateStr,
+} from './date';
 
-export function getTodayDateStr(): string {
-  const now = new Date();
-  const y = now.getFullYear();
-  const m = String(now.getMonth() + 1).padStart(2, '0');
-  const d = String(now.getDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
-}
+export { getOperationalDateStr, getPreviousDateStr };
 
-export function getPreviousDateStr(dateStr: string): string {
-  const [y, m, d] = dateStr.split('-').map(Number);
-  const dt = new Date(y, m - 1, d);
-  dt.setDate(dt.getDate() - 1);
-  const py = dt.getFullYear();
-  const pm = String(dt.getMonth() + 1).padStart(2, '0');
-  const pd = String(dt.getDate()).padStart(2, '0');
-  return `${py}-${pm}-${pd}`;
+export function getTodayDateStr(now: Date = new Date()): string {
+  return getOperationalDateStr(now);
 }
 
 export function formatDateHuman(dateStr: string): string {
   const [y, m, d] = dateStr.split('-').map(Number);
   if (!y || !m || !d) return dateStr;
-  const dt = new Date(y, m - 1, d);
+  const dt = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
   return new Intl.DateTimeFormat('es-CO', {
+    timeZone: BOGOTA_TIME_ZONE,
     weekday: 'short',
     day: 'numeric',
     month: 'short',
@@ -42,6 +36,7 @@ export function formatTimeShort(ts?: Timestamp): string | null {
   if (!ts || typeof ts.toDate !== 'function') return null;
   try {
     return new Intl.DateTimeFormat('es-CO', {
+      timeZone: BOGOTA_TIME_ZONE,
       hour: '2-digit',
       minute: '2-digit',
     }).format(ts.toDate());

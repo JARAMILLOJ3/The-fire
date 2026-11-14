@@ -1,16 +1,23 @@
-import { DEFAULT_SHIFT_SCHEDULE, TIME_PATTERN } from '../constants';
+import { DEFAULT_SHIFT_SCHEDULE, TIME_PATTERN, WORKER_GRACE_MINUTES } from '../constants';
 import type { ShiftSchedule } from '../types';
-import { getPreviousDateStr } from './inventory';
+import { getBogotaNowParts, getOperationalDateStr, getPreviousDateStr } from './date';
 
 export type WorkerSchedulePhase = 'opening' | 'closing' | 'outside' | 'unrestricted';
 
 export interface WorkerScheduleStatus {
   phase: WorkerSchedulePhase;
+  inGracePeriod: boolean;
   operationalDate: string;
   schedule: ShiftSchedule;
   openingRangeLabel: string;
   closingRangeLabel: string;
   currentTimeLabel: string;
+}
+
+export interface ShiftScheduleValidation {
+  valid: boolean;
+  errors: string[];
+  warnings: string[];
 }
 
 export function normalizeShiftSchedule(raw?: Partial<ShiftSchedule> | null): ShiftSchedule {
@@ -55,41 +62,97 @@ export function formatTime12h(hhmm: string): string {
   return `${h12}:${mPad} ${period}`;
 }
 
-function formatDateLocal(dt: Date): string {
-  const y = dt.getFullYear();
-  const m = String(dt.getMonth() + 1).padStart(2, '0');
-  const d = String(dt.getDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
-}
-
 export function isTimeInWindow(
   nowMinutes: number,
   startHHMM: string,
   endHHMM: string,
-): { inWindow: boolean; wrappedToPreviousDay: boolean } {
+  graceMinutes = 0,
+): { inWindow: boolean; inGrace: boolean; wrappedToPreviousDay: boolean } {
   const start = parseTimeToMinutes(startHHMM);
   const end = parseTimeToMinutes(endHHMM);
 
   if (start === end) {
-    return { inWindow: true, wrappedToPreviousDay: false };
+    return { inWindow: false, inGrace: false, wrappedToPreviousDay: false };
   }
 
-  if (start < end) {
-    // Same-day window (e.g. 16:00 -> 19:00)
-    return {
-      inWindow: nowMinutes >= start && nowMinutes <= end,
-      wrappedToPreviousDay: false,
-    };
+  const span = (end - start + 1440) % 1440;
+  const elapsed = (nowMinutes - start + 1440) % 1440;
+
+  if (elapsed < span) {
+    const wrappedToPreviousDay = start > end && nowMinutes < end;
+    return { inWindow: true, inGrace: false, wrappedToPreviousDay };
   }
 
-  // Overnight window (e.g. 23:00 -> 02:00)
-  if (nowMinutes >= start) {
-    return { inWindow: true, wrappedToPreviousDay: false };
+  if (graceMinutes > 0 && elapsed < span + graceMinutes) {
+    const endWithGrace = (end + graceMinutes) % 1440;
+    const wrappedToPreviousDay =
+      (start > end && nowMinutes < endWithGrace) ||
+      (start < end && end + graceMinutes >= 1440 && nowMinutes < endWithGrace);
+    return { inWindow: true, inGrace: true, wrappedToPreviousDay };
   }
-  if (nowMinutes <= end) {
-    return { inWindow: true, wrappedToPreviousDay: true };
+
+  return { inWindow: false, inGrace: false, wrappedToPreviousDay: false };
+}
+
+export function validateShiftSchedule(schedule: ShiftSchedule): ShiftScheduleValidation {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  if (
+    !TIME_PATTERN.test(schedule.openingStart) ||
+    !TIME_PATTERN.test(schedule.openingEnd) ||
+    !TIME_PATTERN.test(schedule.closingStart) ||
+    !TIME_PATTERN.test(schedule.closingEnd)
+  ) {
+    errors.push('Todas las horas deben tener un formato válido (HH:MM).');
+    return { valid: false, errors, warnings };
   }
-  return { inWindow: false, wrappedToPreviousDay: false };
+
+  if (!schedule.enabled) {
+    return { valid: true, errors, warnings };
+  }
+
+  const openStart = parseTimeToMinutes(schedule.openingStart);
+  const openEnd = parseTimeToMinutes(schedule.openingEnd);
+  const closeStart = parseTimeToMinutes(schedule.closingStart);
+  const closeEnd = parseTimeToMinutes(schedule.closingEnd);
+
+  if (openStart === openEnd) {
+    errors.push('La hora de inicio y fin de apertura no pueden ser iguales.');
+  }
+  if (closeStart === closeEnd) {
+    errors.push('La hora de inicio y fin de cierre no pueden ser iguales.');
+  }
+
+  if (errors.length === 0) {
+    const openSpan = (openEnd - openStart + 1440) % 1440;
+    const closeSpan = (closeEnd - closeStart + 1440) % 1440;
+    let overlaps = false;
+    for (let m = 0; m < 1440; m++) {
+      const inOpen = (m - openStart + 1440) % 1440 < openSpan;
+      const inClose = (m - closeStart + 1440) % 1440 < closeSpan;
+      if (inOpen && inClose) {
+        overlaps = true;
+        break;
+      }
+    }
+    if (overlaps) {
+      errors.push('El horario de apertura y el horario de cierre no pueden cruzarse.');
+    }
+  }
+
+  // Non-blocking warning if closing starts during daytime before 6:00 PM
+  if (closeStart >= 6 * 60 && closeStart < 18 * 60) {
+    warnings.push(
+      'El horario de cierre inicia antes de las 6:00 p. m. Confirma si deseas permitir cierres tan temprano.',
+    );
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors,
+    warnings,
+  };
 }
 
 export function resolveWorkerScheduleStatus(
@@ -97,18 +160,19 @@ export function resolveWorkerScheduleStatus(
   rawSchedule?: ShiftSchedule,
 ): WorkerScheduleStatus {
   const schedule = normalizeShiftSchedule(rawSchedule);
-  const todayStr = formatDateLocal(now);
-  const nowMinutes = now.getHours() * 60 + now.getMinutes();
-  const nowHHMM = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+  const bogota = getBogotaNowParts(now);
+  const operationalToday = getOperationalDateStr(now);
+  const nowMinutes = bogota.totalMinutes;
 
   const openingRangeLabel = `${formatTime12h(schedule.openingStart)} – ${formatTime12h(schedule.openingEnd)}`;
   const closingRangeLabel = `${formatTime12h(schedule.closingStart)} – ${formatTime12h(schedule.closingEnd)}`;
-  const currentTimeLabel = formatTime12h(nowHHMM);
+  const currentTimeLabel = formatTime12h(bogota.hhmm);
 
   if (!schedule.enabled) {
     return {
       phase: 'unrestricted',
-      operationalDate: todayStr,
+      inGracePeriod: false,
+      operationalDate: operationalToday,
       schedule,
       openingRangeLabel,
       closingRangeLabel,
@@ -120,13 +184,15 @@ export function resolveWorkerScheduleStatus(
     nowMinutes,
     schedule.openingStart,
     schedule.openingEnd,
+    WORKER_GRACE_MINUTES,
   );
   if (openingCheck.inWindow) {
     return {
       phase: 'opening',
+      inGracePeriod: openingCheck.inGrace,
       operationalDate: openingCheck.wrappedToPreviousDay
-        ? getPreviousDateStr(todayStr)
-        : todayStr,
+        ? getPreviousDateStr(bogota.dateStr)
+        : operationalToday,
       schedule,
       openingRangeLabel,
       closingRangeLabel,
@@ -138,13 +204,15 @@ export function resolveWorkerScheduleStatus(
     nowMinutes,
     schedule.closingStart,
     schedule.closingEnd,
+    WORKER_GRACE_MINUTES,
   );
   if (closingCheck.inWindow) {
     return {
       phase: 'closing',
+      inGracePeriod: closingCheck.inGrace,
       operationalDate: closingCheck.wrappedToPreviousDay
-        ? getPreviousDateStr(todayStr)
-        : todayStr,
+        ? getPreviousDateStr(bogota.dateStr)
+        : operationalToday,
       schedule,
       openingRangeLabel,
       closingRangeLabel,
@@ -152,10 +220,10 @@ export function resolveWorkerScheduleStatus(
     };
   }
 
-  // Outside both windows: if early morning before noon and closing ended earlier today, keep yesterday as reference if needed, or today
   return {
     phase: 'outside',
-    operationalDate: todayStr,
+    inGracePeriod: false,
+    operationalDate: operationalToday,
     schedule,
     openingRangeLabel,
     closingRangeLabel,

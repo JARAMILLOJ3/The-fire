@@ -13,7 +13,6 @@ import {
   writeBatch,
 } from 'firebase/firestore';
 import {
-  BOOTSTRAPPED_ADMIN_EMAIL,
   DEFAULT_CATALOG_ITEMS,
   DEFAULT_SHIFT_SCHEDULE,
   DEFAULT_STATIONS,
@@ -25,7 +24,6 @@ import {
   MAX_NOTES_LENGTH,
   MAX_STOCK_VALUE,
   MAX_UNIT_LENGTH,
-  TIME_PATTERN,
 } from '../constants';
 import { db, handleFirestoreError, OperationType } from '../firebase';
 import type {
@@ -43,6 +41,7 @@ import type {
   Workspace,
   Workstation,
 } from '../types';
+import { validateShiftSchedule } from '../utils/schedule';
 
 export interface ResolvedSession {
   workspace: Workspace;
@@ -50,6 +49,25 @@ export interface ResolvedSession {
   isOwner: boolean;
   initialStation?: StationId;
   stationLinkInfo?: StationLink;
+}
+
+export class SessionAccessError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SessionAccessError';
+  }
+}
+
+const BASE62_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+
+function randomBase62(length: number): string {
+  const bytes = new Uint8Array(length);
+  crypto.getRandomValues(bytes);
+  let result = '';
+  for (let i = 0; i < length; i++) {
+    result += BASE62_ALPHABET[bytes[i] % BASE62_ALPHABET.length];
+  }
+  return result;
 }
 
 function clampString(val: string, maxLen: number): string {
@@ -62,14 +80,11 @@ function clampNumber(val: number): number {
 }
 
 function makeCleanId(prefix: string): string {
-  const rand = Math.random().toString(36).slice(2, 8);
-  return `${prefix}_${Date.now()}_${rand}`.replace(/[^a-zA-Z0-9_\-]/g, '_');
+  return `${prefix}_${Date.now()}_${randomBase62(8)}`.replace(/[^a-zA-Z0-9_\-]/g, '_');
 }
 
 export function generateAccessCode(): string {
-  const part1 = Math.random().toString(36).slice(2, 8);
-  const part2 = Math.random().toString(36).slice(2, 8);
-  return `tf_${part1}${part2}`.replace(/[^a-zA-Z0-9_\-]/g, '');
+  return `tf_${randomBase62(18)}`;
 }
 
 export function buildStationShareUrl(stationId: string, accessCode: string): string {
@@ -92,6 +107,15 @@ export async function fetchStationLinkPreview(accessCode: string): Promise<Stati
   }
 }
 
+async function checkIsAdminUser(uid: string): Promise<boolean> {
+  try {
+    const snap = await getDoc(doc(db, 'admins', uid));
+    return snap.exists();
+  } catch {
+    return false;
+  }
+}
+
 export async function resolveUserWorkspace(
   user: User,
   linkParams?: { stationId?: string | null; accessCode?: string | null },
@@ -101,93 +125,167 @@ export async function resolveUserWorkspace(
     user.displayName || email.split('@')[0] || 'Usuario',
     MAX_NAME_LENGTH,
   );
+  const isAdmin = await checkIsAdminUser(user.uid);
 
   // 0. If user arrived via a QR / Share Link (?puesto=...&codigo=...)
-  const accessCode = linkParams?.accessCode?.trim() || '';
-  if (accessCode.length >= 6) {
+  const rawAccessCode = linkParams?.accessCode?.trim() || '';
+  if (rawAccessCode.length > 0 && rawAccessCode.length < 6) {
+    throw new SessionAccessError('El enlace o código QR ingresado no es válido.');
+  }
+
+  if (rawAccessCode.length >= 6) {
+    let linkSnap;
     try {
-      const linkSnap = await getDoc(doc(db, 'stationLinks', accessCode));
-      if (linkSnap.exists()) {
-        const link = { id: linkSnap.id, ...linkSnap.data() } as StationLink;
-        if (link.active) {
-          const isBoss =
-            link.ownerUid === user.uid ||
-            (email === BOOTSTRAPPED_ADMIN_EMAIL && link.workspaceId === MAIN_WORKSPACE_ID);
+      linkSnap = await getDoc(doc(db, 'stationLinks', rawAccessCode));
+    } catch (error) {
+      handleFirestoreError(error, OperationType.GET, `stationLinks/${rawAccessCode}`);
+    }
 
-          if (isBoss) {
-            const wsSnap = await getDoc(doc(db, 'workspaces', link.workspaceId));
-            if (wsSnap.exists()) {
-              return {
-                workspace: { id: wsSnap.id, ...wsSnap.data() } as Workspace,
-                role: 'jefe',
-                isOwner: true,
-                initialStation: link.stationId,
-                stationLinkInfo: link,
-              };
-            }
-          } else {
-            const memberRef = doc(db, 'teamMembers', user.uid);
-            const existingMemberSnap = await getDoc(memberRef);
-            if (existingMemberSnap.exists()) {
-              await updateDoc(memberRef, {
-                station: link.stationId,
-                inviteId: accessCode,
-                displayName: link.workerName || displayName,
-                updatedAt: serverTimestamp(),
-              });
-            } else {
-              await setDoc(memberRef, {
-                workspaceId: link.workspaceId,
-                ownerUid: link.ownerUid,
-                uid: user.uid,
-                email,
-                displayName: link.workerName || displayName,
-                station: link.stationId,
-                inviteId: accessCode,
-                active: true,
-                createdAt: serverTimestamp(),
-                updatedAt: serverTimestamp(),
-              });
-            }
+    if (!linkSnap.exists()) {
+      throw new SessionAccessError(
+        'Este enlace o código QR ya no es válido porque fue regenerado o eliminado por el jefe.',
+      );
+    }
 
-            const wsSnap = await getDoc(doc(db, 'workspaces', link.workspaceId));
-            if (wsSnap.exists()) {
-              return {
-                workspace: { id: wsSnap.id, ...wsSnap.data() } as Workspace,
-                role: link.stationId,
-                isOwner: false,
-                initialStation: link.stationId,
-                stationLinkInfo: link,
-              };
-            }
-          }
+    const link = { id: linkSnap.id, ...linkSnap.data() } as StationLink;
+    if (!link.active) {
+      throw new SessionAccessError(
+        'Este enlace está temporalmente desactivado por el jefe. Pídele que lo reactive o te comparta uno nuevo.',
+      );
+    }
+
+    const isBoss = link.ownerUid === user.uid || isAdmin;
+    if (isBoss) {
+      try {
+        const wsSnap = await getDoc(doc(db, 'workspaces', link.workspaceId));
+        if (wsSnap.exists()) {
+          const workspace = { id: wsSnap.id, ...wsSnap.data() } as Workspace;
+          return {
+            workspace,
+            role: 'jefe',
+            isOwner: workspace.ownerUid === user.uid || isAdmin,
+            initialStation: link.stationId,
+            stationLinkInfo: link,
+          };
+        }
+      } catch (error) {
+        handleFirestoreError(error, OperationType.GET, `workspaces/${link.workspaceId}`);
+      }
+    }
+
+    // Worker arriving with active QR / link
+    const memberRef = doc(db, 'teamMembers', user.uid);
+    let existingMemberSnap;
+    try {
+      existingMemberSnap = await getDoc(memberRef);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.GET, `teamMembers/${user.uid}`);
+    }
+
+    if (existingMemberSnap.exists()) {
+      const existing = { id: existingMemberSnap.id, ...existingMemberSnap.data() } as TeamMember;
+      if (existing.workspaceId !== link.workspaceId) {
+        throw new SessionAccessError('Tu cuenta pertenece a otro restaurante.');
+      }
+      if (!existing.active) {
+        throw new SessionAccessError(
+          'Tu acceso fue desactivado por el jefe. Pídele que te habilite nuevamente.',
+        );
+      }
+      if (existing.station === 'jefe') {
+        const wsSnap = await getDoc(doc(db, 'workspaces', link.workspaceId));
+        if (wsSnap.exists()) {
+          return {
+            workspace: { id: wsSnap.id, ...wsSnap.data() } as Workspace,
+            role: 'jefe',
+            isOwner: false,
+            initialStation: link.stationId,
+            stationLinkInfo: link,
+          };
         }
       }
+      if (existing.station !== link.stationId) {
+        throw new SessionAccessError(
+          'Tu cuenta ya está vinculada a otro puesto de trabajo. No puedes cambiarte de puesto con otro QR; pídele al jefe que actualice tu puesto.',
+        );
+      }
+
+      try {
+        await updateDoc(memberRef, {
+          inviteId: rawAccessCode,
+          displayName: link.workerName || displayName,
+          updatedAt: serverTimestamp(),
+        });
+      } catch (error) {
+        handleFirestoreError(error, OperationType.UPDATE, `teamMembers/${user.uid}`);
+      }
+    } else {
+      try {
+        await setDoc(memberRef, {
+          workspaceId: link.workspaceId,
+          ownerUid: link.ownerUid,
+          uid: user.uid,
+          email,
+          displayName: link.workerName || displayName,
+          station: link.stationId,
+          inviteId: rawAccessCode,
+          active: true,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      } catch (error) {
+        handleFirestoreError(error, OperationType.CREATE, `teamMembers/${user.uid}`);
+      }
+    }
+
+    try {
+      const wsSnap = await getDoc(doc(db, 'workspaces', link.workspaceId));
+      if (wsSnap.exists()) {
+        return {
+          workspace: { id: wsSnap.id, ...wsSnap.data() } as Workspace,
+          role: link.stationId,
+          isOwner: false,
+          initialStation: link.stationId,
+          stationLinkInfo: link,
+        };
+      }
     } catch (error) {
-      handleFirestoreError(error, OperationType.GET, `stationLinks/${accessCode}`);
+      handleFirestoreError(error, OperationType.GET, `workspaces/${link.workspaceId}`);
     }
   }
 
-  // 1. Check existing active teamMember profile
+  // 1. Check existing teamMember profile
   const memberPath = `teamMembers/${user.uid}`;
+  let memberSnap;
   try {
-    const memberSnap = await getDoc(doc(db, 'teamMembers', user.uid));
-    if (memberSnap.exists()) {
-      const member = { id: memberSnap.id, ...memberSnap.data() } as TeamMember;
-      if (member.active) {
+    memberSnap = await getDoc(doc(db, 'teamMembers', user.uid));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, memberPath);
+  }
+
+  if (memberSnap.exists()) {
+    const member = { id: memberSnap.id, ...memberSnap.data() } as TeamMember;
+    if (!member.active) {
+      if (!isAdmin) {
+        throw new SessionAccessError(
+          'Tu acceso a este restaurante fue desactivado por el jefe.',
+        );
+      }
+    } else {
+      try {
         const wsSnap = await getDoc(doc(db, 'workspaces', member.workspaceId));
         if (wsSnap.exists()) {
           const workspace = { id: wsSnap.id, ...wsSnap.data() } as Workspace;
           return {
             workspace,
             role: member.station,
-            isOwner: workspace.ownerUid === user.uid,
+            isOwner: workspace.ownerUid === user.uid || isAdmin,
           };
         }
+      } catch (error) {
+        handleFirestoreError(error, OperationType.GET, `workspaces/${member.workspaceId}`);
       }
     }
-  } catch (error) {
-    handleFirestoreError(error, OperationType.GET, memberPath);
   }
 
   // 2. Check pending email invite
@@ -218,7 +316,7 @@ export async function resolveUserWorkspace(
           return {
             workspace,
             role: invite.station,
-            isOwner: workspace.ownerUid === user.uid,
+            isOwner: workspace.ownerUid === user.uid || isAdmin,
           };
         }
       }
@@ -227,9 +325,41 @@ export async function resolveUserWorkspace(
     }
   }
 
-  // 3. Owner workspace
-  const targetWsId =
-    email === BOOTSTRAPPED_ADMIN_EMAIL ? MAIN_WORKSPACE_ID : `ws_${user.uid}`;
+  // 3. Check existing owned/authorized workspaces (including main restaurant for owner/admins)
+  try {
+    const mainWsSnap = await getDoc(doc(db, 'workspaces', MAIN_WORKSPACE_ID));
+    if (mainWsSnap.exists()) {
+      const workspace = { id: mainWsSnap.id, ...mainWsSnap.data() } as Workspace;
+      if (
+        isAdmin ||
+        workspace.ownerUid === user.uid ||
+        (email && workspace.authorizedEmails.includes(email))
+      ) {
+        return {
+          workspace,
+          role: 'jefe',
+          isOwner: workspace.ownerUid === user.uid || isAdmin,
+        };
+      }
+    }
+  } catch {
+    // User does not have access to MAIN_WORKSPACE_ID; continue to personal workspace
+  }
+
+  try {
+    const ownedQuery = query(collection(db, 'workspaces'), where('ownerUid', '==', user.uid));
+    const ownedSnaps = await getDocs(ownedQuery);
+    if (!ownedSnaps.empty) {
+      const firstWs = ownedSnaps.docs[0];
+      const workspace = { id: firstWs.id, ...firstWs.data() } as Workspace;
+      return { workspace, role: 'jefe', isOwner: true };
+    }
+  } catch {
+    // Fall through to creating personal workspace
+  }
+
+  // 4. Create or open workspace for owner/admin
+  const targetWsId = isAdmin ? MAIN_WORKSPACE_ID : `ws_${user.uid}`;
   const wsPath = `workspaces/${targetWsId}`;
 
   try {
@@ -538,6 +668,59 @@ export async function updateWorkstation(
   }
 }
 
+async function appendStationWorkerDeactivations(
+  batch: ReturnType<typeof writeBatch>,
+  workspaceId: string,
+  ownerUid: string,
+  stationId: string,
+): Promise<void> {
+  const membersQuery = query(collection(db, 'teamMembers'), where('ownerUid', '==', ownerUid));
+  const snaps = await getDocs(membersQuery);
+  snaps.forEach((d) => {
+    const data = d.data() as TeamMember;
+    if (data.workspaceId === workspaceId && data.station === stationId && data.active) {
+      batch.update(d.ref, {
+        active: false,
+        updatedAt: serverTimestamp(),
+      });
+    }
+  });
+}
+
+export async function toggleStationLinkActive(
+  workspace: Workspace,
+  station: Workstation,
+  active: boolean,
+): Promise<void> {
+  if (!station.accessCode) return;
+  const linkRef = doc(db, 'stationLinks', station.accessCode);
+  try {
+    const batch = writeBatch(db);
+    const existingSnap = await getDoc(linkRef);
+    if (existingSnap.exists()) {
+      batch.update(linkRef, { active });
+    } else {
+      batch.set(linkRef, {
+        workspaceId: workspace.id,
+        ownerUid: workspace.ownerUid,
+        stationId: station.id,
+        stationName: clampString(station.name, MAX_NAME_LENGTH),
+        workerName: clampString(station.workerName, MAX_NAME_LENGTH),
+        active,
+        createdAt: serverTimestamp(),
+      });
+    }
+
+    if (!active) {
+      await appendStationWorkerDeactivations(batch, workspace.id, workspace.ownerUid, station.id);
+    }
+
+    await batch.commit();
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, `stationLinks/${station.accessCode}`);
+  }
+}
+
 export async function regenerateStationLink(
   workspace: Workspace,
   station: Workstation,
@@ -565,6 +748,7 @@ export async function regenerateStationLink(
   });
 
   try {
+    await appendStationWorkerDeactivations(batch, workspace.id, workspace.ownerUid, station.id);
     await batch.commit();
     return newCode;
   } catch (error) {
@@ -586,6 +770,7 @@ export async function deleteWorkstation(
   });
 
   try {
+    await appendStationWorkerDeactivations(batch, station.workspaceId, station.ownerUid, station.id);
     await batch.commit();
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, `stations/${station.id}`);
@@ -637,13 +822,9 @@ export async function updateWorkspaceShiftSchedule(
   workspaceId: string,
   schedule: ShiftSchedule,
 ): Promise<void> {
-  if (
-    !TIME_PATTERN.test(schedule.openingStart) ||
-    !TIME_PATTERN.test(schedule.openingEnd) ||
-    !TIME_PATTERN.test(schedule.closingStart) ||
-    !TIME_PATTERN.test(schedule.closingEnd)
-  ) {
-    throw new Error('Formato de hora inválido.');
+  const validation = validateShiftSchedule(schedule);
+  if (!validation.valid) {
+    throw new Error(validation.errors[0] ?? 'Horario inválido.');
   }
 
   try {
@@ -831,6 +1012,7 @@ export async function fetchStationEntriesOnce(
 export async function saveStationReportBatch(params: {
   workspace: Workspace;
   user: User;
+  canManage: boolean;
   date: string;
   station: StationId;
   mode: 'opening' | 'closing';
@@ -839,7 +1021,7 @@ export async function saveStationReportBatch(params: {
   existingReport: DailyReport | undefined;
   existingEntries: Record<string, DailyReportEntry>;
 }): Promise<void> {
-  const { workspace, user, date, station, mode, notes, rows, existingReport, existingEntries } = params;
+  const { workspace, user, canManage, date, station, mode, notes, rows, existingReport, existingEntries } = params;
   const reportId = `${workspace.id}_${date}_${station}`;
   const reporterName = clampString(
     user.displayName || user.email?.split('@')[0] || 'Encargada',
@@ -900,11 +1082,7 @@ export async function saveStationReportBatch(params: {
       !row.hasClosing && prev?.hasClosing ? clampNumber(prev.closing) : clampNumber(row.closing);
 
     if (prev) {
-      batch.update(entryRef, {
-        itemName: clampString(row.itemName, MAX_NAME_LENGTH),
-        unit: clampString(row.unit, MAX_UNIT_LENGTH),
-        minStock: clampNumber(row.minStock),
-        targetStock: clampNumber(row.targetStock),
+      const updatePayload: Record<string, unknown> = {
         opening: openingVal,
         added: effectiveAdded,
         closing: closingVal,
@@ -914,7 +1092,14 @@ export async function saveStationReportBatch(params: {
         updatedByUid: user.uid,
         updatedByName: reporterName,
         updatedAt: serverTimestamp(),
-      });
+      };
+      if (canManage) {
+        updatePayload.itemName = row.itemName;
+        updatePayload.unit = row.unit;
+        updatePayload.minStock = clampNumber(row.minStock);
+        updatePayload.targetStock = clampNumber(row.targetStock);
+      }
+      batch.update(entryRef, updatePayload);
     } else {
       batch.set(entryRef, {
         workspaceId: workspace.id,
@@ -924,8 +1109,8 @@ export async function saveStationReportBatch(params: {
         itemId: row.itemId,
         station,
         date,
-        itemName: clampString(row.itemName, MAX_NAME_LENGTH),
-        unit: clampString(row.unit, MAX_UNIT_LENGTH),
+        itemName: row.itemName,
+        unit: row.unit,
         minStock: clampNumber(row.minStock),
         targetStock: clampNumber(row.targetStock),
         opening: openingVal,
@@ -968,7 +1153,7 @@ export async function reopenStationReport(reportId: string, user: User): Promise
 
 export async function syncAuthorizedEmailsAcrossWorkspace(params: {
   workspace: Workspace;
-  emailsToInclude: string[];
+  coAdminEmails: string[];
   stations: Workstation[];
   items: InventoryItem[];
   reports: DailyReport[];
@@ -976,9 +1161,8 @@ export async function syncAuthorizedEmailsAcrossWorkspace(params: {
 }): Promise<void> {
   const nextEmails = Array.from(
     new Set([
-      params.workspace.ownerEmail,
-      ...params.workspace.authorizedEmails,
-      ...params.emailsToInclude.map((e) => e.trim().toLowerCase()),
+      params.workspace.ownerEmail.trim().toLowerCase(),
+      ...params.coAdminEmails.map((e) => e.trim().toLowerCase()),
     ]),
   )
     .filter(Boolean)
@@ -1040,10 +1224,6 @@ export async function addInviteAndSyncAccess(params: {
   const cleanName = clampString(params.displayName, MAX_NAME_LENGTH);
   const inviteId = makeCleanId('inv');
 
-  const nextEmails = Array.from(
-    new Set([params.workspace.ownerEmail, ...params.workspace.authorizedEmails, cleanEmail]),
-  ).slice(0, 15);
-
   const batch = writeBatch(db);
   batch.set(doc(db, 'invites', inviteId), {
     workspaceId: params.workspace.id,
@@ -1054,38 +1234,45 @@ export async function addInviteAndSyncAccess(params: {
     createdAt: serverTimestamp(),
   });
 
-  batch.update(doc(db, 'workspaces', params.workspace.id), {
-    authorizedEmails: nextEmails,
-    updatedAt: serverTimestamp(),
-  });
+  // Only co-admins ('jefe') are added to authorizedEmails; workers authenticate strictly via teamMembers/{uid}
+  if (params.station === 'jefe') {
+    const nextEmails = Array.from(
+      new Set([params.workspace.ownerEmail, ...params.workspace.authorizedEmails, cleanEmail]),
+    ).slice(0, 15);
 
-  params.stations.forEach((st) => {
-    batch.update(doc(db, 'stations', st.id), {
+    batch.update(doc(db, 'workspaces', params.workspace.id), {
       authorizedEmails: nextEmails,
       updatedAt: serverTimestamp(),
     });
-  });
 
-  params.items.forEach((item) => {
-    batch.update(doc(db, 'items', item.id), {
-      authorizedEmails: nextEmails,
-      updatedAt: serverTimestamp(),
+    params.stations.forEach((st) => {
+      batch.update(doc(db, 'stations', st.id), {
+        authorizedEmails: nextEmails,
+        updatedAt: serverTimestamp(),
+      });
     });
-  });
 
-  params.todayReports.forEach((rep) => {
-    batch.update(doc(db, 'dailyReports', rep.id), {
-      authorizedEmails: nextEmails,
-      updatedAt: serverTimestamp(),
+    params.items.forEach((item) => {
+      batch.update(doc(db, 'items', item.id), {
+        authorizedEmails: nextEmails,
+        updatedAt: serverTimestamp(),
+      });
     });
-  });
 
-  params.todayEntries.forEach((entry) => {
-    batch.update(doc(db, 'dailyReports', entry.reportId, 'entries', entry.itemId), {
-      authorizedEmails: nextEmails,
-      updatedAt: serverTimestamp(),
+    params.todayReports.forEach((rep) => {
+      batch.update(doc(db, 'dailyReports', rep.id), {
+        authorizedEmails: nextEmails,
+        updatedAt: serverTimestamp(),
+      });
     });
-  });
+
+    params.todayEntries.forEach((entry) => {
+      batch.update(doc(db, 'dailyReports', entry.reportId, 'entries', entry.itemId), {
+        authorizedEmails: nextEmails,
+        updatedAt: serverTimestamp(),
+      });
+    });
+  }
 
   try {
     await batch.commit();
@@ -1107,36 +1294,61 @@ export async function removeInviteOrMember(params: {
     .filter((e) => e !== cleanEmail || e === params.workspace.ownerEmail)
     .slice(0, 15);
 
+  const emailsChanged =
+    nextEmails.length !== params.workspace.authorizedEmails.length ||
+    nextEmails.some((e, i) => params.workspace.authorizedEmails[i] !== e);
+
   const batch = writeBatch(db);
   if (params.inviteId) {
     batch.delete(doc(db, 'invites', params.inviteId));
   }
   if (params.memberId) {
-    batch.delete(doc(db, 'teamMembers', params.memberId));
+    batch.update(doc(db, 'teamMembers', params.memberId), {
+      active: false,
+      updatedAt: serverTimestamp(),
+    });
   }
 
-  batch.update(doc(db, 'workspaces', params.workspace.id), {
-    authorizedEmails: nextEmails,
-    updatedAt: serverTimestamp(),
-  });
-
-  params.stations.forEach((st) => {
-    batch.update(doc(db, 'stations', st.id), {
+  if (emailsChanged) {
+    batch.update(doc(db, 'workspaces', params.workspace.id), {
       authorizedEmails: nextEmails,
       updatedAt: serverTimestamp(),
     });
-  });
 
-  params.items.forEach((item) => {
-    batch.update(doc(db, 'items', item.id), {
-      authorizedEmails: nextEmails,
-      updatedAt: serverTimestamp(),
+    params.stations.forEach((st) => {
+      batch.update(doc(db, 'stations', st.id), {
+        authorizedEmails: nextEmails,
+        updatedAt: serverTimestamp(),
+      });
     });
-  });
+
+    params.items.forEach((item) => {
+      batch.update(doc(db, 'items', item.id), {
+        authorizedEmails: nextEmails,
+        updatedAt: serverTimestamp(),
+      });
+    });
+  }
 
   try {
     await batch.commit();
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, `workspaces/${params.workspace.id}`);
+  }
+}
+
+export async function updateTeamMemberAccess(
+  memberId: string,
+  payload: { active?: boolean; station?: TeamStationId },
+): Promise<void> {
+  const updates: Record<string, unknown> = {
+    updatedAt: serverTimestamp(),
+  };
+  if (payload.active !== undefined) updates.active = payload.active;
+  if (payload.station !== undefined) updates.station = payload.station;
+  try {
+    await updateDoc(doc(db, 'teamMembers', memberId), updates);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `teamMembers/${memberId}`);
   }
 }

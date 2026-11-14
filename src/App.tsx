@@ -40,6 +40,7 @@ import {
   fetchStationLinkPreview,
   loadWorkerStationFallback,
   resolveUserWorkspace,
+  SessionAccessError,
   syncAuthorizedEmailsAcrossWorkspace,
 } from './services/inventoryService';
 import type {
@@ -158,12 +159,14 @@ export default function App() {
   >({});
   const [invites, setInvites] = useState<Invite[]>([]);
   const [members, setMembers] = useState<TeamMember[]>([]);
+  const [stationLinksByCode, setStationLinksByCode] = useState<Record<string, StationLink>>({});
   const [workerFallback, setWorkerFallback] = useState<WorkerFallbackState | null>(null);
 
   const migrationAttemptedRef = useRef<string | null>(null);
   const syncingEmailsKeyRef = useRef<string>('');
   const manualDatePickedRef = useRef(false);
   const autoDateCheckedRef = useRef<string | null>(null);
+  const prevTodayRef = useRef<string>(getTodayDateStr());
 
   const canManage = isOwner || role === 'jefe';
   const userEmail = (user?.email ?? '').trim().toLowerCase();
@@ -201,6 +204,7 @@ export default function App() {
         setEntriesByReportId({});
         setInvites([]);
         setMembers([]);
+        setStationLinksByCode({});
         setWorkerFallback(null);
       }
     });
@@ -253,9 +257,13 @@ export default function App() {
       .catch((err) => {
         if (cancelled) return;
         console.error(err);
-        setSessionError(
-          'No se pudo inicializar el espacio del restaurante. Verifica tu sesión e intenta nuevamente.',
-        );
+        if (err instanceof SessionAccessError) {
+          setSessionError(err.message);
+        } else {
+          setSessionError(
+            'No se pudo inicializar el espacio del restaurante. Verifica tu sesión e intenta nuevamente.',
+          );
+        }
       })
       .finally(() => {
         if (!cancelled) setSessionLoading(false);
@@ -282,91 +290,240 @@ export default function App() {
     return () => unsub();
   }, [authReady, user, workspace?.id]);
 
-  // Listen to workstations, inventory items, and dailyReports
+  const todayStr = useMemo(() => getTodayDateStr(now), [now]);
+  const yesterdayStr = useMemo(() => getPreviousDateStr(todayStr), [todayStr]);
+
+  // Recalculate dashboard "today" cleanly across midnight / 6 AM operational cutoff
   useEffect(() => {
-    if (!authReady || !user || !workspace?.id || !userEmail) return;
+    if (prevTodayRef.current === todayStr) return;
+    prevTodayRef.current = todayStr;
+    if (!manualDatePickedRef.current) {
+      autoDateCheckedRef.current = null;
+      setSelectedDate(todayStr);
+      setAutoSelectedYesterday(false);
+    }
+  }, [todayStr]);
+
+  // Listen to workstations, inventory items, and dailyReports (Managers use authorizedEmails queries; Workers strictly use single-station document listeners)
+  useEffect(() => {
+    if (!authReady || !user || !workspace?.id) return;
     setStationsLoaded(false);
     setItemsLoaded(false);
     setReportsLoaded(false);
 
-    const stationsQuery = query(
-      collection(db, 'stations'),
-      where('authorizedEmails', 'array-contains', userEmail),
-    );
-    const unsubStations = onSnapshot(
-      stationsQuery,
+    if (canManage && userEmail) {
+      const stationsQuery = query(
+        collection(db, 'stations'),
+        where('authorizedEmails', 'array-contains', userEmail),
+      );
+      const unsubStations = onSnapshot(
+        stationsQuery,
+        (snap) => {
+          const list: Workstation[] = [];
+          snap.forEach((d) => {
+            const st = { id: d.id, ...d.data() } as Workstation;
+            if (st.workspaceId === workspace.id && st.active) {
+              list.push(st);
+            }
+          });
+          list.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name));
+          setStations(list);
+          setStationsLoaded(true);
+        },
+        (err) => handleFirestoreError(err, OperationType.LIST, 'stations'),
+      );
+
+      const itemsQuery = query(
+        collection(db, 'items'),
+        where('authorizedEmails', 'array-contains', userEmail),
+      );
+      const unsubItems = onSnapshot(
+        itemsQuery,
+        (snap) => {
+          const list: InventoryItem[] = [];
+          snap.forEach((d) => {
+            const raw = d.data() as Omit<InventoryItem, 'id'>;
+            const item: InventoryItem = {
+              ...raw,
+              id: d.id,
+              station: normalizeStation(raw.station),
+            };
+            if (item.workspaceId === workspace.id) {
+              list.push(item);
+            }
+          });
+          list.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name));
+          setItems(list);
+          setItemsLoaded(true);
+        },
+        (err) => handleFirestoreError(err, OperationType.LIST, 'items'),
+      );
+
+      const reportsQuery = query(
+        collection(db, 'dailyReports'),
+        where('authorizedEmails', 'array-contains', userEmail),
+      );
+      const unsubReports = onSnapshot(
+        reportsQuery,
+        (snap) => {
+          const list: DailyReport[] = [];
+          snap.forEach((d) => {
+            const raw = d.data() as Omit<DailyReport, 'id'>;
+            const rep: DailyReport = {
+              ...raw,
+              id: d.id,
+              station: normalizeStation(raw.station),
+            };
+            if (rep.workspaceId === workspace.id) {
+              list.push(rep);
+            }
+          });
+          setAllReports(list);
+          setReportsLoaded(true);
+        },
+        (err) => handleFirestoreError(err, OperationType.LIST, 'dailyReports'),
+      );
+
+      return () => {
+        unsubStations();
+        unsubItems();
+        unsubReports();
+      };
+    }
+
+    // Worker mode: strict single-station document listeners (no collection list queries)
+    if (role === 'jefe') return;
+    const stationDocPath = `stations/${role}`;
+    const unsubStation = onSnapshot(
+      doc(db, 'stations', role),
       (snap) => {
-        const list: Workstation[] = [];
-        snap.forEach((d) => {
-          const st = { id: d.id, ...d.data() } as Workstation;
-          if (st.workspaceId === workspace.id && st.active) {
-            list.push(st);
-          }
-        });
-        list.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name));
-        setStations(list);
+        if (snap.exists()) {
+          const st = { id: snap.id, ...snap.data() } as Workstation;
+          setStations(st.workspaceId === workspace.id && st.active ? [st] : []);
+        } else {
+          setStations([]);
+        }
         setStationsLoaded(true);
       },
-      (err) => handleFirestoreError(err, OperationType.LIST, 'stations'),
+      (err) => handleFirestoreError(err, OperationType.GET, stationDocPath),
     );
 
-    const itemsQuery = query(
-      collection(db, 'items'),
-      where('authorizedEmails', 'array-contains', userEmail),
-    );
-    const unsubItems = onSnapshot(
-      itemsQuery,
+    const reportId = `${workspace.id}_${effectiveSelectedDate}_${role}`;
+    const reportDocPath = `dailyReports/${reportId}`;
+    const unsubReport = onSnapshot(
+      doc(db, 'dailyReports', reportId),
       (snap) => {
-        const list: InventoryItem[] = [];
-        snap.forEach((d) => {
-          const raw = d.data() as Omit<InventoryItem, 'id'>;
-          const item: InventoryItem = {
-            ...raw,
-            id: d.id,
-            station: normalizeStation(raw.station),
-          };
-          if (item.workspaceId === workspace.id) {
-            list.push(item);
-          }
-        });
-        list.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name));
-        setItems(list);
-        setItemsLoaded(true);
-      },
-      (err) => handleFirestoreError(err, OperationType.LIST, 'items'),
-    );
-
-    const reportsQuery = query(
-      collection(db, 'dailyReports'),
-      where('authorizedEmails', 'array-contains', userEmail),
-    );
-    const unsubReports = onSnapshot(
-      reportsQuery,
-      (snap) => {
-        const list: DailyReport[] = [];
-        snap.forEach((d) => {
-          const raw = d.data() as Omit<DailyReport, 'id'>;
-          const rep: DailyReport = {
-            ...raw,
-            id: d.id,
-            station: normalizeStation(raw.station),
-          };
-          if (rep.workspaceId === workspace.id) {
-            list.push(rep);
-          }
-        });
-        setAllReports(list);
+        if (snap.exists()) {
+          const raw = snap.data() as Omit<DailyReport, 'id'>;
+          setAllReports([
+            {
+              ...raw,
+              id: snap.id,
+              station: normalizeStation(raw.station),
+            },
+          ]);
+        } else {
+          setAllReports([]);
+        }
         setReportsLoaded(true);
       },
-      (err) => handleFirestoreError(err, OperationType.LIST, 'dailyReports'),
+      (err) => handleFirestoreError(err, OperationType.GET, reportDocPath),
+    );
+
+    // Live check on worker's own teamMembers/{uid} for instant revocation / reassignment
+    const unsubSelfMember = onSnapshot(
+      doc(db, 'teamMembers', user.uid),
+      (snap) => {
+        if (!snap.exists()) {
+          setSessionError('Tu acceso fue removido por el jefe.');
+          return;
+        }
+        const m = snap.data() as TeamMember;
+        if (!m.active) {
+          setSessionError('Tu acceso a este restaurante fue desactivado por el jefe.');
+          return;
+        }
+        if (normalizeTeamRole(m.station) !== role) {
+          const nextRole = normalizeTeamRole(m.station);
+          setRole(nextRole);
+          setActiveSection(nextRole === 'jefe' ? 'jefe' : nextRole);
+        }
+      },
+      () => {
+        // Ignore transient offline listener issues
+      },
     );
 
     return () => {
-      unsubStations();
-      unsubItems();
-      unsubReports();
+      unsubStation();
+      unsubReport();
+      unsubSelfMember();
     };
-  }, [authReady, user, workspace?.id, userEmail]);
+  }, [authReady, user, workspace?.id, canManage, userEmail, role, effectiveSelectedDate]);
+
+  // Worker mode: real-time document-level listeners on worker's own station items
+  const workerNextSlot = useMemo(() => {
+    if (canManage || role === 'jefe' || !stationsLoaded) return 0;
+    const st = stations.find((s) => s.id === role);
+    return st ? Math.min(200, Math.max(1, st.nextItemSlot)) : 1;
+  }, [canManage, role, stationsLoaded, stations]);
+
+  useEffect(() => {
+    if (!authReady || !user || !workspace?.id || canManage || role === 'jefe' || !stationsLoaded) {
+      return;
+    }
+
+    if (workerNextSlot <= 1) {
+      setItems([]);
+      setItemsLoaded(true);
+      return;
+    }
+
+    const itemsMap = new Map<string, InventoryItem>();
+    const unsubs: Array<() => void> = [];
+    let resolvedCount = 0;
+    const totalSlots = workerNextSlot - 1;
+
+    for (let slot = 1; slot < workerNextSlot; slot++) {
+      const itemId = `${role}_${slot}`;
+      const unsub = onSnapshot(
+        doc(db, 'items', itemId),
+        (snap) => {
+          resolvedCount += 1;
+          if (snap.exists()) {
+            const raw = snap.data() as Omit<InventoryItem, 'id'>;
+            if (raw.workspaceId === workspace.id && normalizeStation(raw.station) === role) {
+              itemsMap.set(itemId, {
+                ...raw,
+                id: snap.id,
+                station: normalizeStation(raw.station),
+              });
+            } else {
+              itemsMap.delete(itemId);
+            }
+          } else {
+            itemsMap.delete(itemId);
+          }
+          const list = Array.from(itemsMap.values()).sort(
+            (a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name),
+          );
+          setItems(list);
+          if (resolvedCount >= totalSlots) {
+            setItemsLoaded(true);
+          }
+        },
+        (err) => handleFirestoreError(err, OperationType.GET, `items/${itemId}`),
+      );
+      unsubs.push(unsub);
+    }
+
+    const fallbackTimer = window.setTimeout(() => setItemsLoaded(true), 800);
+
+    return () => {
+      window.clearTimeout(fallbackTimer);
+      unsubs.forEach((u) => u());
+    };
+  }, [authReady, user, workspace?.id, canManage, role, workerNextSlot]);
 
   // Smart morning review: if Boss logs in when today has 0 reports and yesterday has reports, auto-show yesterday
   useEffect(() => {
@@ -375,20 +532,18 @@ export default function App() {
       !workspace?.id ||
       !reportsLoaded ||
       manualDatePickedRef.current ||
-      autoDateCheckedRef.current === workspace.id
+      autoDateCheckedRef.current === `${workspace.id}:${todayStr}`
     ) {
       return;
     }
-    autoDateCheckedRef.current = workspace.id;
-    const today = getTodayDateStr();
-    const yesterday = getPreviousDateStr(today);
-    const hasToday = allReports.some((r) => r.date === today);
-    const hasYesterday = allReports.some((r) => r.date === yesterday);
+    autoDateCheckedRef.current = `${workspace.id}:${todayStr}`;
+    const hasToday = allReports.some((r) => r.date === todayStr);
+    const hasYesterday = allReports.some((r) => r.date === yesterdayStr);
     if (!hasToday && hasYesterday) {
-      setSelectedDate(yesterday);
+      setSelectedDate(yesterdayStr);
       setAutoSelectedYesterday(true);
     }
-  }, [canManage, workspace?.id, reportsLoaded, allReports]);
+  }, [canManage, workspace?.id, reportsLoaded, allReports, todayStr, yesterdayStr]);
 
   // Auto-migrate existing workspace without stations doc into dynamic Workstations
   useEffect(() => {
@@ -421,28 +576,6 @@ export default function App() {
       console.error('Error loading station fallback:', err);
     }
   }, [workspace?.id, canManage, role, effectiveSelectedDate]);
-
-  // Fallback for QR-linked workers before Boss syncs authorizedEmails
-  useEffect(() => {
-    if (canManage || !workspace?.id || role === 'jefe' || !stationsLoaded || !itemsLoaded) {
-      return;
-    }
-    const hasStationViaQuery = stations.some((s) => s.id === role);
-    const hasItemsViaQuery = items.some((i) => i.station === role);
-    if (!hasStationViaQuery || !hasItemsViaQuery) {
-      refreshWorkerFallback();
-    }
-  }, [
-    canManage,
-    workspace?.id,
-    role,
-    stationsLoaded,
-    itemsLoaded,
-    stations,
-    items,
-    effectiveSelectedDate,
-    refreshWorkerFallback,
-  ]);
 
   const effectiveStations = useMemo(() => {
     if (stations.length > 0) return stations;
@@ -483,43 +616,96 @@ export default function App() {
       .join('|');
   }, [reportsForSelectedDate]);
 
+  const workerStationItemIdsKey = useMemo(() => {
+    if (canManage || role === 'jefe') return '';
+    return effectiveItems
+      .filter((it) => it.station === role)
+      .map((it) => it.id)
+      .join('|');
+  }, [canManage, role, effectiveItems]);
+
   useEffect(() => {
-    if (!authReady || !user || !userEmail || !workspace?.id) return;
+    if (!authReady || !user || !workspace?.id) return;
     const reportIds = existingReportIdsKey ? existingReportIdsKey.split('|') : [];
     if (reportIds.length === 0) {
       setEntriesByReportId({});
       return;
     }
 
-    const unsubs = reportIds.map((repId) => {
-      const entriesPath = `dailyReports/${repId}/entries`;
-      const q = query(
-        collection(db, 'dailyReports', repId, 'entries'),
-        where('authorizedEmails', 'array-contains', userEmail),
-      );
-      return onSnapshot(
-        q,
+    if (canManage && userEmail) {
+      const unsubs = reportIds.map((repId) => {
+        const entriesPath = `dailyReports/${repId}/entries`;
+        const q = query(
+          collection(db, 'dailyReports', repId, 'entries'),
+          where('authorizedEmails', 'array-contains', userEmail),
+        );
+        return onSnapshot(
+          q,
+          (snap) => {
+            const map: Record<string, DailyReportEntry> = {};
+            snap.forEach((d) => {
+              const entry = { id: d.id, ...d.data() } as DailyReportEntry;
+              map[entry.itemId] = entry;
+            });
+            setEntriesByReportId((prev) => ({
+              ...prev,
+              [repId]: map,
+            }));
+          },
+          (err) => handleFirestoreError(err, OperationType.LIST, entriesPath),
+        );
+      });
+
+      return () => {
+        unsubs.forEach((u) => u());
+      };
+    }
+
+    // Worker mode: document-level entry listeners via allow get
+    if (role === 'jefe') return;
+    const targetReportId = reportIds[0];
+    const itemIds = workerStationItemIdsKey ? workerStationItemIdsKey.split('|') : [];
+    if (!targetReportId || itemIds.length === 0) return;
+
+    const entryMap: Record<string, DailyReportEntry> = {};
+    const unsubs = itemIds.map((itemId) =>
+      onSnapshot(
+        doc(db, 'dailyReports', targetReportId, 'entries', itemId),
         (snap) => {
-          const map: Record<string, DailyReportEntry> = {};
-          snap.forEach((d) => {
-            const entry = { id: d.id, ...d.data() } as DailyReportEntry;
-            map[entry.itemId] = entry;
-          });
+          if (snap.exists()) {
+            entryMap[itemId] = { id: snap.id, ...snap.data() } as DailyReportEntry;
+          } else {
+            delete entryMap[itemId];
+          }
           setEntriesByReportId((prev) => ({
             ...prev,
-            [repId]: map,
+            [targetReportId]: { ...entryMap },
           }));
         },
-        (err) => handleFirestoreError(err, OperationType.LIST, entriesPath),
-      );
-    });
+        (err) =>
+          handleFirestoreError(
+            err,
+            OperationType.GET,
+            `dailyReports/${targetReportId}/entries/${itemId}`,
+          ),
+      ),
+    );
 
     return () => {
       unsubs.forEach((u) => u());
     };
-  }, [authReady, user, userEmail, workspace?.id, existingReportIdsKey]);
+  }, [
+    authReady,
+    user,
+    userEmail,
+    workspace?.id,
+    canManage,
+    role,
+    existingReportIdsKey,
+    workerStationItemIdsKey,
+  ]);
 
-  // Listen to invites and teamMembers for managers
+  // Listen to invites, teamMembers, and stationLinks for managers
   useEffect(() => {
     if (!authReady || !user || !workspace?.id || !canManage) return;
 
@@ -557,9 +743,29 @@ export default function App() {
       (err) => handleFirestoreError(err, OperationType.LIST, 'teamMembers'),
     );
 
+    const linksQuery = query(
+      collection(db, 'stationLinks'),
+      where('ownerUid', '==', workspace.ownerUid),
+    );
+    const unsubLinks = onSnapshot(
+      linksQuery,
+      (snap) => {
+        const map: Record<string, StationLink> = {};
+        snap.forEach((d) => {
+          const link = { id: d.id, ...d.data() } as StationLink;
+          if (link.workspaceId === workspace.id) {
+            map[d.id] = link;
+          }
+        });
+        setStationLinksByCode(map);
+      },
+      (err) => handleFirestoreError(err, OperationType.LIST, 'stationLinks'),
+    );
+
     return () => {
       unsubInvites();
       unsubMembers();
+      unsubLinks();
     };
   }, [authReady, user, workspace?.id, workspace?.ownerUid, canManage]);
 
@@ -591,36 +797,40 @@ export default function App() {
     return Object.values(consolidatedEntriesByItemId);
   }, [consolidatedEntriesByItemId]);
 
-  // Automatically sync authorizedEmails when a QR-linked worker registers in teamMembers
+  // Keep authorizedEmails limited strictly to owner + active co-admins ('jefe'), never workers
   useEffect(() => {
-    if (!canManage || !workspace || !stationsLoaded || !itemsLoaded || members.length === 0) return;
-    const activeEmails = members
-      .filter((m) => m.active && m.email)
+    if (!canManage || !workspace || !stationsLoaded || !itemsLoaded) return;
+    const coAdminEmails = members
+      .filter((m) => m.active && m.station === 'jefe' && m.email)
       .map((m) => m.email.trim().toLowerCase());
-    const missingEmails = activeEmails.filter(
-      (em) => !workspace.authorizedEmails.includes(em),
-    );
-    if (missingEmails.length === 0) return;
+    const desiredEmails = Array.from(
+      new Set([workspace.ownerEmail.trim().toLowerCase(), ...coAdminEmails]),
+    )
+      .filter(Boolean)
+      .slice(0, 15);
 
-    const syncKey = `${workspace.id}:${missingEmails.sort().join(',')}`;
+    const unchanged =
+      desiredEmails.length === workspace.authorizedEmails.length &&
+      desiredEmails.every((e, i) => workspace.authorizedEmails[i] === e);
+    if (unchanged) return;
+
+    const syncKey = `${workspace.id}:${desiredEmails.sort().join(',')}`;
     if (syncingEmailsKeyRef.current === syncKey) return;
     syncingEmailsKeyRef.current = syncKey;
 
     syncAuthorizedEmailsAcrossWorkspace({
       workspace,
-      emailsToInclude: activeEmails,
+      coAdminEmails,
       stations,
       items,
       reports: allReports,
       entries: todayAllEntries,
     }).catch((err) => {
-      console.error('Error syncing member access emails:', err);
+      console.error('Error syncing co-admin access emails:', err);
       syncingEmailsKeyRef.current = '';
     });
   }, [canManage, workspace, stationsLoaded, itemsLoaded, members, stations, items, allReports, todayAllEntries]);
 
-  const todayStr = getTodayDateStr();
-  const yesterdayStr = getPreviousDateStr(todayStr);
   const yesterdayHasReports = useMemo(
     () => allReports.some((r) => r.date === yesterdayStr),
     [allReports, yesterdayStr],
@@ -1094,6 +1304,7 @@ export default function App() {
                       workspace={workspace}
                       stations={effectiveStations}
                       items={effectiveItems}
+                      stationLinksByCode={stationLinksByCode}
                       onOpenStationSheet={(stId) => navigateTo(stId)}
                       onOpenStationCatalog={(stId) => {
                         setCatalogFilterStation(stId);

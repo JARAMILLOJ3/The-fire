@@ -1,9 +1,10 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { MailPlus, Trash2, UserCheck, Users } from 'lucide-react';
+import { Ban, MailPlus, RotateCcw, Trash2, UserCheck, Users } from 'lucide-react';
 import { MAX_EMAIL_LENGTH, MAX_NAME_LENGTH } from '../constants';
 import {
   addInviteAndSyncAccess,
   removeInviteOrMember,
+  updateTeamMemberAccess,
   updateWorkspaceProfile,
 } from '../services/inventoryService';
 import type {
@@ -85,8 +86,8 @@ export function TeamManager({
       setFeedback({ type: 'error', text: 'Ingresa un correo de Google válido.' });
       return;
     }
-    if (workspace.authorizedEmails.length >= 15) {
-      setFeedback({ type: 'error', text: 'Límite máximo de 15 cuentas autorizadas alcanzado.' });
+    if (station === 'jefe' && workspace.authorizedEmails.length >= 15) {
+      setFeedback({ type: 'error', text: 'Límite máximo de 15 administradores autorizados alcanzado.' });
       return;
     }
     setInviting(true);
@@ -130,7 +131,7 @@ export function TeamManager({
     }
   };
 
-  const handleRemoveMember = async (member: TeamMember) => {
+  const handleDeactivateMember = async (member: TeamMember) => {
     setFeedback(null);
     try {
       const matchingInvite = invites.find((i) => i.email === member.email);
@@ -142,10 +143,43 @@ export function TeamManager({
         stations,
         items,
       });
+      setFeedback({
+        type: 'success',
+        text: `Acceso desactivado para ${member.displayName}.`,
+      });
     } catch {
       setFeedback({ type: 'error', text: 'No se pudo revocar el acceso.' });
     }
   };
+
+  const handleReactivateMember = async (member: TeamMember) => {
+    setFeedback(null);
+    try {
+      await updateTeamMemberAccess(member.id, { active: true });
+      setFeedback({
+        type: 'success',
+        text: `Acceso reactivado para ${member.displayName}.`,
+      });
+    } catch {
+      setFeedback({ type: 'error', text: 'No se pudo reactivar el acceso.' });
+    }
+  };
+
+  const handleChangeMemberStation = async (member: TeamMember, nextStation: TeamStationId) => {
+    setFeedback(null);
+    try {
+      await updateTeamMemberAccess(member.id, { station: nextStation });
+      setFeedback({
+        type: 'success',
+        text: `Puesto actualizado para ${member.displayName}.`,
+      });
+    } catch {
+      setFeedback({ type: 'error', text: 'No se pudo cambiar el puesto asignado.' });
+    }
+  };
+
+  const activeMembers = members.filter((m) => m.active);
+  const revokedMembers = members.filter((m) => !m.active);
 
   return (
     <div className="space-y-6 sm:space-y-8 min-w-0">
@@ -303,7 +337,7 @@ export function TeamManager({
                 </h2>
               </div>
               <span className="font-mono text-xs text-stone-500 shrink-0">
-                {members.length + 1} activas
+                {activeMembers.length + 1} activas
               </span>
             </div>
 
@@ -322,26 +356,78 @@ export function TeamManager({
                 </span>
               </div>
 
-              {members.map((m) => (
-                <div key={m.id} className="px-5 py-3.5 flex items-center justify-between gap-4">
+              {activeMembers.map((m) => (
+                <div key={m.id} className="px-5 py-3.5 flex flex-wrap items-center justify-between gap-3">
                   <div className="min-w-0 flex-1">
                     <p className="text-sm font-medium text-stone-900 truncate">{m.displayName}</p>
                     <p className="text-xs text-stone-500 truncate">
                       {m.email} · {getRoleLabel(m.station)}
                     </p>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => handleRemoveMember(m)}
-                    aria-label={`Revocar acceso de ${m.email}`}
-                    className="p-2 text-stone-400 hover:text-red-700 hover:bg-red-50 rounded-lg shrink-0 cursor-pointer"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <select
+                      aria-label={`Puesto de ${m.displayName}`}
+                      value={m.station}
+                      onChange={(e) => handleChangeMemberStation(m, e.target.value as TeamStationId)}
+                      className="min-h-[34px] px-2 py-1 text-xs bg-stone-50 border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500"
+                    >
+                      {stations.map((st) => (
+                        <option key={st.id} value={st.id}>
+                          {st.name}
+                        </option>
+                      ))}
+                      <option value="jefe">Co-Administrador / Jefe</option>
+                    </select>
+                    <button
+                      type="button"
+                      onClick={() => handleDeactivateMember(m)}
+                      aria-label={`Desactivar acceso de ${m.email}`}
+                      title="Desactivar acceso"
+                      className="p-2 text-stone-400 hover:text-red-700 hover:bg-red-50 rounded-lg shrink-0 cursor-pointer"
+                    >
+                      <Ban className="w-4 h-4" />
+                    </button>
+                  </div>
                 </div>
               ))}
             </div>
           </div>
+
+          {revokedMembers.length > 0 && (
+            <div className="bg-white border border-stone-200 rounded-2xl overflow-hidden">
+              <div className="px-5 py-4 border-b border-stone-200 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <Ban className="w-4 h-4 text-red-600 shrink-0" />
+                  <h2 className="font-display text-base font-bold text-stone-900 truncate">
+                    Accesos desactivados
+                  </h2>
+                </div>
+                <span className="font-mono text-xs text-stone-500 shrink-0">
+                  {revokedMembers.length}
+                </span>
+              </div>
+              <div className="divide-y divide-stone-100">
+                {revokedMembers.map((m) => (
+                  <div key={m.id} className="px-5 py-3.5 flex items-center justify-between gap-4">
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-medium text-stone-500 truncate">{m.displayName}</p>
+                      <p className="text-xs text-stone-400 truncate">
+                        {m.email} · {getRoleLabel(m.station)}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleReactivateMember(m)}
+                      className="min-h-[34px] inline-flex items-center gap-1.5 px-3 py-1 text-xs font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg hover:bg-emerald-100 shrink-0 cursor-pointer"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      Reactivar
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           <div className="bg-white border border-stone-200 rounded-2xl overflow-hidden">
             <div className="px-5 py-4 border-b border-stone-200 flex items-center justify-between gap-2">
