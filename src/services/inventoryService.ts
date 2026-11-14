@@ -601,6 +601,34 @@ export async function updateWorkspaceName(workspaceId: string, name: string): Pr
   }
 }
 
+export async function updateWorkspaceProfile(
+  workspaceId: string,
+  payload: { ownerName?: string; name?: string },
+): Promise<void> {
+  const updates: Record<string, unknown> = {
+    updatedAt: serverTimestamp(),
+  };
+
+  if (payload.ownerName !== undefined) {
+    const cleanOwner = clampString(payload.ownerName, MAX_NAME_LENGTH);
+    if (cleanOwner.length < 1) return;
+    updates.ownerName = cleanOwner;
+  }
+
+  if (payload.name !== undefined) {
+    const cleanName = clampString(payload.name, MAX_NAME_LENGTH);
+    if (cleanName.length >= 2) {
+      updates.name = cleanName;
+    }
+  }
+
+  try {
+    await updateDoc(doc(db, 'workspaces', workspaceId), updates);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `workspaces/${workspaceId}`);
+  }
+}
+
 export async function createInventoryItem(
   workspace: Workspace,
   station: Workstation | undefined,

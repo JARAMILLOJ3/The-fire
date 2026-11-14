@@ -1,10 +1,10 @@
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import { MailPlus, Trash2, UserCheck, Users } from 'lucide-react';
 import { MAX_EMAIL_LENGTH, MAX_NAME_LENGTH } from '../constants';
 import {
   addInviteAndSyncAccess,
   removeInviteOrMember,
-  updateWorkspaceName,
+  updateWorkspaceProfile,
 } from '../services/inventoryService';
 import type {
   DailyReport,
@@ -36,8 +36,9 @@ export function TeamManager({
   invites,
   members,
 }: TeamManagerProps) {
+  const [ownerName, setOwnerName] = useState(workspace.ownerName ?? '');
   const [restaurantName, setRestaurantName] = useState(workspace.name);
-  const [savingName, setSavingName] = useState(false);
+  const [savingProfile, setSavingProfile] = useState(false);
 
   const [email, setEmail] = useState('');
   const [displayName, setDisplayName] = useState('');
@@ -45,24 +46,35 @@ export function TeamManager({
   const [inviting, setInviting] = useState(false);
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
+  useEffect(() => {
+    setOwnerName(workspace.ownerName ?? '');
+    setRestaurantName(workspace.name);
+  }, [workspace.ownerName, workspace.name]);
+
   const stationNameMap = new Map(stations.map((s) => [s.id, s.name]));
   const getRoleLabel = (roleId: TeamStationId) => {
     if (roleId === 'jefe') return 'Co-Administrador / Jefe';
     return stationNameMap.get(roleId) ?? roleId;
   };
 
-  const handleRename = async (e: FormEvent) => {
+  const handleSaveProfile = async (e: FormEvent) => {
     e.preventDefault();
-    if (restaurantName.trim().length < 2) return;
-    setSavingName(true);
+    if (restaurantName.trim().length < 2 || ownerName.trim().length < 1) {
+      setFeedback({ type: 'error', text: 'Completa tu nombre y el nombre del negocio.' });
+      return;
+    }
+    setSavingProfile(true);
     setFeedback(null);
     try {
-      await updateWorkspaceName(workspace.id, restaurantName);
-      setFeedback({ type: 'success', text: 'Nombre del negocio actualizado.' });
+      await updateWorkspaceProfile(workspace.id, {
+        ownerName: ownerName.trim(),
+        name: restaurantName.trim(),
+      });
+      setFeedback({ type: 'success', text: 'Tu nombre y datos del negocio fueron guardados.' });
     } catch {
-      setFeedback({ type: 'error', text: 'No se pudo actualizar el nombre.' });
+      setFeedback({ type: 'error', text: 'No se pudieron actualizar los datos.' });
     } finally {
-      setSavingName(false);
+      setSavingProfile(false);
     }
   };
 
@@ -136,23 +148,23 @@ export function TeamManager({
   };
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-6 sm:space-y-8 min-w-0">
       <div>
-        <p className="text-xs font-medium text-slate-500">
+        <p className="text-xs font-semibold text-orange-600">
           Administración · Cuentas conectadas
         </p>
-        <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 mt-1">
+        <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-stone-900 mt-1">
           Equipo y Configuración
         </h1>
-        <p className="text-sm text-slate-600 mt-1">
-          Las trabajadoras que ingresan mediante el código QR o enlace de su puesto aparecerán aquí automáticamente. También puedes invitar por correo manualmente.
+        <p className="text-sm text-stone-600 mt-1">
+          Las trabajadoras que ingresan mediante el código QR o enlace de su puesto aparecen aquí automáticamente.
         </p>
       </div>
 
       {feedback && (
         <div
           role="status"
-          className={`px-4 py-3 text-sm rounded-xl border ${
+          className={`px-4 py-3 text-sm rounded-2xl border ${
             feedback.type === 'success'
               ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
               : 'bg-red-50 text-red-800 border-red-200'
@@ -163,15 +175,35 @@ export function TeamManager({
       )}
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        <div className="lg:col-span-5 space-y-6">
+        <div className="lg:col-span-5 space-y-6 min-w-0">
           <form
-            onSubmit={handleRename}
-            className="bg-white border border-slate-200 rounded-xl p-5 space-y-4"
+            onSubmit={handleSaveProfile}
+            className="bg-white border border-stone-200 rounded-2xl p-5 space-y-4"
           >
-            <h2 className="font-display text-base font-semibold text-slate-900">
-              Nombre del negocio
+            <h2 className="font-display text-base font-bold text-stone-900">
+              Tu perfil y negocio
             </h2>
-            <div className="flex items-center gap-2">
+
+            <div>
+              <label className="block text-xs font-semibold text-stone-700 mb-1">
+                Tu nombre (para la bienvenida)
+              </label>
+              <input
+                type="text"
+                required
+                minLength={1}
+                maxLength={MAX_NAME_LENGTH}
+                value={ownerName}
+                onChange={(e) => setOwnerName(e.target.value)}
+                placeholder="Ej: Carlos"
+                className="w-full min-h-[42px] px-3 py-2 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-stone-700 mb-1">
+                Nombre del restaurante
+              </label>
               <input
                 type="text"
                 required
@@ -179,31 +211,32 @@ export function TeamManager({
                 maxLength={MAX_NAME_LENGTH}
                 value={restaurantName}
                 onChange={(e) => setRestaurantName(e.target.value)}
-                className="flex-1 px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
+                className="w-full min-h-[42px] px-3 py-2 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
               />
-              <button
-                type="submit"
-                disabled={savingName}
-                className="px-4 py-2 text-sm font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 disabled:opacity-60 whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                {savingName ? 'Guardando...' : 'Guardar'}
-              </button>
             </div>
+
+            <button
+              type="submit"
+              disabled={savingProfile}
+              className="w-full min-h-[42px] px-4 py-2 text-sm font-semibold text-white bg-stone-950 rounded-xl hover:bg-stone-800 disabled:opacity-60 transition-colors cursor-pointer"
+            >
+              {savingProfile ? 'Guardando...' : 'Guardar cambios'}
+            </button>
           </form>
 
           <form
             onSubmit={handleInvite}
-            className="bg-white border border-slate-200 rounded-xl p-5 space-y-4"
+            className="bg-white border border-stone-200 rounded-2xl p-5 space-y-4"
           >
             <div className="flex items-center gap-2">
-              <MailPlus className="w-4 h-4 text-teal-700" />
-              <h2 className="font-display text-base font-semibold text-slate-900">
+              <MailPlus className="w-4 h-4 text-orange-600 shrink-0" />
+              <h2 className="font-display text-base font-bold text-stone-900">
                 Autorizar acceso por correo (opcional)
               </h2>
             </div>
 
             <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1">
+              <label className="block text-xs font-semibold text-stone-700 mb-1">
                 Nombre de la persona
               </label>
               <input
@@ -213,12 +246,12 @@ export function TeamManager({
                 value={displayName}
                 onChange={(e) => setDisplayName(e.target.value)}
                 placeholder="Ej: Laura (Salchipapas)"
-                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
+                className="w-full min-h-[42px] px-3 py-2 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
               />
             </div>
 
             <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1">
+              <label className="block text-xs font-semibold text-stone-700 mb-1">
                 Correo de Google
               </label>
               <input
@@ -228,18 +261,18 @@ export function TeamManager({
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 placeholder="ejemplo@gmail.com"
-                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
+                className="w-full min-h-[42px] px-3 py-2 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
               />
             </div>
 
             <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1">
+              <label className="block text-xs font-semibold text-stone-700 mb-1">
                 Puesto asignado
               </label>
               <select
                 value={station}
                 onChange={(e) => setStation(e.target.value as TeamStationId)}
-                className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600 bg-white"
+                className="w-full min-h-[42px] px-3 py-2 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 bg-white"
               >
                 {stations.map((st) => (
                   <option key={st.id} value={st.id}>
@@ -253,41 +286,47 @@ export function TeamManager({
             <button
               type="submit"
               disabled={inviting}
-              className="w-full py-2.5 text-sm font-semibold text-white bg-teal-700 rounded-lg hover:bg-teal-800 disabled:opacity-60 transition-colors cursor-pointer"
+              className="w-full min-h-[44px] py-2.5 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 disabled:opacity-60 transition-colors cursor-pointer"
             >
               {inviting ? 'Autorizando...' : 'Autorizar acceso'}
             </button>
           </form>
         </div>
 
-        <div className="lg:col-span-7 space-y-6">
-          <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-            <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <UserCheck className="w-4 h-4 text-teal-700" />
-                <h2 className="font-display text-base font-semibold text-slate-900">
+        <div className="lg:col-span-7 space-y-6 min-w-0">
+          <div className="bg-white border border-stone-200 rounded-2xl overflow-hidden">
+            <div className="px-5 py-4 border-b border-stone-200 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 min-w-0">
+                <UserCheck className="w-4 h-4 text-orange-600 shrink-0" />
+                <h2 className="font-display text-base font-bold text-stone-900 truncate">
                   Cuentas activas
                 </h2>
               </div>
-              <span className="font-mono text-xs text-slate-500">
+              <span className="font-mono text-xs text-stone-500 shrink-0">
                 {members.length + 1} activas
               </span>
             </div>
 
-            <div className="divide-y divide-slate-100">
+            <div className="divide-y divide-stone-100">
               <div className="px-5 py-3.5 flex items-center justify-between gap-4">
-                <div>
-                  <p className="text-sm font-medium text-slate-900">{workspace.ownerEmail}</p>
-                  <p className="text-xs text-slate-500">Jefe Principal · Acceso total</p>
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-semibold text-stone-900 truncate">
+                    {workspace.ownerName ? `${workspace.ownerName} (${workspace.ownerEmail})` : workspace.ownerEmail}
+                  </p>
+                  <p className="text-xs text-stone-500 truncate">
+                    Jefe Principal · Acceso total
+                  </p>
                 </div>
-                <span className="text-xs font-semibold text-teal-700">Propietario</span>
+                <span className="text-xs font-semibold text-orange-600 shrink-0">
+                  Propietario
+                </span>
               </div>
 
               {members.map((m) => (
                 <div key={m.id} className="px-5 py-3.5 flex items-center justify-between gap-4">
-                  <div>
-                    <p className="text-sm font-medium text-slate-900">{m.displayName}</p>
-                    <p className="text-xs text-slate-500">
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-medium text-stone-900 truncate">{m.displayName}</p>
+                    <p className="text-xs text-stone-500 truncate">
                       {m.email} · {getRoleLabel(m.station)}
                     </p>
                   </div>
@@ -295,7 +334,7 @@ export function TeamManager({
                     type="button"
                     onClick={() => handleRemoveMember(m)}
                     aria-label={`Revocar acceso de ${m.email}`}
-                    className="p-2 text-slate-400 hover:text-red-700 hover:bg-red-50 rounded-lg cursor-pointer"
+                    className="p-2 text-stone-400 hover:text-red-700 hover:bg-red-50 rounded-lg shrink-0 cursor-pointer"
                   >
                     <Trash2 className="w-4 h-4" />
                   </button>
@@ -304,28 +343,30 @@ export function TeamManager({
             </div>
           </div>
 
-          <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
-            <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <Users className="w-4 h-4 text-slate-600" />
-                <h2 className="font-display text-base font-semibold text-slate-900">
+          <div className="bg-white border border-stone-200 rounded-2xl overflow-hidden">
+            <div className="px-5 py-4 border-b border-stone-200 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 min-w-0">
+                <Users className="w-4 h-4 text-stone-600 shrink-0" />
+                <h2 className="font-display text-base font-bold text-stone-900 truncate">
                   Invitaciones por correo pendientes
                 </h2>
               </div>
-              <span className="font-mono text-xs text-slate-500">{invites.length}</span>
+              <span className="font-mono text-xs text-stone-500 shrink-0">{invites.length}</span>
             </div>
 
             {invites.length === 0 ? (
-              <div className="p-6 text-sm text-slate-500">
+              <div className="p-6 text-sm text-stone-500">
                 No hay invitaciones por correo pendientes. Si usas códigos QR o enlaces desde &ldquo;Puestos de Trabajo&rdquo;, las trabajadoras se activan al ingresar.
               </div>
             ) : (
-              <div className="divide-y divide-slate-100">
+              <div className="divide-y divide-stone-100">
                 {invites.map((inv) => (
                   <div key={inv.id} className="px-5 py-3.5 flex items-center justify-between gap-4">
-                    <div>
-                      <p className="text-sm font-medium text-slate-900">{inv.displayName}</p>
-                      <p className="text-xs text-slate-500">
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-medium text-stone-900 truncate">
+                        {inv.displayName}
+                      </p>
+                      <p className="text-xs text-stone-500 truncate">
                         {inv.email} · {getRoleLabel(inv.station)}
                       </p>
                     </div>
@@ -333,7 +374,7 @@ export function TeamManager({
                       type="button"
                       onClick={() => handleRemoveInvite(inv)}
                       aria-label={`Eliminar invitación de ${inv.email}`}
-                      className="p-2 text-slate-400 hover:text-red-700 hover:bg-red-50 rounded-lg cursor-pointer"
+                      className="p-2 text-stone-400 hover:text-red-700 hover:bg-red-50 rounded-lg shrink-0 cursor-pointer"
                     >
                       <Trash2 className="w-4 h-4" />
                     </button>

@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import QRCode from 'qrcode';
+import { AnimatePresence, motion } from 'motion/react';
 import {
   Check,
   Copy,
@@ -78,7 +79,7 @@ export function WorkstationsManager({
     QRCode.toDataURL(shareUrl, {
       width: 320,
       margin: 2,
-      color: { dark: '#0f172a', light: '#ffffff' },
+      color: { dark: '#1c1917', light: '#ffffff' },
     })
       .then((url) => setQrDataUrl(url))
       .catch(() => setQrDataUrl(''));
@@ -176,7 +177,7 @@ export function WorkstationsManager({
 
   const handleCopyWhatsAppInvite = async (st: Workstation) => {
     const shareUrl = buildStationShareUrl(st.id, st.accessCode);
-    const msg = `Hola ${st.workerName}, ingresa desde tu celular a este enlace de *The Fire Inventario* para registrar el inicio y cierre diario de *${st.name}*:\n${shareUrl}`;
+    const msg = `Hola ${st.workerName}, ingresa desde tu celular a este enlace de *The Fire Inventario* para registrar el cierre diario de *${st.name}*:\n${shareUrl}`;
     try {
       await navigator.clipboard.writeText(msg);
       setCopiedId(`wa_${st.id}`);
@@ -220,24 +221,24 @@ export function WorkstationsManager({
   };
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 min-w-0">
       <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
-        <div>
-          <p className="text-xs font-medium text-slate-500">
+        <div className="min-w-0">
+          <p className="text-xs font-semibold text-orange-600">
             Administración · {stations.length} puestos activos
           </p>
-          <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 mt-1">
+          <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-stone-900 mt-1">
             Puestos de Trabajo y Códigos QR
           </h1>
-          <p className="text-sm text-slate-600 mt-1 max-w-2xl">
-            Crea cada sección del negocio, asigna a su trabajadora y genera el enlace o código QR para que entre desde su celular directo a reportar su inventario diario.
+          <p className="text-sm text-stone-600 mt-1 max-w-2xl">
+            Crea cada sección del restaurante, asigna a su encargada y comparte el código QR o enlace directo para que registre su cierre desde el celular.
           </p>
         </div>
 
         <button
           type="button"
           onClick={openCreateModal}
-          className="inline-flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          className="min-h-[44px] inline-flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.98] transition-all whitespace-nowrap shrink-0 cursor-pointer"
         >
           <Plus className="w-4 h-4" />
           Nuevo puesto de trabajo
@@ -245,25 +246,28 @@ export function WorkstationsManager({
       </div>
 
       {/* Stations Grid */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
-        {stations.map((st) => {
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-5">
+        {stations.map((st, idx) => {
           const stationItems = items.filter((i) => i.active && i.station === st.id);
           const shareUrl = buildStationShareUrl(st.id, st.accessCode);
           const isCopiedLink = copiedId === st.id;
           const isCopiedWa = copiedId === `wa_${st.id}`;
 
           return (
-            <div
+            <motion.div
               key={st.id}
-              className="bg-white border border-slate-200 rounded-xl p-5 flex flex-col justify-between gap-5"
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.24, delay: Math.min(idx * 0.04, 0.2) }}
+              className="min-w-0 bg-white border border-stone-200 rounded-2xl p-4 sm:p-5 flex flex-col justify-between gap-4 sm:gap-5 hover:shadow-md transition-shadow"
             >
-              <div className="space-y-3">
+              <div className="space-y-3 min-w-0">
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
-                    <h2 className="font-display text-lg font-bold text-slate-900 truncate">
+                    <h2 className="font-display text-lg font-bold text-stone-900 truncate">
                       {st.name}
                     </h2>
-                    <p className="text-xs text-slate-500 mt-0.5">
+                    <p className="text-xs text-stone-500 mt-0.5 truncate">
                       {st.area || 'Área general'} ·{' '}
                       <span className="font-mono tabular-nums">
                         {stationItems.length} insumos
@@ -275,7 +279,7 @@ export function WorkstationsManager({
                       type="button"
                       onClick={() => openEditModal(st)}
                       aria-label={`Editar ${st.name}`}
-                      className="p-2 text-slate-500 hover:text-slate-900 hover:bg-slate-100 rounded-lg cursor-pointer"
+                      className="p-2 text-stone-500 hover:text-stone-900 hover:bg-stone-100 rounded-lg cursor-pointer"
                     >
                       <Pencil className="w-4 h-4" />
                     </button>
@@ -283,53 +287,61 @@ export function WorkstationsManager({
                       type="button"
                       onClick={() => setConfirmDelete(st)}
                       aria-label={`Eliminar ${st.name}`}
-                      className="p-2 text-slate-500 hover:text-red-700 hover:bg-red-50 rounded-lg cursor-pointer"
+                      className="p-2 text-stone-500 hover:text-red-700 hover:bg-red-50 rounded-lg cursor-pointer"
                     >
                       <Trash2 className="w-4 h-4" />
                     </button>
                   </div>
                 </div>
 
-                <div className="flex items-center gap-2 text-sm text-slate-700 bg-slate-50 border border-slate-200 rounded-lg px-3.5 py-2.5">
-                  <UserRound className="w-4 h-4 text-teal-700 shrink-0" />
-                  <span className="text-slate-500">Trabajadora:</span>
-                  <span className="font-semibold text-slate-900 truncate">{st.workerName}</span>
+                <div className="flex items-center gap-2 text-sm text-stone-700 bg-stone-50 border border-stone-200 rounded-xl px-3.5 py-2.5 min-w-0">
+                  <UserRound className="w-4 h-4 text-orange-600 shrink-0" />
+                  <span className="text-stone-500 shrink-0">Trabajadora:</span>
+                  <span className="font-semibold text-stone-900 truncate">{st.workerName}</span>
                 </div>
 
                 {st.description && (
-                  <p className="text-xs text-slate-600 leading-relaxed">{st.description}</p>
+                  <p className="text-xs text-stone-600 leading-relaxed">{st.description}</p>
                 )}
 
-                <div className="text-xs text-slate-500 font-mono truncate bg-slate-50 px-3 py-2 rounded-lg border border-slate-100">
+                <div className="text-xs text-stone-500 font-mono truncate bg-stone-50 px-3 py-2 rounded-xl border border-stone-100 min-w-0">
                   {shareUrl}
                 </div>
               </div>
 
-              <div className="pt-3 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2">
+              <div className="pt-3 border-t border-stone-100 flex flex-wrap items-center justify-between gap-2.5">
                 <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
                     onClick={() => setQrStation(st)}
-                    className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-white bg-teal-700 rounded-lg hover:bg-teal-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    className="min-h-[38px] inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-stone-950 rounded-xl hover:bg-stone-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                   >
-                    <QrCode className="w-3.5 h-3.5" />
+                    <QrCode className="w-3.5 h-3.5 text-orange-400" />
                     Ver código QR
                   </button>
                   <button
                     type="button"
                     onClick={() => handleCopyLink(st)}
-                    className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    className="min-h-[38px] inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                   >
-                    {isCopiedLink ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
-                    {isCopiedLink ? 'Enlace copiado' : 'Copiar enlace'}
+                    {isCopiedLink ? (
+                      <Check className="w-3.5 h-3.5 text-emerald-600" />
+                    ) : (
+                      <Copy className="w-3.5 h-3.5" />
+                    )}
+                    {isCopiedLink ? 'Copiado' : 'Copiar enlace'}
                   </button>
                   <button
                     type="button"
                     onClick={() => handleCopyWhatsAppInvite(st)}
-                    className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                    className="min-h-[38px] inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                   >
-                    {isCopiedWa ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <ExternalLink className="w-3.5 h-3.5" />}
-                    {isCopiedWa ? 'Mensaje copiado' : 'Mensaje WhatsApp'}
+                    {isCopiedWa ? (
+                      <Check className="w-3.5 h-3.5 text-emerald-600" />
+                    ) : (
+                      <ExternalLink className="w-3.5 h-3.5" />
+                    )}
+                    {isCopiedWa ? 'Copiado' : 'WhatsApp'}
                   </button>
                 </div>
 
@@ -337,336 +349,393 @@ export function WorkstationsManager({
                   <button
                     type="button"
                     onClick={() => onOpenStationCatalog(st.id)}
-                    className="text-slate-600 hover:text-slate-900 cursor-pointer"
+                    className="text-stone-600 hover:text-stone-900 cursor-pointer"
                   >
                     Insumos
                   </button>
                   <button
                     type="button"
                     onClick={() => onOpenStationSheet(st.id)}
-                    className="text-teal-700 hover:text-teal-800 cursor-pointer"
+                    className="text-orange-600 hover:text-orange-700 cursor-pointer"
                   >
                     Abrir planilla
                   </button>
                 </div>
               </div>
-            </div>
+            </motion.div>
           );
         })}
       </div>
 
       {/* Create / Edit Workstation Modal */}
-      {showModal && (
-        <div className="fixed inset-0 z-50 bg-slate-900/40 flex items-center justify-center p-4 overflow-y-auto">
-          <div className="bg-white border border-slate-200 rounded-xl w-full max-w-xl p-6 space-y-5 shadow-xl my-8">
-            <div className="flex items-center justify-between">
-              <h2 className="font-display text-lg font-bold text-slate-900">
-                {editingStation ? 'Editar puesto de trabajo' : 'Nuevo puesto de trabajo'}
-              </h2>
-              <button
-                type="button"
-                onClick={() => setShowModal(false)}
-                className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg cursor-pointer"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            {errorMsg && (
-              <div className="p-3 text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg">
-                {errorMsg}
-              </div>
-            )}
-
-            <form onSubmit={handleSubmit} className="space-y-4">
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Nombre del puesto / sección
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    maxLength={MAX_NAME_LENGTH}
-                    value={name}
-                    onChange={(e) => setName(e.target.value)}
-                    placeholder="Ej: Jugos y Salchipapas"
-                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Trabajadora encargada
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    maxLength={MAX_NAME_LENGTH}
-                    value={workerName}
-                    onChange={(e) => setWorkerName(e.target.value)}
-                    placeholder="Ej: Laura Gómez"
-                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
-                  />
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Área del local (opcional)
-                  </label>
-                  <input
-                    type="text"
-                    maxLength={MAX_AREA_LENGTH}
-                    value={area}
-                    onChange={(e) => setArea(e.target.value)}
-                    placeholder="Ej: Barra y Freidora"
-                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Descripción (opcional)
-                  </label>
-                  <input
-                    type="text"
-                    maxLength={MAX_DESC_LENGTH}
-                    value={description}
-                    onChange={(e) => setDescription(e.target.value)}
-                    placeholder="Ej: Control de pulpas, limones y papas"
-                    className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
-                  />
-                </div>
-              </div>
-
-              {!editingStation && (
-                <div className="pt-2 border-t border-slate-200 space-y-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold text-slate-700">
-                      Insumos a registrar en este puesto
-                    </span>
-                    <button
-                      type="button"
-                      onClick={handleAddDraftItemRow}
-                      className="text-xs font-semibold text-teal-700 hover:text-teal-800 cursor-pointer"
-                    >
-                      + Agregar otro insumo
-                    </button>
-                  </div>
-
-                  <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
-                    {draftItems.map((row, idx) => (
-                      <div key={idx} className="grid grid-cols-12 gap-2 items-center">
-                        <input
-                          type="text"
-                          maxLength={MAX_NAME_LENGTH}
-                          value={row.name}
-                          onChange={(e) => handleUpdateDraftItem(idx, 'name', e.target.value)}
-                          placeholder="Nombre del insumo"
-                          className="col-span-5 px-2.5 py-1.5 text-xs border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
-                        />
-                        <input
-                          type="text"
-                          list="ws-unit-list"
-                          maxLength={MAX_UNIT_LENGTH}
-                          value={row.unit}
-                          onChange={(e) => handleUpdateDraftItem(idx, 'unit', e.target.value)}
-                          placeholder="und"
-                          className="col-span-2 px-2 py-1.5 text-xs border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
-                        />
-                        <input
-                          type="number"
-                          min={0}
-                          value={row.minStock}
-                          onChange={(e) =>
-                            handleUpdateDraftItem(idx, 'minStock', parseFloat(e.target.value) || 0)
-                          }
-                          title="Stock mínimo"
-                          placeholder="Mín"
-                          className="col-span-2 px-2 py-1.5 text-xs font-mono border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
-                        />
-                        <input
-                          type="number"
-                          min={0}
-                          value={row.targetStock}
-                          onChange={(e) =>
-                            handleUpdateDraftItem(
-                              idx,
-                              'targetStock',
-                              parseFloat(e.target.value) || 0,
-                            )
-                          }
-                          title="Stock ideal"
-                          placeholder="Ideal"
-                          className="col-span-2 px-2 py-1.5 text-xs font-mono border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => handleRemoveDraftItem(idx)}
-                          aria-label="Quitar fila"
-                          className="col-span-1 p-1.5 text-slate-400 hover:text-red-600 cursor-pointer"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                  <datalist id="ws-unit-list">
-                    {UNIT_OPTIONS.map((u) => (
-                      <option key={u} value={u} />
-                    ))}
-                  </datalist>
-                </div>
-              )}
-
-              <div className="flex items-center justify-end gap-2 pt-2">
+      <AnimatePresence>
+        {showModal && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 bg-stone-950/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto"
+          >
+            <motion.div
+              initial={{ opacity: 0, scale: 0.96, y: 10 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.96, y: 10 }}
+              transition={{ duration: 0.2 }}
+              className="bg-white border border-stone-200 rounded-2xl w-full max-w-xl p-5 sm:p-6 space-y-5 shadow-2xl my-8"
+            >
+              <div className="flex items-center justify-between">
+                <h2 className="font-display text-lg font-bold text-stone-900">
+                  {editingStation ? 'Editar puesto de trabajo' : 'Nuevo puesto de trabajo'}
+                </h2>
                 <button
                   type="button"
                   onClick={() => setShowModal(false)}
-                  className="px-4 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
+                  aria-label="Cerrar ventana"
+                  className="p-1.5 text-stone-400 hover:text-stone-700 rounded-lg cursor-pointer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {errorMsg && (
+                <div className="p-3 text-xs text-red-700 bg-red-50 border border-red-200 rounded-xl">
+                  {errorMsg}
+                </div>
+              )}
+
+              <form onSubmit={handleSubmit} className="space-y-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-semibold text-stone-700 mb-1">
+                      Nombre del puesto / sección
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      maxLength={MAX_NAME_LENGTH}
+                      value={name}
+                      onChange={(e) => setName(e.target.value)}
+                      placeholder="Ej: Jugos y Salchipapas"
+                      className="w-full min-h-[42px] px-3 py-2 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-stone-700 mb-1">
+                      Trabajadora encargada
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      maxLength={MAX_NAME_LENGTH}
+                      value={workerName}
+                      onChange={(e) => setWorkerName(e.target.value)}
+                      placeholder="Ej: Laura Gómez"
+                      className="w-full min-h-[42px] px-3 py-2 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-semibold text-stone-700 mb-1">
+                      Área del local (opcional)
+                    </label>
+                    <input
+                      type="text"
+                      maxLength={MAX_AREA_LENGTH}
+                      value={area}
+                      onChange={(e) => setArea(e.target.value)}
+                      placeholder="Ej: Barra y Freidora"
+                      className="w-full min-h-[42px] px-3 py-2 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-stone-700 mb-1">
+                      Descripción (opcional)
+                    </label>
+                    <input
+                      type="text"
+                      maxLength={MAX_DESC_LENGTH}
+                      value={description}
+                      onChange={(e) => setDescription(e.target.value)}
+                      placeholder="Ej: Control de pulpas, limones y papas"
+                      className="w-full min-h-[42px] px-3 py-2 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                    />
+                  </div>
+                </div>
+
+                {!editingStation && (
+                  <div className="pt-2 border-t border-stone-200 space-y-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-semibold text-stone-700">
+                        Insumos a registrar en este puesto
+                      </span>
+                      <button
+                        type="button"
+                        onClick={handleAddDraftItemRow}
+                        className="text-xs font-semibold text-orange-600 hover:text-orange-700 whitespace-nowrap cursor-pointer"
+                      >
+                        + Agregar otro insumo
+                      </button>
+                    </div>
+
+                    <div className="space-y-2.5 max-h-56 overflow-y-auto pr-1">
+                      {draftItems.map((row, idx) => (
+                        <div
+                          key={idx}
+                          className="p-2.5 sm:p-0 bg-stone-50 sm:bg-transparent border border-stone-200 sm:border-0 rounded-xl grid grid-cols-1 sm:grid-cols-12 gap-2 items-center"
+                        >
+                          <input
+                            type="text"
+                            maxLength={MAX_NAME_LENGTH}
+                            value={row.name}
+                            onChange={(e) => handleUpdateDraftItem(idx, 'name', e.target.value)}
+                            placeholder="Nombre del insumo"
+                            className="sm:col-span-5 px-2.5 py-2 text-xs bg-white border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500"
+                          />
+                          <div className="grid grid-cols-4 sm:contents gap-2 items-center">
+                            <input
+                              type="text"
+                              list="ws-unit-list"
+                              maxLength={MAX_UNIT_LENGTH}
+                              value={row.unit}
+                              onChange={(e) => handleUpdateDraftItem(idx, 'unit', e.target.value)}
+                              placeholder="und"
+                              aria-label="Unidad"
+                              className="sm:col-span-2 px-2 py-2 text-xs bg-white border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500"
+                            />
+                            <input
+                              type="number"
+                              min={0}
+                              value={row.minStock}
+                              onChange={(e) =>
+                                handleUpdateDraftItem(
+                                  idx,
+                                  'minStock',
+                                  parseFloat(e.target.value) || 0,
+                                )
+                              }
+                              title="Stock mínimo"
+                              placeholder="Mín"
+                              aria-label="Stock mínimo"
+                              className="sm:col-span-2 px-2 py-2 text-xs font-mono bg-white border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500"
+                            />
+                            <input
+                              type="number"
+                              min={0}
+                              value={row.targetStock}
+                              onChange={(e) =>
+                                handleUpdateDraftItem(
+                                  idx,
+                                  'targetStock',
+                                  parseFloat(e.target.value) || 0,
+                                )
+                              }
+                              title="Stock ideal"
+                              placeholder="Ideal"
+                              aria-label="Stock ideal"
+                              className="sm:col-span-2 px-2 py-2 text-xs font-mono bg-white border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveDraftItem(idx)}
+                              aria-label="Quitar fila"
+                              className="sm:col-span-1 p-2 flex items-center justify-center text-stone-400 hover:text-red-600 cursor-pointer"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                    <datalist id="ws-unit-list">
+                      {UNIT_OPTIONS.map((u) => (
+                        <option key={u} value={u} />
+                      ))}
+                    </datalist>
+                  </div>
+                )}
+
+                <div className="flex items-center justify-end gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowModal(false)}
+                    className="min-h-[42px] px-4 py-2 text-sm font-medium text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 cursor-pointer"
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={submitting}
+                    className="min-h-[42px] px-4 py-2 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 disabled:opacity-60 cursor-pointer"
+                  >
+                    {submitting
+                      ? 'Guardando...'
+                      : editingStation
+                        ? 'Guardar cambios'
+                        : 'Crear puesto y generar QR'}
+                  </button>
+                </div>
+              </form>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* QR Code Display & Print Modal */}
+      <AnimatePresence>
+        {qrStation && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 bg-stone-950/60 backdrop-blur-xs flex items-center justify-center p-4"
+          >
+            <motion.div
+              initial={{ opacity: 0, scale: 0.96, y: 10 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.96, y: 10 }}
+              transition={{ duration: 0.2 }}
+              className="bg-white border border-stone-200 rounded-2xl w-full max-w-md p-6 space-y-5 shadow-2xl text-center"
+            >
+              <div className="flex items-center justify-between no-print">
+                <span className="text-xs font-semibold text-orange-600">
+                  Acceso directo al puesto
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setQrStation(null)}
+                  aria-label="Cerrar código QR"
+                  className="p-1.5 text-stone-400 hover:text-stone-700 rounded-lg cursor-pointer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="space-y-2">
+                <img
+                  src="/assets/aistudio/IMG_1518_bd74972f.jpeg"
+                  alt="Logo The Fire"
+                  referrerPolicy="no-referrer"
+                  className="w-14 h-14 object-contain mx-auto rounded-xl border border-stone-200 p-1"
+                />
+                <h2 className="font-display text-xl font-bold text-stone-900">
+                  {qrStation.name}
+                </h2>
+                <p className="text-sm text-stone-600">
+                  Encargada:{' '}
+                  <span className="font-semibold text-stone-900">{qrStation.workerName}</span>
+                </p>
+              </div>
+
+              <div className="bg-white border border-stone-200 rounded-2xl p-4 inline-block mx-auto">
+                {qrDataUrl ? (
+                  <img
+                    src={qrDataUrl}
+                    alt={`Código QR para ${qrStation.name}`}
+                    className="w-52 h-52 sm:w-56 sm:h-56 mx-auto"
+                  />
+                ) : (
+                  <div className="w-52 h-52 sm:w-56 sm:h-56 flex items-center justify-center text-xs text-stone-400">
+                    Generando código QR...
+                  </div>
+                )}
+              </div>
+
+              <p className="text-xs text-stone-500 leading-relaxed">
+                Escanea este código QR desde el celular de la trabajadora o envíale el enlace para que registre su cierre cada día.
+              </p>
+
+              <div className="flex flex-wrap items-center justify-center gap-2 no-print">
+                <button
+                  type="button"
+                  onClick={handleDownloadQr}
+                  disabled={!qrDataUrl}
+                  className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-stone-950 rounded-xl hover:bg-stone-800 disabled:opacity-50 cursor-pointer"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  Descargar QR
+                </button>
+                <button
+                  type="button"
+                  onClick={() => window.print()}
+                  className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 cursor-pointer"
+                >
+                  <Printer className="w-3.5 h-3.5" />
+                  Imprimir
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleCopyLink(qrStation)}
+                  className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 cursor-pointer"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                  {copiedId === qrStation.id ? 'Copiado' : 'Copiar enlace'}
+                </button>
+              </div>
+
+              <div className="pt-3 border-t border-stone-100 flex justify-center no-print">
+                <button
+                  type="button"
+                  disabled={regenerating}
+                  onClick={handleRegenerate}
+                  className="inline-flex items-center gap-1.5 text-xs font-medium text-stone-500 hover:text-red-700 cursor-pointer"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${regenerating ? 'animate-spin' : ''}`} />
+                  {regenerating
+                    ? 'Regenerando...'
+                    : 'Regenerar enlace/QR (invalida el anterior)'}
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Confirm Delete Station */}
+      <AnimatePresence>
+        {confirmDelete && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-50 bg-stone-950/50 backdrop-blur-xs flex items-center justify-center p-4"
+          >
+            <motion.div
+              initial={{ opacity: 0, scale: 0.96 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.96 }}
+              className="bg-white border border-stone-200 rounded-2xl w-full max-w-sm p-6 space-y-4 shadow-2xl"
+            >
+              <h3 className="font-display text-lg font-bold text-stone-900">
+                Eliminar puesto de trabajo
+              </h3>
+              <p className="text-sm text-stone-600">
+                ¿Seguro que deseas eliminar{' '}
+                <span className="font-semibold text-stone-900">{confirmDelete.name}</span> y todos
+                sus insumos asignados? Su enlace y QR dejarán de funcionar.
+              </p>
+              <div className="flex items-center justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setConfirmDelete(null)}
+                  className="min-h-[40px] px-4 py-2 text-sm font-medium text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 cursor-pointer"
                 >
                   Cancelar
                 </button>
                 <button
-                  type="submit"
+                  type="button"
                   disabled={submitting}
-                  className="px-4 py-2 text-sm font-semibold text-white bg-teal-700 rounded-lg hover:bg-teal-800 disabled:opacity-60 cursor-pointer"
+                  onClick={handleDeleteStation}
+                  className="min-h-[40px] px-4 py-2 text-sm font-semibold text-white bg-red-600 rounded-xl hover:bg-red-700 disabled:opacity-60 cursor-pointer"
                 >
-                  {submitting
-                    ? 'Guardando...'
-                    : editingStation
-                      ? 'Guardar cambios'
-                      : 'Crear puesto y generar QR'}
+                  {submitting ? 'Eliminando...' : 'Eliminar puesto'}
                 </button>
               </div>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* QR Code Display & Print Modal */}
-      {qrStation && (
-        <div className="fixed inset-0 z-50 bg-slate-900/50 flex items-center justify-center p-4">
-          <div className="bg-white border border-slate-200 rounded-xl w-full max-w-md p-6 space-y-5 shadow-xl text-center">
-            <div className="flex items-center justify-between no-print">
-              <span className="text-xs font-semibold text-teal-700">Acceso directo al puesto</span>
-              <button
-                type="button"
-                onClick={() => setQrStation(null)}
-                className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg cursor-pointer"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <div className="space-y-2">
-              <img
-                src="/assets/aistudio/IMG_1518_bd74972f.jpeg"
-                alt="Logo The Fire"
-                referrerPolicy="no-referrer"
-                className="w-14 h-14 object-contain mx-auto rounded-lg border border-slate-200 p-1"
-              />
-              <h2 className="font-display text-xl font-bold text-slate-900">
-                {qrStation.name}
-              </h2>
-              <p className="text-sm text-slate-600">
-                Encargada: <span className="font-semibold text-slate-900">{qrStation.workerName}</span>
-              </p>
-            </div>
-
-            <div className="bg-white border border-slate-200 rounded-xl p-4 inline-block mx-auto">
-              {qrDataUrl ? (
-                <img
-                  src={qrDataUrl}
-                  alt={`Código QR para ${qrStation.name}`}
-                  className="w-56 h-56 mx-auto"
-                />
-              ) : (
-                <div className="w-56 h-56 flex items-center justify-center text-xs text-slate-400">
-                  Generando código QR...
-                </div>
-              )}
-            </div>
-
-            <p className="text-xs text-slate-500 leading-relaxed">
-              Escanea este código QR desde el celular de la trabajadora o envíale el enlace para que registre apertura y cierre cada día.
-            </p>
-
-            <div className="flex flex-wrap items-center justify-center gap-2 no-print">
-              <button
-                type="button"
-                onClick={handleDownloadQr}
-                disabled={!qrDataUrl}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-slate-900 rounded-lg hover:bg-slate-800 disabled:opacity-50 cursor-pointer"
-              >
-                <Download className="w-3.5 h-3.5" />
-                Descargar QR
-              </button>
-              <button
-                type="button"
-                onClick={() => window.print()}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
-              >
-                <Printer className="w-3.5 h-3.5" />
-                Imprimir
-              </button>
-              <button
-                type="button"
-                onClick={() => handleCopyLink(qrStation)}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
-              >
-                <Copy className="w-3.5 h-3.5" />
-                {copiedId === qrStation.id ? 'Copiado' : 'Copiar enlace'}
-              </button>
-            </div>
-
-            <div className="pt-3 border-t border-slate-100 flex justify-center no-print">
-              <button
-                type="button"
-                disabled={regenerating}
-                onClick={handleRegenerate}
-                className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-500 hover:text-red-700 cursor-pointer"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${regenerating ? 'animate-spin' : ''}`} />
-                {regenerating
-                  ? 'Regenerando...'
-                  : 'Regenerar enlace/QR (invalida el anterior)'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Confirm Delete Station */}
-      {confirmDelete && (
-        <div className="fixed inset-0 z-50 bg-slate-900/40 flex items-center justify-center p-4">
-          <div className="bg-white border border-slate-200 rounded-xl w-full max-w-sm p-6 space-y-4 shadow-xl">
-            <h3 className="font-display text-lg font-bold text-slate-900">
-              Eliminar puesto de trabajo
-            </h3>
-            <p className="text-sm text-slate-600">
-              ¿Seguro que deseas eliminar <span className="font-semibold text-slate-900">{confirmDelete.name}</span> y todos sus insumos asignados? Su enlace y QR dejarán de funcionar.
-            </p>
-            <div className="flex items-center justify-end gap-2 pt-1">
-              <button
-                type="button"
-                onClick={() => setConfirmDelete(null)}
-                className="px-4 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 cursor-pointer"
-              >
-                Cancelar
-              </button>
-              <button
-                type="button"
-                disabled={submitting}
-                onClick={handleDeleteStation}
-                className="px-4 py-2 text-sm font-semibold text-white bg-red-600 rounded-lg hover:bg-red-700 disabled:opacity-60 cursor-pointer"
-              >
-                {submitting ? 'Eliminando...' : 'Eliminar puesto'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

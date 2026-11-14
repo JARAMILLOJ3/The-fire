@@ -86,10 +86,11 @@ service cloud.firestore {
 
     function isValidWorkspace(data) {
       return data.keys().hasAll(['name', 'ownerUid', 'ownerEmail', 'authorizedEmails', 'seeded', 'createdAt', 'updatedAt'])
-        && data.keys().hasOnly(['name', 'ownerUid', 'ownerEmail', 'authorizedEmails', 'seeded', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['name', 'ownerUid', 'ownerEmail', 'ownerName', 'authorizedEmails', 'seeded', 'createdAt', 'updatedAt'])
         && data.name is string && data.name.size() >= 2 && data.name.size() <= 80
         && isValidId(data.ownerUid)
         && data.ownerEmail is string && data.ownerEmail.size() >= 3 && data.ownerEmail.size() <= 120
+        && (!('ownerName' in data) || (data.ownerName is string && data.ownerName.size() >= 1 && data.ownerName.size() <= 80))
         && isValidEmailList(data.authorizedEmails)
         && data.seeded is bool
         && data.createdAt is timestamp
@@ -289,7 +290,7 @@ service cloud.firestore {
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && canManageWorkspace(workspaceId)
-        && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'authorizedEmails', 'seeded', 'updatedAt']);
+        && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'ownerName', 'authorizedEmails', 'seeded', 'updatedAt']);
 
       allow delete: if false;
     }

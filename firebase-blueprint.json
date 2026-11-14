@@ -21,6 +21,12 @@
           "format": "email",
           "maxLength": 120
         },
+        "ownerName": {
+          "type": "string",
+          "description": "Nombre personalizado del jefe para darle la bienvenida",
+          "minLength": 1,
+          "maxLength": 80
+        },
         "authorizedEmails": {
           "type": "array",
           "description": "Correos autorizados para acceder al restaurante (máximo 15)"

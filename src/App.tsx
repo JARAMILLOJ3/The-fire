@@ -1,6 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth';
+import {
+  getRedirectResult,
+  onAuthStateChanged,
+  signInWithPopup,
+  signInWithRedirect,
+  signOut,
+  type User,
+} from 'firebase/auth';
 import { collection, doc, onSnapshot, query, where } from 'firebase/firestore';
+import { AnimatePresence, motion, MotionConfig } from 'motion/react';
 import {
   Calendar,
   Citrus,
@@ -18,6 +26,7 @@ import {
 } from 'lucide-react';
 import { AuthScreen } from './components/AuthScreen';
 import { BossDashboard } from './components/BossDashboard';
+import { BossWelcomeModal } from './components/BossWelcomeModal';
 import { BrandLogo } from './components/BrandLogo';
 import { CatalogManager } from './components/CatalogManager';
 import { StationShiftView } from './components/StationShiftView';
@@ -70,6 +79,28 @@ function normalizeStation(raw: string): StationId {
 function normalizeTeamRole(raw: string): TeamStationId {
   if (raw === 'jefe') return 'jefe';
   return normalizeStation(raw);
+}
+
+function formatGoogleAuthError(error: unknown): string {
+  const code = (error as { code?: string } | null)?.code ?? '';
+  const host = typeof window !== 'undefined' ? window.location.hostname : '';
+  switch (code) {
+    case 'auth/unauthorized-domain':
+      return `El dominio "${host}" aún no está autorizado en Firebase. Agrégalo en Firebase Console → Authentication → Settings → Authorized domains.`;
+    case 'auth/popup-blocked':
+      return 'Tu navegador bloqueó la ventana emergente de Google. Permite ventanas emergentes o abre la app en Chrome o Safari.';
+    case 'auth/popup-closed-by-user':
+    case 'auth/cancelled-popup-request':
+      return 'Se cerró la ventana de Google antes de completar el ingreso. Intenta nuevamente.';
+    case 'auth/network-request-failed':
+      return 'Error de conexión con Google. Verifica tu internet e intenta de nuevo.';
+    case 'auth/operation-not-allowed':
+      return 'El inicio de sesión con Google no está habilitado en Firebase Authentication.';
+    default:
+      return code
+        ? `No se pudo iniciar sesión con Google (${code}).`
+        : 'No se pudo completar el inicio de sesión con Google.';
+  }
 }
 
 interface WorkerFallbackState {
@@ -151,6 +182,12 @@ export default function App() {
         setWorkerFallback(null);
       }
     });
+
+    getRedirectResult(auth).catch((error) => {
+      console.error('Redirect auth error:', error);
+      setAuthError(formatGoogleAuthError(error));
+    });
+
     return () => unsub();
   }, []);
 
@@ -373,7 +410,17 @@ export default function App() {
     if (!hasStationViaQuery || !hasItemsViaQuery) {
       refreshWorkerFallback();
     }
-  }, [canManage, workspace?.id, role, stationsLoaded, itemsLoaded, stations, items, selectedDate, refreshWorkerFallback]);
+  }, [
+    canManage,
+    workspace?.id,
+    role,
+    stationsLoaded,
+    itemsLoaded,
+    stations,
+    items,
+    selectedDate,
+    refreshWorkerFallback,
+  ]);
 
   const effectiveStations = useMemo(() => {
     if (stations.length > 0) return stations;
@@ -558,8 +605,27 @@ export default function App() {
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (error) {
-      console.error(error);
-      setAuthError('No se pudo completar el inicio de sesión con Google.');
+      console.error('Google Sign-In error:', error);
+      const code = (error as { code?: string } | null)?.code ?? '';
+      const isStandaloneWindow =
+        typeof window !== 'undefined' && window.self === window.top;
+
+      if (
+        isStandaloneWindow &&
+        (code === 'auth/popup-blocked' ||
+          code === 'auth/operation-not-supported-in-this-environment')
+      ) {
+        try {
+          await signInWithRedirect(auth, googleProvider);
+          return;
+        } catch (redirectError) {
+          console.error('Google Redirect Sign-In error:', redirectError);
+          setAuthError(formatGoogleAuthError(redirectError));
+          return;
+        }
+      }
+
+      setAuthError(formatGoogleAuthError(error));
     } finally {
       setAuthLoading(false);
     }
@@ -571,49 +637,59 @@ export default function App() {
 
   if (!authReady) {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
-        <div className="text-sm font-medium text-slate-600">Iniciando The Fire Inventario...</div>
-      </div>
+      <MotionConfig reducedMotion="user">
+        <div className="min-h-screen bg-stone-50 flex items-center justify-center p-6">
+          <div className="flex items-center gap-3 text-sm font-medium text-stone-600">
+            <Flame className="w-5 h-5 text-orange-600 animate-pulse" />
+            <span>Iniciando The Fire Inventario...</span>
+          </div>
+        </div>
+      </MotionConfig>
     );
   }
 
   if (!user) {
     return (
-      <AuthScreen
-        onSignIn={handleSignIn}
-        loading={authLoading}
-        errorMessage={authError}
-        pendingLink={pendingLink}
-        hasLinkParams={Boolean(linkParams.accessCode)}
-      />
+      <MotionConfig reducedMotion="user">
+        <AuthScreen
+          onSignIn={handleSignIn}
+          loading={authLoading}
+          errorMessage={authError}
+          pendingLink={pendingLink}
+          hasLinkParams={Boolean(linkParams.accessCode)}
+        />
+      </MotionConfig>
     );
   }
 
   if (sessionLoading || !workspace) {
     return (
-      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-6 gap-4">
-        {sessionError ? (
-          <div className="max-w-md bg-white border border-red-200 rounded-xl p-6 text-center space-y-4">
-            <p className="text-sm text-red-700">{sessionError}</p>
-            <button
-              type="button"
-              onClick={handleSignOut}
-              className="px-4 py-2 text-sm font-semibold text-white bg-slate-900 rounded-lg cursor-pointer"
-            >
-              Cerrar sesión
-            </button>
-          </div>
-        ) : (
-          <div className="w-full max-w-md space-y-3">
-            <div className="h-5 w-40 bg-slate-200 rounded animate-pulse mx-auto" />
-            <div className="h-3 w-64 bg-slate-200 rounded animate-pulse mx-auto" />
-          </div>
-        )}
-      </div>
+      <MotionConfig reducedMotion="user">
+        <div className="min-h-screen bg-stone-50 flex flex-col items-center justify-center p-6 gap-4">
+          {sessionError ? (
+            <div className="max-w-md bg-white border border-red-200 rounded-2xl p-6 text-center space-y-4">
+              <p className="text-sm text-red-700">{sessionError}</p>
+              <button
+                type="button"
+                onClick={handleSignOut}
+                className="px-4 py-2 text-sm font-semibold text-white bg-stone-950 rounded-xl cursor-pointer"
+              >
+                Cerrar sesión
+              </button>
+            </div>
+          ) : (
+            <div className="w-full max-w-md space-y-3">
+              <div className="h-5 w-44 bg-stone-200 rounded-lg animate-pulse mx-auto" />
+              <div className="h-3 w-64 bg-stone-200 rounded-lg animate-pulse mx-auto" />
+            </div>
+          )}
+        </div>
+      </MotionConfig>
     );
   }
 
   const dataLoading = !stationsLoaded || !itemsLoaded;
+  const needsOwnerNameOnboarding = canManage && !workspace.ownerName?.trim();
 
   const handleSelectDate = (nextDate: string) => {
     if (!nextDate) return;
@@ -631,37 +707,44 @@ export default function App() {
 
   const sectionBreadcrumb =
     activeSection === 'jefe'
-      ? 'Panel del Jefe'
+      ? 'Resumen y Compras'
       : activeSection === 'puestos'
-        ? 'Puestos de Trabajo y QR'
+        ? 'Puestos y QR'
         : activeSection === 'catalogo'
-          ? 'Catálogo de Insumos'
+          ? 'Catálogo'
           : activeSection === 'equipo'
-            ? 'Equipo y Accesos'
-            : currentStation?.name ?? 'Puesto de trabajo';
+            ? 'Equipo'
+            : currentStation?.name ?? 'Puesto';
 
   const navigateTo = (section: ActiveSection) => {
     setActiveSection(section);
     setMobileNavOpen(false);
   };
 
+  const displayAccountName =
+    canManage && workspace.ownerName?.trim()
+      ? workspace.ownerName.trim()
+      : user.displayName || user.email;
+
   const sidebarContent = (
-    <div className="flex flex-col h-full bg-white border-r border-slate-200">
-      <div className="px-5 py-4 border-b border-slate-200">
-        <BrandLogo subtitle={workspace.name} size="sm" />
+    <div className="flex flex-col h-full bg-stone-950 text-stone-100 border-r border-stone-800/80">
+      <div className="px-5 py-4 border-b border-stone-800/80">
+        <BrandLogo subtitle={workspace.name} size="sm" theme="dark" />
       </div>
 
       <nav className="flex-1 px-3 py-4 space-y-6 overflow-y-auto">
         {canManage && (
           <div className="space-y-1">
-            <p className="px-3 text-xs font-semibold text-slate-500 mb-1.5">Dirección</p>
+            <p className="px-3 text-[11px] font-semibold uppercase tracking-wider text-stone-500 mb-1.5">
+              Dirección
+            </p>
             <button
               type="button"
               onClick={() => navigateTo('jefe')}
-              className={`w-full min-h-[44px] flex items-center gap-2.5 px-3 py-2.5 text-sm font-medium rounded-lg transition-colors cursor-pointer ${
+              className={`w-full min-h-[44px] flex items-center gap-2.5 px-3 py-2.5 text-sm font-medium rounded-xl transition-colors cursor-pointer ${
                 activeSection === 'jefe'
-                  ? 'bg-teal-50 text-teal-800 font-semibold'
-                  : 'text-slate-800 hover:bg-slate-100'
+                  ? 'bg-orange-600/15 text-orange-400 font-semibold'
+                  : 'text-stone-300 hover:bg-stone-900 hover:text-white'
               }`}
             >
               <LayoutDashboard className="w-4 h-4 shrink-0" />
@@ -671,7 +754,7 @@ export default function App() {
         )}
 
         <div className="space-y-1">
-          <p className="px-3 text-xs font-semibold text-slate-500 mb-1.5">
+          <p className="px-3 text-[11px] font-semibold uppercase tracking-wider text-stone-500 mb-1.5">
             Puestos de trabajo
           </p>
           {visibleStations.map((st) => {
@@ -682,17 +765,25 @@ export default function App() {
                 key={st.id}
                 type="button"
                 onClick={() => navigateTo(st.id)}
-                className={`w-full min-h-[44px] flex items-center justify-between gap-2 px-3 py-2.5 text-sm font-medium rounded-lg transition-colors cursor-pointer ${
+                className={`w-full min-h-[44px] flex items-center justify-between gap-2 px-3 py-2.5 text-sm font-medium rounded-xl transition-colors cursor-pointer ${
                   activeSection === st.id
-                    ? 'bg-teal-50 text-teal-800 font-semibold'
-                    : 'text-slate-800 hover:bg-slate-100'
+                    ? 'bg-orange-600/15 text-orange-400 font-semibold'
+                    : 'text-stone-300 hover:bg-stone-900 hover:text-white'
                 }`}
               >
                 <span className="flex items-center gap-2.5 min-w-0">
                   <Icon className="w-4 h-4 shrink-0" />
                   <span className="truncate">{st.name}</span>
                 </span>
-                <span className="text-xs font-mono text-slate-500 shrink-0">
+                <span
+                  className={`text-xs font-mono shrink-0 ${
+                    rep?.status === 'completed'
+                      ? 'text-emerald-400'
+                      : rep?.status === 'opening_saved'
+                        ? 'text-amber-400'
+                        : 'text-stone-500'
+                  }`}
+                >
                   {rep?.status === 'completed'
                     ? 'Listo'
                     : rep?.status === 'opening_saved'
@@ -706,16 +797,16 @@ export default function App() {
 
         {canManage && (
           <div className="space-y-1">
-            <p className="px-3 text-xs font-semibold text-slate-500 mb-1.5">
+            <p className="px-3 text-[11px] font-semibold uppercase tracking-wider text-stone-500 mb-1.5">
               Administración
             </p>
             <button
               type="button"
               onClick={() => navigateTo('puestos')}
-              className={`w-full min-h-[44px] flex items-center gap-2.5 px-3 py-2.5 text-sm font-medium rounded-lg transition-colors cursor-pointer ${
+              className={`w-full min-h-[44px] flex items-center gap-2.5 px-3 py-2.5 text-sm font-medium rounded-xl transition-colors cursor-pointer ${
                 activeSection === 'puestos'
-                  ? 'bg-teal-50 text-teal-800 font-semibold'
-                  : 'text-slate-800 hover:bg-slate-100'
+                  ? 'bg-orange-600/15 text-orange-400 font-semibold'
+                  : 'text-stone-300 hover:bg-stone-900 hover:text-white'
               }`}
             >
               <QrCode className="w-4 h-4 shrink-0" />
@@ -727,10 +818,10 @@ export default function App() {
                 setCatalogFilterStation('all');
                 navigateTo('catalogo');
               }}
-              className={`w-full min-h-[44px] flex items-center gap-2.5 px-3 py-2.5 text-sm font-medium rounded-lg transition-colors cursor-pointer ${
+              className={`w-full min-h-[44px] flex items-center gap-2.5 px-3 py-2.5 text-sm font-medium rounded-xl transition-colors cursor-pointer ${
                 activeSection === 'catalogo'
-                  ? 'bg-teal-50 text-teal-800 font-semibold'
-                  : 'text-slate-800 hover:bg-slate-100'
+                  ? 'bg-orange-600/15 text-orange-400 font-semibold'
+                  : 'text-stone-300 hover:bg-stone-900 hover:text-white'
               }`}
             >
               <Package className="w-4 h-4 shrink-0" />
@@ -739,25 +830,23 @@ export default function App() {
             <button
               type="button"
               onClick={() => navigateTo('equipo')}
-              className={`w-full min-h-[44px] flex items-center gap-2.5 px-3 py-2.5 text-sm font-medium rounded-lg transition-colors cursor-pointer ${
+              className={`w-full min-h-[44px] flex items-center gap-2.5 px-3 py-2.5 text-sm font-medium rounded-xl transition-colors cursor-pointer ${
                 activeSection === 'equipo'
-                  ? 'bg-teal-50 text-teal-800 font-semibold'
-                  : 'text-slate-800 hover:bg-slate-100'
+                  ? 'bg-orange-600/15 text-orange-400 font-semibold'
+                  : 'text-stone-300 hover:bg-stone-900 hover:text-white'
               }`}
             >
               <Users className="w-4 h-4 shrink-0" />
-              <span className="truncate">Equipo y Accesos</span>
+              <span className="truncate">Equipo y Perfil</span>
             </button>
           </div>
         )}
       </nav>
 
-      <div className="p-4 border-t border-slate-200 space-y-3">
+      <div className="p-4 border-t border-stone-800/80 space-y-3">
         <div className="min-w-0">
-          <p className="text-sm font-semibold text-slate-900 truncate">
-            {user.displayName || user.email}
-          </p>
-          <p className="text-xs text-slate-500 truncate">
+          <p className="text-sm font-semibold text-white truncate">{displayAccountName}</p>
+          <p className="text-xs text-stone-400 truncate">
             {canManage
               ? 'Jefe / Administrador'
               : currentStation?.name ?? 'Trabajadora de puesto'}
@@ -766,7 +855,7 @@ export default function App() {
         <button
           type="button"
           onClick={handleSignOut}
-          className="w-full inline-flex items-center justify-center gap-2 px-3 py-2 text-xs font-semibold text-slate-700 bg-slate-100 rounded-lg hover:bg-slate-200 transition-colors cursor-pointer"
+          className="w-full min-h-[38px] inline-flex items-center justify-center gap-2 px-3 py-2 text-xs font-semibold text-stone-200 bg-stone-900 border border-stone-800 rounded-xl hover:bg-stone-800 transition-colors cursor-pointer"
         >
           <LogOut className="w-3.5 h-3.5" />
           Cerrar sesión
@@ -776,196 +865,230 @@ export default function App() {
   );
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 flex">
-      {/* Desktop Sidebar */}
-      <aside className="hidden lg:block w-64 shrink-0 sticky top-0 h-screen no-print">
-        {sidebarContent}
-      </aside>
+    <MotionConfig reducedMotion="user">
+      <div className="min-h-screen overflow-x-hidden bg-stone-50 text-stone-900 flex">
+        {/* Desktop Sidebar */}
+        <aside className="hidden lg:block w-64 shrink-0 sticky top-0 h-screen no-print">
+          {sidebarContent}
+        </aside>
 
-      {/* Mobile Drawer */}
-      {mobileNavOpen && (
-        <div className="fixed inset-0 z-50 lg:hidden flex no-print">
-          <div
-            className="fixed inset-0 bg-slate-900/40"
-            onClick={() => setMobileNavOpen(false)}
-          />
-          <div className="relative w-72 max-w-[85vw] h-full z-10">
-            <button
-              type="button"
-              onClick={() => setMobileNavOpen(false)}
-              aria-label="Cerrar menú"
-              className="absolute top-4 right-3 p-1.5 text-slate-500 hover:text-slate-900 rounded-lg cursor-pointer"
-            >
-              <X className="w-5 h-5" />
-            </button>
-            {sidebarContent}
-          </div>
-        </div>
-      )}
-
-      {/* Main Content Area */}
-      <div className="flex-1 min-w-0 flex flex-col">
-        {/* Top Header */}
-        <header className="sticky top-0 z-30 bg-white border-b border-slate-200 px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4 no-print">
-          <div className="flex items-center gap-3 min-w-0">
-            <button
-              type="button"
-              onClick={() => setMobileNavOpen(true)}
-              aria-label="Abrir navegación"
-              className="lg:hidden p-2 -ml-2 text-slate-600 hover:text-slate-900 rounded-lg cursor-pointer"
-            >
-              <Menu className="w-5 h-5" />
-            </button>
-            <div className="flex items-center gap-2 text-sm min-w-0">
-              <span className="text-slate-400 hidden sm:inline whitespace-nowrap">
-                {workspace.name}
-              </span>
-              <span className="text-slate-300 hidden sm:inline">/</span>
-              <span className="font-semibold text-slate-900 truncate">
-                {sectionBreadcrumb}
-              </span>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-            <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
-              <button
-                type="button"
-                onClick={() => handleSelectDate(yesterdayStr)}
-                className={`min-h-[34px] px-2.5 py-1 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                  selectedDate === yesterdayStr
-                    ? 'bg-white text-slate-900 shadow-sm'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                Ayer
-              </button>
-              <button
-                type="button"
-                onClick={() => handleSelectDate(todayStr)}
-                className={`min-h-[34px] px-2.5 py-1 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                  selectedDate === todayStr
-                    ? 'bg-white text-slate-900 shadow-sm'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                Hoy
-              </button>
-            </div>
-
-            <div className="relative flex items-center">
-              <Calendar className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-slate-500 absolute left-2 sm:left-2.5 pointer-events-none" />
-              <input
-                type="date"
-                aria-label="Seleccionar fecha del reporte"
-                value={selectedDate}
-                onChange={(e) => e.target.value && handleSelectDate(e.target.value)}
-                className="min-h-[38px] pl-7 sm:pl-8 pr-1.5 sm:pr-2.5 py-1 text-xs sm:text-sm font-mono tabular-nums bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600 w-[114px] sm:w-auto"
+        {/* Mobile Drawer */}
+        <AnimatePresence>
+          {mobileNavOpen && (
+            <div className="fixed inset-0 z-50 lg:hidden flex no-print">
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.2 }}
+                className="fixed inset-0 bg-stone-950/60 backdrop-blur-xs"
+                onClick={() => setMobileNavOpen(false)}
               />
-            </div>
-          </div>
-        </header>
-
-        {/* Workspace Viewport */}
-        <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-5 sm:py-8">
-          {dataLoading ? (
-            <div className="space-y-4">
-              <div className="h-8 w-64 bg-slate-200 rounded animate-pulse" />
-              <div className="h-28 w-full bg-white border border-slate-200 rounded-xl animate-pulse" />
-              <div className="h-64 w-full bg-white border border-slate-200 rounded-xl animate-pulse" />
-            </div>
-          ) : activeSection === 'jefe' && canManage ? (
-            <BossDashboard
-              workspaceName={workspace.name}
-              selectedDate={selectedDate}
-              todayStr={todayStr}
-              yesterdayStr={yesterdayStr}
-              yesterdayHasReports={yesterdayHasReports}
-              autoSelectedYesterday={autoSelectedYesterday}
-              stations={effectiveStations}
-              items={effectiveItems}
-              reportsByStation={reportsForSelectedDate}
-              entriesByItemId={consolidatedEntriesByItemId}
-              onSelectDate={handleSelectDate}
-              onOpenStation={(stId) => navigateTo(stId)}
-              onGoToWorkstations={() => navigateTo('puestos')}
-              onGoToCatalog={() => {
-                setCatalogFilterStation('all');
-                navigateTo('catalogo');
-              }}
-            />
-          ) : activeSection === 'puestos' && canManage ? (
-            <WorkstationsManager
-              workspace={workspace}
-              stations={effectiveStations}
-              items={effectiveItems}
-              onOpenStationSheet={(stId) => navigateTo(stId)}
-              onOpenStationCatalog={(stId) => {
-                setCatalogFilterStation(stId);
-                navigateTo('catalogo');
-              }}
-            />
-          ) : activeSection === 'catalogo' && canManage ? (
-            <CatalogManager
-              workspace={workspace}
-              stations={effectiveStations}
-              items={effectiveItems}
-              initialFilterStation={catalogFilterStation}
-            />
-          ) : activeSection === 'equipo' && canManage ? (
-            <TeamManager
-              workspace={workspace}
-              stations={effectiveStations}
-              items={effectiveItems}
-              todayReports={Object.values(reportsForSelectedDate).filter(
-                (r): r is DailyReport => Boolean(r),
-              )}
-              todayEntries={todayAllEntries}
-              invites={invites}
-              members={members}
-            />
-          ) : currentStation ? (
-            <StationShiftView
-              workspace={workspace}
-              user={user}
-              canManage={canManage}
-              station={currentStation}
-              selectedDate={selectedDate}
-              items={effectiveItems}
-              report={reportsForSelectedDate[currentStation.id]}
-              entriesByItemId={
-                effectiveEntriesByReportId[reportsForSelectedDate[currentStation.id]?.id ?? ''] ??
-                {}
-              }
-              onSaved={() => {
-                if (!canManage) {
-                  refreshWorkerFallback();
-                }
-              }}
-            />
-          ) : (
-            <div className="bg-white border border-slate-200 rounded-xl p-10 text-center space-y-3">
-              <p className="font-display text-lg font-semibold text-slate-900">
-                No hay puestos de trabajo disponibles
-              </p>
-              <p className="text-sm text-slate-600 max-w-md mx-auto">
-                {canManage
-                  ? 'Crea un puesto de trabajo para comenzar a gestionar los insumos y generar su código QR.'
-                  : 'Solicita al jefe que te comparta el enlace o código QR de tu puesto de trabajo.'}
-              </p>
-              {canManage && (
+              <motion.div
+                initial={{ x: '-100%' }}
+                animate={{ x: 0 }}
+                exit={{ x: '-100%' }}
+                transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }}
+                className="relative w-72 max-w-[85vw] h-full z-10"
+              >
                 <button
                   type="button"
-                  onClick={() => navigateTo('puestos')}
-                  className="px-4 py-2 text-sm font-semibold text-white bg-teal-700 rounded-lg hover:bg-teal-800 cursor-pointer"
+                  onClick={() => setMobileNavOpen(false)}
+                  aria-label="Cerrar menú"
+                  className="absolute top-4 right-3 z-20 p-1.5 text-stone-400 hover:text-white rounded-lg cursor-pointer"
                 >
-                  Ir a Puestos de Trabajo
+                  <X className="w-5 h-5" />
                 </button>
-              )}
+                {sidebarContent}
+              </motion.div>
             </div>
           )}
-        </main>
+        </AnimatePresence>
+
+        {/* Main Content Area */}
+        <div className="flex-1 min-w-0 flex flex-col">
+          {/* Top Header */}
+          <header className="sticky top-0 z-30 bg-white/95 backdrop-blur-xs border-b border-stone-200 px-3.5 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-2 sm:gap-4 no-print">
+            <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+              <button
+                type="button"
+                onClick={() => setMobileNavOpen(true)}
+                aria-label="Abrir navegación"
+                className="lg:hidden p-2 -ml-1 text-stone-600 hover:text-stone-900 rounded-xl shrink-0 cursor-pointer"
+              >
+                <Menu className="w-5 h-5" />
+              </button>
+              <div className="flex items-center gap-2 text-sm min-w-0">
+                <span className="text-stone-400 hidden sm:inline whitespace-nowrap">
+                  {workspace.name}
+                </span>
+                <span className="text-stone-300 hidden sm:inline">/</span>
+                <span className="font-semibold text-stone-900 truncate">
+                  {sectionBreadcrumb}
+                </span>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+              <div className="flex items-center gap-0.5 p-0.5 sm:p-1 bg-stone-100 rounded-xl">
+                <button
+                  type="button"
+                  onClick={() => handleSelectDate(yesterdayStr)}
+                  className={`min-h-[32px] px-2 sm:px-2.5 py-1 text-xs font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+                    selectedDate === yesterdayStr
+                      ? 'bg-white text-stone-900 shadow-sm'
+                      : 'text-stone-600 hover:text-stone-900'
+                  }`}
+                >
+                  Ayer
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleSelectDate(todayStr)}
+                  className={`min-h-[32px] px-2 sm:px-2.5 py-1 text-xs font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+                    selectedDate === todayStr
+                      ? 'bg-white text-stone-900 shadow-sm'
+                      : 'text-stone-600 hover:text-stone-900'
+                  }`}
+                >
+                  Hoy
+                </button>
+              </div>
+
+              <div className="relative flex items-center">
+                <Calendar className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-stone-500 absolute left-2 sm:left-2.5 pointer-events-none" />
+                <input
+                  type="date"
+                  aria-label="Seleccionar fecha del reporte"
+                  value={selectedDate}
+                  onChange={(e) => e.target.value && handleSelectDate(e.target.value)}
+                  className="min-h-[36px] pl-7 sm:pl-8 pr-1.5 sm:pr-2.5 py-1 text-xs sm:text-sm font-mono tabular-nums bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 w-[112px] sm:w-auto"
+                />
+              </div>
+            </div>
+          </header>
+
+          {/* Workspace Viewport */}
+          <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-5 sm:py-8 min-w-0">
+            {dataLoading ? (
+              <div className="space-y-4">
+                <div className="h-8 w-64 bg-stone-200 rounded-xl animate-pulse" />
+                <div className="h-28 w-full bg-white border border-stone-200 rounded-2xl animate-pulse" />
+                <div className="h-64 w-full bg-white border border-stone-200 rounded-2xl animate-pulse" />
+              </div>
+            ) : (
+              <AnimatePresence mode="wait">
+                <motion.div
+                  key={activeSection}
+                  initial={{ opacity: 0, y: 8 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -4 }}
+                  transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+                  className="min-w-0"
+                >
+                  {activeSection === 'jefe' && canManage ? (
+                    <BossDashboard
+                      workspaceName={workspace.name}
+                      ownerName={workspace.ownerName}
+                      selectedDate={selectedDate}
+                      todayStr={todayStr}
+                      yesterdayStr={yesterdayStr}
+                      yesterdayHasReports={yesterdayHasReports}
+                      autoSelectedYesterday={autoSelectedYesterday}
+                      stations={effectiveStations}
+                      items={effectiveItems}
+                      reportsByStation={reportsForSelectedDate}
+                      entriesByItemId={consolidatedEntriesByItemId}
+                      onSelectDate={handleSelectDate}
+                      onOpenStation={(stId) => navigateTo(stId)}
+                      onGoToWorkstations={() => navigateTo('puestos')}
+                      onGoToCatalog={() => {
+                        setCatalogFilterStation('all');
+                        navigateTo('catalogo');
+                      }}
+                    />
+                  ) : activeSection === 'puestos' && canManage ? (
+                    <WorkstationsManager
+                      workspace={workspace}
+                      stations={effectiveStations}
+                      items={effectiveItems}
+                      onOpenStationSheet={(stId) => navigateTo(stId)}
+                      onOpenStationCatalog={(stId) => {
+                        setCatalogFilterStation(stId);
+                        navigateTo('catalogo');
+                      }}
+                    />
+                  ) : activeSection === 'catalogo' && canManage ? (
+                    <CatalogManager
+                      workspace={workspace}
+                      stations={effectiveStations}
+                      items={effectiveItems}
+                      initialFilterStation={catalogFilterStation}
+                    />
+                  ) : activeSection === 'equipo' && canManage ? (
+                    <TeamManager
+                      workspace={workspace}
+                      stations={effectiveStations}
+                      items={effectiveItems}
+                      todayReports={Object.values(reportsForSelectedDate).filter(
+                        (r): r is DailyReport => Boolean(r),
+                      )}
+                      todayEntries={todayAllEntries}
+                      invites={invites}
+                      members={members}
+                    />
+                  ) : currentStation ? (
+                    <StationShiftView
+                      workspace={workspace}
+                      user={user}
+                      canManage={canManage}
+                      station={currentStation}
+                      selectedDate={selectedDate}
+                      items={effectiveItems}
+                      report={reportsForSelectedDate[currentStation.id]}
+                      entriesByItemId={
+                        effectiveEntriesByReportId[
+                          reportsForSelectedDate[currentStation.id]?.id ?? ''
+                        ] ?? {}
+                      }
+                      onSaved={() => {
+                        if (!canManage) {
+                          refreshWorkerFallback();
+                        }
+                      }}
+                    />
+                  ) : (
+                    <div className="bg-white border border-stone-200 rounded-2xl p-10 text-center space-y-3">
+                      <p className="font-display text-lg font-semibold text-stone-900">
+                        No hay puestos de trabajo disponibles
+                      </p>
+                      <p className="text-sm text-stone-600 max-w-md mx-auto">
+                        {canManage
+                          ? 'Crea un puesto de trabajo para comenzar a gestionar los insumos y generar su código QR.'
+                          : 'Solicita al jefe que te comparta el enlace o código QR de tu puesto de trabajo.'}
+                      </p>
+                      {canManage && (
+                        <button
+                          type="button"
+                          onClick={() => navigateTo('puestos')}
+                          className="min-h-[42px] px-4 py-2 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 cursor-pointer"
+                        >
+                          Ir a Puestos de Trabajo
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </motion.div>
+              </AnimatePresence>
+            )}
+          </main>
+        </div>
+
+        {/* First-Time Boss Onboarding Name Prompt */}
+        {needsOwnerNameOnboarding && (
+          <BossWelcomeModal workspace={workspace} suggestedName={user.displayName} />
+        )}
       </div>
-    </div>
+    </MotionConfig>
   );
 }

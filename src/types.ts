@@ -8,6 +8,7 @@ export type StockLevel = 'agotado' | 'comprar' | 'medio' | 'suficiente';
 export interface Workspace {
   id: string;
   name: string;
+  ownerName?: string;
   ownerUid: string;
   ownerEmail: string;
   authorizedEmails: string[];
