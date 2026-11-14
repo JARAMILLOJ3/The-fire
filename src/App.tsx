@@ -59,6 +59,8 @@ import { resolveWorkerScheduleStatus } from './utils/schedule';
 
 type ActiveSection = 'jefe' | 'puestos' | 'catalogo' | 'equipo' | StationId;
 
+const EMPTY_ENTRIES: Record<string, DailyReportEntry> = {};
+
 function getStationIcon(stationId: string) {
   switch (stationId) {
     case 'mesera':
@@ -624,6 +626,37 @@ export default function App() {
     [allReports, yesterdayStr],
   );
 
+  const visibleStations = useMemo(
+    () =>
+      canManage
+        ? effectiveStations
+        : effectiveStations.filter((st) => st.id === role),
+    [canManage, effectiveStations, role],
+  );
+
+  const currentStation = useMemo(
+    () => effectiveStations.find((st) => st.id === activeSection) ?? visibleStations[0] ?? null,
+    [effectiveStations, activeSection, visibleStations],
+  );
+
+  const currentStationReportId = currentStation
+    ? reportsForSelectedDate[currentStation.id]?.id ?? ''
+    : '';
+
+  const currentStationEntries = useMemo(
+    () =>
+      currentStationReportId
+        ? effectiveEntriesByReportId[currentStationReportId] ?? EMPTY_ENTRIES
+        : EMPTY_ENTRIES,
+    [currentStationReportId, effectiveEntriesByReportId],
+  );
+
+  const handleStationSaved = useCallback(() => {
+    if (!canManage) {
+      void refreshWorkerFallback();
+    }
+  }, [canManage, refreshWorkerFallback]);
+
   const handleSignIn = async () => {
     setAuthLoading(true);
     setAuthError(null);
@@ -722,13 +755,6 @@ export default function App() {
     setAutoSelectedYesterday(false);
     setSelectedDate(nextDate);
   };
-
-  const visibleStations = canManage
-    ? effectiveStations
-    : effectiveStations.filter((st) => st.id === role);
-
-  const currentStation =
-    effectiveStations.find((st) => st.id === activeSection) ?? visibleStations[0] ?? null;
 
   const sectionBreadcrumb =
     activeSection === 'jefe'
@@ -1103,16 +1129,8 @@ export default function App() {
                       selectedDate={effectiveSelectedDate}
                       items={effectiveItems}
                       report={reportsForSelectedDate[currentStation.id]}
-                      entriesByItemId={
-                        effectiveEntriesByReportId[
-                          reportsForSelectedDate[currentStation.id]?.id ?? ''
-                        ] ?? {}
-                      }
-                      onSaved={() => {
-                        if (!canManage) {
-                          refreshWorkerFallback();
-                        }
-                      }}
+                      entriesByItemId={currentStationEntries}
+                      onSaved={handleStationSaved}
                     />
                   ) : (
                     <div className="bg-white border border-stone-200 rounded-2xl p-10 text-center space-y-3">

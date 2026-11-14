@@ -877,10 +877,27 @@ export async function saveStationReportBatch(params: {
   }
 
   rows.forEach((row) => {
-    const entryRef = doc(db, 'dailyReports', reportId, 'entries', row.itemId);
     const prev = existingEntries[row.itemId];
-    const hasOpening = mode === 'opening' ? true : prev ? prev.hasOpening : row.hasOpening;
-    const hasClosing = mode === 'closing' ? true : prev ? prev.hasClosing : row.hasClosing;
+    const notApplicable = Boolean(row.notApplicable);
+    const hasOpening = notApplicable
+      ? false
+      : row.hasOpening || Boolean(prev?.hasOpening && mode === 'closing');
+    const hasClosing = notApplicable
+      ? false
+      : row.hasClosing || Boolean(prev?.hasClosing && mode === 'opening');
+    const addedVal = clampNumber(row.added);
+
+    if (!prev && !hasOpening && !hasClosing && !notApplicable && addedVal === 0) {
+      return;
+    }
+
+    const entryRef = doc(db, 'dailyReports', reportId, 'entries', row.itemId);
+    const openingVal =
+      !row.hasOpening && prev?.hasOpening ? clampNumber(prev.opening) : clampNumber(row.opening);
+    const effectiveAdded =
+      !row.hasOpening && prev && row.added === 0 ? clampNumber(prev.added) : addedVal;
+    const closingVal =
+      !row.hasClosing && prev?.hasClosing ? clampNumber(prev.closing) : clampNumber(row.closing);
 
     if (prev) {
       batch.update(entryRef, {
@@ -888,11 +905,12 @@ export async function saveStationReportBatch(params: {
         unit: clampString(row.unit, MAX_UNIT_LENGTH),
         minStock: clampNumber(row.minStock),
         targetStock: clampNumber(row.targetStock),
-        opening: clampNumber(row.opening),
-        added: clampNumber(row.added),
-        closing: clampNumber(row.closing),
+        opening: openingVal,
+        added: effectiveAdded,
+        closing: closingVal,
         hasOpening,
         hasClosing,
+        notApplicable,
         updatedByUid: user.uid,
         updatedByName: reporterName,
         updatedAt: serverTimestamp(),
@@ -910,11 +928,12 @@ export async function saveStationReportBatch(params: {
         unit: clampString(row.unit, MAX_UNIT_LENGTH),
         minStock: clampNumber(row.minStock),
         targetStock: clampNumber(row.targetStock),
-        opening: clampNumber(row.opening),
-        added: clampNumber(row.added),
-        closing: clampNumber(row.closing),
+        opening: openingVal,
+        added: effectiveAdded,
+        closing: closingVal,
         hasOpening,
         hasClosing,
+        notApplicable,
         updatedByUid: user.uid,
         updatedByName: reporterName,
         createdAt: serverTimestamp(),

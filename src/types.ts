@@ -3,7 +3,7 @@ import type { Timestamp } from 'firebase/firestore';
 export type StationId = string;
 export type TeamStationId = StationId | 'jefe';
 export type ReportStatus = 'open' | 'opening_saved' | 'completed';
-export type StockLevel = 'agotado' | 'comprar' | 'medio' | 'suficiente';
+export type StockLevel = 'agotado' | 'comprar' | 'medio' | 'suficiente' | 'sin_dato';
 
 export interface ShiftSchedule {
   enabled: boolean;
@@ -103,6 +103,7 @@ export interface DailyReportEntry {
   closing: number;
   hasOpening: boolean;
   hasClosing: boolean;
+  notApplicable?: boolean;
   updatedByUid: string;
   updatedByName: string;
   createdAt?: Timestamp;
@@ -144,14 +145,18 @@ export interface DraftEntryRow {
   closing: number;
   hasOpening: boolean;
   hasClosing: boolean;
+  notApplicable?: boolean;
 }
 
 export interface ConsolidatedItemRow {
   item: InventoryItem;
   entry: DailyReportEntry | null;
   reportStatus: ReportStatus;
-  currentStock: number;
+  currentStock: number | null;
   hasCountedClosing: boolean;
+  isProvisional: boolean;
+  isNotApplicable: boolean;
+  provisionalStock: number | null;
   consumed: number | null;
   stockLevel: StockLevel;
   suggestedBuy: number;

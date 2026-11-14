@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { User } from 'firebase/auth';
 import { AnimatePresence, motion } from 'motion/react';
 import {
   AlertTriangle,
+  Ban,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
@@ -56,6 +57,136 @@ interface StationShiftViewProps {
 
 type ItemFilter = 'todos' | 'pendientes' | 'bajos';
 
+interface TouchedFlags {
+  opening?: boolean;
+  added?: boolean;
+  closing?: boolean;
+  notApplicable?: boolean;
+}
+
+interface StoredRowDraft {
+  opening: number;
+  added: number;
+  closing: number;
+  hasOpening: boolean;
+  hasClosing: boolean;
+  notApplicable: boolean;
+}
+
+interface StoredDraftPayload {
+  rows: Record<string, StoredRowDraft>;
+  touched: Record<string, TouchedFlags>;
+  notes: string;
+  notesTouched: boolean;
+  savedAt: number;
+}
+
+function getDraftStorageKey(
+  workspaceId: string,
+  stationId: string,
+  dateStr: string,
+  mode: 'opening' | 'closing',
+): string {
+  return `thefire_draft:${workspaceId}:${stationId}:${dateStr}:${mode}`;
+}
+
+function readStoredDraft(key: string): StoredDraftPayload | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<StoredDraftPayload> | null;
+    if (!parsed || typeof parsed !== 'object' || !parsed.rows || typeof parsed.rows !== 'object') {
+      return null;
+    }
+    return {
+      rows: parsed.rows,
+      touched: parsed.touched && typeof parsed.touched === 'object' ? parsed.touched : {},
+      notes: typeof parsed.notes === 'string' ? parsed.notes : '',
+      notesTouched: Boolean(parsed.notesTouched),
+      savedAt: typeof parsed.savedAt === 'number' ? parsed.savedAt : Date.now(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredDraft(key: string, payload: StoredDraftPayload): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(key, JSON.stringify(payload));
+  } catch {
+    // Ignore storage quota / private browsing errors
+  }
+}
+
+function clearStoredDraft(key: string): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.removeItem(key);
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+function buildRowFromSources(
+  item: InventoryItem,
+  existing: DailyReportEntry | undefined,
+  storedRow: StoredRowDraft | undefined,
+  storedTouched: TouchedFlags | undefined,
+): DraftEntryRow {
+  const notApplicable = storedTouched?.notApplicable
+    ? Boolean(storedRow?.notApplicable)
+    : Boolean(existing?.notApplicable);
+
+  const opening = storedTouched?.opening
+    ? storedRow?.opening ?? 0
+    : existing
+      ? existing.opening
+      : 0;
+  const hasOpening = notApplicable
+    ? false
+    : storedTouched?.opening
+      ? Boolean(storedRow?.hasOpening)
+      : Boolean(existing?.hasOpening);
+
+  const added = storedTouched?.added
+    ? storedRow?.added ?? 0
+    : existing
+      ? existing.added
+      : 0;
+
+  const closing = storedTouched?.closing
+    ? storedRow?.closing ?? 0
+    : existing
+      ? existing.closing
+      : 0;
+  const hasClosing = notApplicable
+    ? false
+    : storedTouched?.closing
+      ? Boolean(storedRow?.hasClosing)
+      : Boolean(existing?.hasClosing);
+
+  return {
+    itemId: item.id,
+    itemName: item.name,
+    unit: item.unit,
+    minStock: item.minStock,
+    targetStock: item.targetStock,
+    opening,
+    added,
+    closing,
+    hasOpening,
+    hasClosing,
+    notApplicable,
+  };
+}
+
+function clampQty(val: number): number {
+  if (!Number.isFinite(val)) return 0;
+  return Math.max(0, Math.min(MAX_STOCK_VALUE, Math.round(val * 100) / 100));
+}
+
 export function StationShiftView({
   workspace,
   user,
@@ -73,48 +204,205 @@ export function StationShiftView({
     [items, station.id],
   );
 
+  const isCompleted = report?.status === 'completed';
+  const isLocked = isCompleted && !canManage;
+  const isWorkerOpeningPhase = !canManage && scheduleStatus.phase === 'opening';
+  const isWorkerOutsideHours = !canManage && scheduleStatus.phase === 'outside';
+  const draftMode: 'opening' | 'closing' = isWorkerOpeningPhase ? 'opening' : 'closing';
+  const storageKey = getDraftStorageKey(workspace.id, station.id, selectedDate, draftMode);
+
   const [drafts, setDrafts] = useState<Record<string, DraftEntryRow>>({});
   const [notes, setNotes] = useState('');
   const [savingMode, setSavingMode] = useState<'opening' | 'closing' | null>(null);
   const [loadingPrev, setLoadingPrev] = useState(false);
   const [autoLoadedPrevDate, setAutoLoadedPrevDate] = useState<string | null>(null);
+  const [restoredFromLocal, setRestoredFromLocal] = useState(false);
   const [reopening, setReopening] = useState(false);
   const [showOpeningDetails, setShowOpeningDetails] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [itemFilter, setItemFilter] = useState<ItemFilter>('todos');
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
+  const touchedRef = useRef<Record<string, TouchedFlags>>({});
+  const notesTouchedRef = useRef(false);
+  const latestEntriesRef = useRef(entriesByItemId);
+  const latestItemsRef = useRef(stationItems);
+  const latestReportNotesRef = useRef(report?.notes ?? '');
   const autoPreloadKeyRef = useRef<string>('');
+  const listSectionRef = useRef<HTMLDivElement | null>(null);
 
-  const isCompleted = report?.status === 'completed';
-  const isLocked = isCompleted && !canManage;
-  const isWorkerOpeningPhase = !canManage && scheduleStatus.phase === 'opening';
-  const isWorkerOutsideHours = !canManage && scheduleStatus.phase === 'outside';
+  latestEntriesRef.current = entriesByItemId;
+  latestItemsRef.current = stationItems;
+  latestReportNotesRef.current = report?.notes ?? '';
 
+  const persistLocalDraft = useCallback(
+    (nextDrafts: Record<string, DraftEntryRow>, nextNotes: string) => {
+      const hasAnyTouchedRow = Object.values(touchedRef.current).some(
+        (t) => t.opening || t.added || t.closing || t.notApplicable,
+      );
+      if (!hasAnyTouchedRow && !notesTouchedRef.current) {
+        clearStoredDraft(storageKey);
+        return;
+      }
+
+      const rowsPayload: Record<string, StoredRowDraft> = {};
+      Object.entries(nextDrafts).forEach(([id, row]) => {
+        const t = touchedRef.current[id];
+        if (t && (t.opening || t.added || t.closing || t.notApplicable)) {
+          rowsPayload[id] = {
+            opening: row.opening,
+            added: row.added,
+            closing: row.closing,
+            hasOpening: row.hasOpening,
+            hasClosing: row.hasClosing,
+            notApplicable: Boolean(row.notApplicable),
+          };
+        }
+      });
+
+      writeStoredDraft(storageKey, {
+        rows: rowsPayload,
+        touched: touchedRef.current,
+        notes: nextNotes,
+        notesTouched: notesTouchedRef.current,
+        savedAt: Date.now(),
+      });
+    },
+    [storageKey],
+  );
+
+  // 1. Initialize / Reset ONLY when station, date, report identity, or mode changes
   useEffect(() => {
+    const stored = readStoredDraft(storageKey);
+    const nextTouched: Record<string, TouchedFlags> = stored?.touched ? { ...stored.touched } : {};
+    touchedRef.current = nextTouched;
+    notesTouchedRef.current = Boolean(stored?.notesTouched);
+
+    const entries = latestEntriesRef.current;
+    const currentItems = latestItemsRef.current;
     const nextDrafts: Record<string, DraftEntryRow> = {};
-    stationItems.forEach((item) => {
-      const existing = entriesByItemId[item.id];
-      nextDrafts[item.id] = {
-        itemId: item.id,
-        itemName: item.name,
-        unit: item.unit,
-        minStock: item.minStock,
-        targetStock: item.targetStock,
-        opening: existing ? existing.opening : 0,
-        added: existing ? existing.added : 0,
-        closing: existing ? existing.closing : 0,
-        hasOpening: existing ? existing.hasOpening : false,
-        hasClosing: existing ? existing.hasClosing : false,
-      };
+
+    currentItems.forEach((item) => {
+      nextDrafts[item.id] = buildRowFromSources(
+        item,
+        entries[item.id],
+        stored?.rows?.[item.id],
+        nextTouched[item.id],
+      );
     });
+
+    const hasRestoredEdits =
+      Boolean(stored?.notesTouched) ||
+      Object.values(nextTouched).some(
+        (t) => t.opening || t.added || t.closing || t.notApplicable,
+      );
+
     setDrafts(nextDrafts);
-    setNotes(report?.notes ?? '');
+    setNotes(stored?.notesTouched ? stored.notes : latestReportNotesRef.current);
+    setRestoredFromLocal(hasRestoredEdits);
     setFeedback(null);
     setAutoLoadedPrevDate(null);
-  }, [stationItems, entriesByItemId, report?.id, report?.notes, selectedDate, station.id]);
+  }, [workspace.id, station.id, selectedDate, report?.id, draftMode, storageKey]);
 
-  // Auto-preload yesterday's closing as today's opening if today has no report yet
+  // 2. Merge remote snapshot updates WITHOUT overwriting any touched local fields
+  useEffect(() => {
+    const stored = readStoredDraft(storageKey);
+    setDrafts((prev) => {
+      let changed = false;
+      const next: Record<string, DraftEntryRow> = { ...prev };
+      const activeIds = new Set(stationItems.map((i) => i.id));
+
+      Object.keys(next).forEach((id) => {
+        if (!activeIds.has(id)) {
+          delete next[id];
+          changed = true;
+        }
+      });
+
+      stationItems.forEach((item) => {
+        const existing = entriesByItemId[item.id];
+        const cur = next[item.id];
+        const touched = touchedRef.current[item.id];
+
+        if (!cur) {
+          next[item.id] = buildRowFromSources(
+            item,
+            existing,
+            stored?.rows?.[item.id],
+            touched ?? stored?.touched?.[item.id],
+          );
+          changed = true;
+          return;
+        }
+
+        let updatedRow = cur;
+        if (
+          cur.itemName !== item.name ||
+          cur.unit !== item.unit ||
+          cur.minStock !== item.minStock ||
+          cur.targetStock !== item.targetStock
+        ) {
+          updatedRow = {
+            ...updatedRow,
+            itemName: item.name,
+            unit: item.unit,
+            minStock: item.minStock,
+            targetStock: item.targetStock,
+          };
+        }
+
+        if (existing) {
+          if (!touched?.notApplicable && Boolean(existing.notApplicable) !== Boolean(updatedRow.notApplicable)) {
+            updatedRow = {
+              ...updatedRow,
+              notApplicable: Boolean(existing.notApplicable),
+            };
+          }
+          if (
+            !touched?.opening &&
+            !touched?.notApplicable &&
+            (updatedRow.opening !== existing.opening || updatedRow.hasOpening !== existing.hasOpening)
+          ) {
+            updatedRow = {
+              ...updatedRow,
+              opening: existing.opening,
+              hasOpening: existing.hasOpening,
+            };
+          }
+          if (!touched?.added && updatedRow.added !== existing.added) {
+            updatedRow = {
+              ...updatedRow,
+              added: existing.added,
+            };
+          }
+          if (
+            !touched?.closing &&
+            !touched?.notApplicable &&
+            (updatedRow.closing !== existing.closing || updatedRow.hasClosing !== existing.hasClosing)
+          ) {
+            updatedRow = {
+              ...updatedRow,
+              closing: existing.closing,
+              hasClosing: existing.hasClosing,
+            };
+          }
+        }
+
+        if (updatedRow !== cur) {
+          next[item.id] = updatedRow;
+          changed = true;
+        }
+      });
+
+      return changed ? next : prev;
+    });
+
+    if (!notesTouchedRef.current) {
+      setNotes(report?.notes ?? '');
+    }
+  }, [stationItems, entriesByItemId, report?.notes, storageKey]);
+
+  // 3. Auto-preload yesterday's closing as today's opening if today has no report yet
   useEffect(() => {
     if (isWorkerOutsideHours || report || stationItems.length === 0) return;
     const key = `${workspace.id}_${selectedDate}_${station.id}_${stationItems.length}`;
@@ -132,21 +420,34 @@ export function StationShiftView({
       .then((prevEntries) => {
         if (cancelled) return;
         if (Object.keys(prevEntries).length === 0) return;
+        let loadedAny = false;
         setDrafts((prev) => {
           const updated = { ...prev };
           Object.keys(updated).forEach((itemId) => {
             const prevEntry = prevEntries[itemId];
-            if (prevEntry && !updated[itemId].hasOpening) {
+            const touched = touchedRef.current[itemId];
+            if (
+              prevEntry &&
+              prevEntry.hasClosing &&
+              !prevEntry.notApplicable &&
+              !updated[itemId].hasOpening &&
+              !updated[itemId].notApplicable &&
+              !touched?.opening &&
+              !touched?.notApplicable
+            ) {
               updated[itemId] = {
                 ...updated[itemId],
-                opening: prevEntry.hasClosing ? prevEntry.closing : prevEntry.opening,
+                opening: prevEntry.closing,
                 hasOpening: true,
               };
+              loadedAny = true;
             }
           });
-          return updated;
+          return loadedAny ? updated : prev;
         });
-        setAutoLoadedPrevDate(prevDate);
+        if (loadedAny) {
+          setAutoLoadedPrevDate(prevDate);
+        }
       })
       .catch(() => {
         // Silent auto-preload fallback
@@ -157,32 +458,141 @@ export function StationShiftView({
     };
   }, [isWorkerOutsideHours, report, workspace.id, selectedDate, station.id, stationItems]);
 
-  const updateField = (
+  const applyRowMutation = (
     itemId: string,
-    field: 'opening' | 'added' | 'closing',
-    rawValue: number,
+    mutator: (current: DraftEntryRow) => DraftEntryRow,
+    touchedUpdate: TouchedFlags,
   ) => {
-    const clamped = Number.isFinite(rawValue)
-      ? Math.max(0, Math.min(MAX_STOCK_VALUE, Math.round(rawValue * 100) / 100))
-      : 0;
+    if (isLocked) return;
+    touchedRef.current = {
+      ...touchedRef.current,
+      [itemId]: {
+        ...(touchedRef.current[itemId] ?? {}),
+        ...touchedUpdate,
+      },
+    };
     setDrafts((prev) => {
       const current = prev[itemId];
       if (!current) return prev;
-      return {
+      const next = {
         ...prev,
-        [itemId]: {
-          ...current,
-          [field]: clamped,
-          hasOpening: field === 'opening' || field === 'added' ? true : current.hasOpening,
-          hasClosing: field === 'closing' ? true : current.hasClosing,
-        },
+        [itemId]: mutator(current),
       };
+      persistLocalDraft(next, notes);
+      return next;
     });
   };
 
+  const handleNumberInput = (
+    itemId: string,
+    field: 'opening' | 'added' | 'closing',
+    rawValue: string,
+    badInput: boolean,
+  ) => {
+    if (badInput) return;
+    const trimmed = rawValue.trim();
+
+    if (trimmed === '') {
+      applyRowMutation(
+        itemId,
+        (current) => ({
+          ...current,
+          [field]: 0,
+          hasOpening: field === 'opening' ? false : current.hasOpening,
+          hasClosing: field === 'closing' ? false : current.hasClosing,
+        }),
+        { [field]: true },
+      );
+      return;
+    }
+
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed) || parsed < 0) return;
+    const clamped = clampQty(parsed);
+
+    applyRowMutation(
+      itemId,
+      (current) => ({
+        ...current,
+        [field]: clamped,
+        notApplicable: field === 'added' ? current.notApplicable : false,
+        hasOpening: field === 'opening' ? true : current.hasOpening,
+        hasClosing: field === 'closing' ? true : current.hasClosing,
+      }),
+      {
+        [field]: true,
+        ...(field !== 'added' ? { notApplicable: true } : {}),
+      },
+    );
+  };
+
   const stepField = (itemId: string, field: 'opening' | 'added' | 'closing', delta: number) => {
-    const currentVal = drafts[itemId]?.[field] ?? 0;
-    updateField(itemId, field, currentVal + delta);
+    const current = drafts[itemId];
+    if (!current) return;
+    const base =
+      field === 'closing'
+        ? current.hasClosing
+          ? current.closing
+          : 0
+        : field === 'opening'
+          ? current.hasOpening
+            ? current.opening
+            : 0
+          : current.added;
+    const nextVal = clampQty(base + delta);
+    applyRowMutation(
+      itemId,
+      (row) => ({
+        ...row,
+        [field]: nextVal,
+        notApplicable: field === 'added' ? row.notApplicable : false,
+        hasOpening: field === 'opening' ? true : row.hasOpening,
+        hasClosing: field === 'closing' ? true : row.hasClosing,
+      }),
+      {
+        [field]: true,
+        ...(field !== 'added' ? { notApplicable: true } : {}),
+      },
+    );
+  };
+
+  const markZeroExplicit = (itemId: string, field: 'opening' | 'closing') => {
+    applyRowMutation(
+      itemId,
+      (row) => ({
+        ...row,
+        [field]: 0,
+        notApplicable: false,
+        hasOpening: field === 'opening' ? true : row.hasOpening,
+        hasClosing: field === 'closing' ? true : row.hasClosing,
+      }),
+      { [field]: true, notApplicable: true },
+    );
+  };
+
+  const toggleNotApplicable = (itemId: string) => {
+    const current = drafts[itemId];
+    if (!current) return;
+    const nextNA = !current.notApplicable;
+    applyRowMutation(
+      itemId,
+      (row) => ({
+        ...row,
+        notApplicable: nextNA,
+        opening: nextNA ? 0 : row.opening,
+        added: nextNA ? 0 : row.added,
+        closing: nextNA ? 0 : row.closing,
+        hasOpening: nextNA ? false : row.hasOpening,
+        hasClosing: nextNA ? false : row.hasClosing,
+      }),
+      { notApplicable: true, opening: true, closing: true },
+    );
+  };
+
+  const handleNotesChange = (nextNotes: string) => {
+    notesTouchedRef.current = true;
+    setNotes(nextNotes);
+    persistLocalDraft(drafts, nextNotes);
   };
 
   const handleLoadYesterdayClosing = async () => {
@@ -210,14 +620,21 @@ export function StationShiftView({
         const updated = { ...prev };
         Object.keys(updated).forEach((itemId) => {
           const prevEntry = prevEntries[itemId];
-          if (prevEntry) {
+          if (prevEntry && prevEntry.hasClosing && !prevEntry.notApplicable) {
             updated[itemId] = {
               ...updated[itemId],
-              opening: prevEntry.hasClosing ? prevEntry.closing : prevEntry.opening,
+              opening: prevEntry.closing,
               hasOpening: true,
+              notApplicable: false,
+            };
+            touchedRef.current[itemId] = {
+              ...(touchedRef.current[itemId] ?? {}),
+              opening: true,
+              notApplicable: true,
             };
           }
         });
+        persistLocalDraft(updated, notes);
         return updated;
       });
       setAutoLoadedPrevDate(prevDate);
@@ -235,8 +652,45 @@ export function StationShiftView({
     }
   };
 
+  const isRowAccounted = useCallback(
+    (row: DraftEntryRow | undefined): boolean => {
+      if (!row) return false;
+      if (row.notApplicable) return true;
+      return isWorkerOpeningPhase ? Boolean(row.hasOpening) : Boolean(row.hasClosing);
+    },
+    [isWorkerOpeningPhase],
+  );
+
+  const countedCount = stationItems.filter((it) => isRowAccounted(drafts[it.id])).length;
+  const missingCount = Math.max(0, stationItems.length - countedCount);
+  const allAccounted = stationItems.length > 0 && missingCount === 0;
+
+  const lowCount = stationItems.filter((it) => {
+    const row = drafts[it.id];
+    if (!row || row.notApplicable) return false;
+    const isCounted = isWorkerOpeningPhase ? row.hasOpening : row.hasClosing;
+    if (!isCounted) return false;
+    const lvl = getStockLevel(isWorkerOpeningPhase ? row.opening + row.added : row.closing, it.minStock);
+    return lvl === 'agotado' || lvl === 'comprar' || lvl === 'medio';
+  }).length;
+
+  const progressPct =
+    stationItems.length > 0 ? Math.round((countedCount / stationItems.length) * 100) : 0;
+
   const handleSave = async (mode: 'opening' | 'closing') => {
     if (stationItems.length === 0) return;
+
+    const requiresFullCount = mode === 'closing' || isWorkerOpeningPhase;
+    if (requiresFullCount && !allAccounted) {
+      setItemFilter('pendientes');
+      setFeedback({
+        type: 'error',
+        text: `Faltan ${missingCount} ${missingCount === 1 ? 'insumo' : 'insumos'} por contar. Escribe la cantidad, pulsa "0 / No queda" o marca "No aplica hoy".`,
+      });
+      listSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      return;
+    }
+
     setSavingMode(mode);
     setFeedback(null);
     try {
@@ -252,6 +706,12 @@ export function StationShiftView({
         existingReport: report,
         existingEntries: entriesByItemId,
       });
+
+      clearStoredDraft(storageKey);
+      touchedRef.current = {};
+      notesTouchedRef.current = false;
+      setRestoredFromLocal(false);
+
       setFeedback({
         type: 'success',
         text:
@@ -263,7 +723,7 @@ export function StationShiftView({
     } catch {
       setFeedback({
         type: 'error',
-        text: 'Ocurrió un error al guardar el inventario. Verifica tu conexión.',
+        text: 'Ocurrió un error al guardar el inventario. Tu borrador sigue guardado en este celular.',
       });
     } finally {
       setSavingMode(null);
@@ -291,46 +751,25 @@ export function StationShiftView({
     }
   };
 
-  const countedCount = stationItems.filter((it) => {
-    const row = drafts[it.id];
-    if (isWorkerOpeningPhase) {
-      return Boolean(row?.hasOpening || report?.status === 'opening_saved' || isCompleted);
-    }
-    return Boolean(row?.hasClosing || isCompleted);
-  }).length;
-
-  const lowCount = stationItems.filter((it) => {
-    const row = drafts[it.id];
-    if (!row) return false;
-    const lvl = getStockLevel(isWorkerOpeningPhase ? row.opening + row.added : row.closing, it.minStock);
-    return (
-      (isWorkerOpeningPhase ? row.hasOpening : row.hasClosing || isCompleted) &&
-      (lvl === 'agotado' || lvl === 'comprar' || lvl === 'medio')
-    );
-  }).length;
-
-  const progressPct =
-    stationItems.length > 0 ? Math.round((countedCount / stationItems.length) * 100) : 0;
-
   const filteredItems = useMemo(() => {
     const q = searchTerm.trim().toLowerCase();
     return stationItems.filter((item) => {
       if (q && !item.name.toLowerCase().includes(q)) return false;
       const row = drafts[item.id];
       if (itemFilter === 'pendientes') {
-        if (isWorkerOpeningPhase) {
-          return !row?.hasOpening && report?.status !== 'opening_saved' && !isCompleted;
-        }
-        return !row?.hasClosing && !isCompleted;
+        return !isRowAccounted(row);
       }
       if (itemFilter === 'bajos') {
-        const val = isWorkerOpeningPhase ? (row?.opening ?? 0) + (row?.added ?? 0) : row?.closing ?? 0;
+        if (!row || row.notApplicable) return false;
+        const isCounted = isWorkerOpeningPhase ? row.hasOpening : row.hasClosing;
+        if (!isCounted) return false;
+        const val = isWorkerOpeningPhase ? row.opening + row.added : row.closing;
         const lvl = getStockLevel(val, item.minStock);
         return lvl === 'agotado' || lvl === 'comprar' || lvl === 'medio';
       }
       return true;
     });
-  }, [stationItems, searchTerm, itemFilter, drafts, isCompleted, isWorkerOpeningPhase, report?.status]);
+  }, [stationItems, searchTerm, itemFilter, drafts, isRowAccounted, isWorkerOpeningPhase]);
 
   const closingTime = report?.status === 'completed' ? formatTimeShort(report?.updatedAt) : null;
   const draftTime = report?.status === 'opening_saved' ? formatTimeShort(report?.updatedAt) : null;
@@ -490,8 +929,7 @@ export function StationShiftView({
           </div>
 
           <div className="text-sm font-mono tabular-nums font-bold text-stone-800 shrink-0">
-            {countedCount} / {stationItems.length}{' '}
-            {isWorkerOpeningPhase ? 'confirmados' : 'contados'}
+            {countedCount} de {stationItems.length} contados
           </div>
         </div>
 
@@ -508,11 +946,13 @@ export function StationShiftView({
 
         <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-stone-600">
           <span>
-            {autoLoadedPrevDate
-              ? `Base inicial cargada automáticamente con el cierre de ${formatDateHuman(autoLoadedPrevDate)}.`
-              : isWorkerOpeningPhase
-                ? 'Revisa con cuánto abres y suma en "Surtido (+)" lo que haya llegado hoy.'
-                : 'Cuando termines de contar, presiona "Enviar cierre del día al jefe".'}
+            {restoredFromLocal
+              ? 'Borrador recuperado en este dispositivo. Tus números editados están a salvo.'
+              : autoLoadedPrevDate
+                ? `Base inicial cargada automáticamente con el cierre de ${formatDateHuman(autoLoadedPrevDate)}.`
+                : isWorkerOpeningPhase
+                  ? 'Cuenta cada insumo, toca "0" si no hay o "No aplica hoy" para poder guardar.'
+                  : 'Cuenta todos los insumos (o marca "0 / No queda" / "No aplica") para habilitar el envío.'}
           </span>
           {!isLocked && stationItems.length > 0 && (
             <button
@@ -557,7 +997,10 @@ export function StationShiftView({
 
       {/* Quick Search & Filter Toolbar */}
       {stationItems.length > 0 && (
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div
+          ref={listSectionRef}
+          className="flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+        >
           <div className="flex items-center gap-1 p-1 bg-stone-200/70 rounded-xl w-full sm:w-auto overflow-x-auto">
             <button
               type="button"
@@ -579,7 +1022,7 @@ export function StationShiftView({
                   : 'text-stone-700 hover:text-stone-900'
               }`}
             >
-              Faltan ({Math.max(0, stationItems.length - countedCount)})
+              Faltan ({missingCount})
             </button>
             <button
               type="button"
@@ -601,7 +1044,7 @@ export function StationShiftView({
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
               placeholder="Buscar insumo..."
-              className="w-full min-h-[44px] pl-10 pr-3 py-2 text-sm bg-white border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+              className="w-full min-h-[44px] pl-10 pr-3 py-2 text-base sm:text-sm bg-white border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
             />
           </div>
         </div>
@@ -634,7 +1077,7 @@ export function StationShiftView({
             {/* Mobile / Tablet Touch-First List */}
             <div className="lg:hidden divide-y divide-stone-200">
               {filteredItems.map((item) => {
-                const row = drafts[item.id] ?? {
+                const row: DraftEntryRow = drafts[item.id] ?? {
                   itemId: item.id,
                   itemName: item.name,
                   unit: item.unit,
@@ -645,8 +1088,11 @@ export function StationShiftView({
                   closing: 0,
                   hasOpening: false,
                   hasClosing: false,
+                  notApplicable: false,
                 };
-                const hasClosingVal = row.hasClosing || isCompleted;
+                const isNA = Boolean(row.notApplicable);
+                const hasOpeningVal = row.hasOpening && !isNA;
+                const hasClosingVal = row.hasClosing && !isNA;
                 const activeStockVal = isWorkerOpeningPhase ? row.opening + row.added : row.closing;
                 const level = getStockLevel(activeStockVal, item.minStock);
                 const meta = getStockLevelMeta(level);
@@ -656,21 +1102,23 @@ export function StationShiftView({
                   item.targetStock,
                 );
 
-                const inputBorderClass = !hasClosingVal
-                  ? 'bg-stone-50 border-stone-300 text-stone-800'
-                  : level === 'agotado' || level === 'comprar'
-                    ? 'bg-red-50/40 border-red-400 text-stone-900'
-                    : level === 'medio'
-                      ? 'bg-amber-50/40 border-amber-400 text-stone-900'
-                      : 'bg-emerald-50/40 border-emerald-500 text-stone-900';
+                const inputBorderClass = isNA
+                  ? 'bg-stone-100 border-stone-200 text-stone-400'
+                  : !hasClosingVal
+                    ? 'bg-stone-50 border-stone-300 text-stone-800'
+                    : level === 'agotado' || level === 'comprar'
+                      ? 'bg-red-50/40 border-red-400 text-stone-900'
+                      : level === 'medio'
+                        ? 'bg-amber-50/40 border-amber-400 text-stone-900'
+                        : 'bg-emerald-50/40 border-emerald-500 text-stone-900';
+
+                const isAccounted = isRowAccounted(row);
 
                 return (
                   <div
                     key={item.id}
                     className={`p-4 sm:p-5 space-y-3.5 transition-colors ${
-                      (isWorkerOpeningPhase ? row.hasOpening : hasClosingVal)
-                        ? 'bg-white'
-                        : 'bg-stone-50/40'
+                      isNA ? 'bg-stone-100/70' : isAccounted ? 'bg-white' : 'bg-stone-50/50'
                     }`}
                   >
                     <div className="flex items-start justify-between gap-3">
@@ -680,17 +1128,27 @@ export function StationShiftView({
                         </h3>
                         <p className="text-xs text-stone-500 mt-0.5 font-mono tabular-nums">
                           {item.unit} · Mínimo: {item.minStock}
-                          {!isWorkerOpeningPhase && row.hasOpening && !showOpeningDetails
+                          {!isWorkerOpeningPhase && row.hasOpening && !isNA && !showOpeningDetails
                             ? ` · Base: ${row.opening + row.added}`
                             : ''}
                         </p>
                       </div>
 
                       <div className="shrink-0 text-right">
-                        {isWorkerOpeningPhase ? (
-                          <span className="text-xs font-mono font-bold text-orange-700">
-                            Total: {row.opening + row.added} {item.unit}
+                        {isNA ? (
+                          <span className="text-xs font-semibold text-stone-500">
+                            No aplica hoy
                           </span>
+                        ) : isWorkerOpeningPhase ? (
+                          hasOpeningVal ? (
+                            <span className="text-xs font-mono font-bold text-orange-700">
+                              Total: {row.opening + row.added} {item.unit}
+                            </span>
+                          ) : (
+                            <span className="text-xs font-semibold text-stone-400">
+                              Por contar
+                            </span>
+                          )
                         ) : !hasClosingVal ? (
                           <span className="text-xs font-semibold text-stone-400">
                             Por contar
@@ -709,92 +1167,133 @@ export function StationShiftView({
                     </div>
 
                     {isWorkerOpeningPhase ? (
-                      /* OPENING & RESTOCK PHASE (4 PM - 7 PM) */
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                        <div className="space-y-1.5">
-                          <label className="block text-xs font-semibold text-stone-700">
-                            Con cuánto abre ({item.unit})
-                          </label>
-                          <div className="flex items-center gap-2">
-                            <motion.button
-                              whileTap={{ scale: 0.93 }}
-                              type="button"
-                              disabled={isLocked}
-                              onClick={() => stepField(item.id, 'opening', -1)}
-                              aria-label={`Restar inicio ${item.name}`}
-                              className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                            >
-                              <Minus className="w-5 h-5" />
-                            </motion.button>
-                            <input
-                              type="number"
-                              inputMode="decimal"
-                              min={0}
-                              step="any"
-                              disabled={isLocked}
-                              value={row.opening}
-                              onChange={(e) =>
-                                updateField(item.id, 'opening', parseFloat(e.target.value))
-                              }
-                              className="min-w-0 flex-1 h-12 text-center font-mono tabular-nums text-xl font-bold rounded-xl border border-stone-300 bg-white text-stone-900 focus:outline-none focus:ring-2 focus:ring-orange-500"
-                            />
-                            <motion.button
-                              whileTap={{ scale: 0.93 }}
-                              type="button"
-                              disabled={isLocked}
-                              onClick={() => stepField(item.id, 'opening', 1)}
-                              aria-label={`Sumar inicio ${item.name}`}
-                              className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                            >
-                              <Plus className="w-5 h-5" />
-                            </motion.button>
+                      /* OPENING & RESTOCK PHASE */
+                      <div className="space-y-3">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          <div className="space-y-1.5">
+                            <label className="block text-xs font-semibold text-stone-700">
+                              Con cuánto abre ({item.unit})
+                            </label>
+                            <div className="flex items-center gap-2">
+                              <motion.button
+                                whileTap={{ scale: 0.93 }}
+                                type="button"
+                                disabled={isLocked || isNA}
+                                onClick={() => stepField(item.id, 'opening', -1)}
+                                aria-label={`Restar inicio ${item.name}`}
+                                className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
+                              >
+                                <Minus className="w-5 h-5" />
+                              </motion.button>
+                              <input
+                                type="number"
+                                inputMode="decimal"
+                                min={0}
+                                step="any"
+                                disabled={isLocked || isNA}
+                                placeholder="—"
+                                value={hasOpeningVal ? row.opening : ''}
+                                onChange={(e) =>
+                                  handleNumberInput(
+                                    item.id,
+                                    'opening',
+                                    e.target.value,
+                                    e.target.validity.badInput,
+                                  )
+                                }
+                                className="min-w-0 flex-1 h-12 text-center font-mono tabular-nums text-xl font-bold rounded-xl border border-stone-300 bg-white text-stone-900 placeholder:text-stone-300 focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:bg-stone-100"
+                              />
+                              <motion.button
+                                whileTap={{ scale: 0.93 }}
+                                type="button"
+                                disabled={isLocked || isNA}
+                                onClick={() => stepField(item.id, 'opening', 1)}
+                                aria-label={`Sumar inicio ${item.name}`}
+                                className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
+                              >
+                                <Plus className="w-5 h-5" />
+                              </motion.button>
+                            </div>
+                          </div>
+
+                          <div className="space-y-1.5">
+                            <label className="block text-xs font-semibold text-orange-700">
+                              ¿Llegó producto hoy? / Surtido (+)
+                            </label>
+                            <div className="flex items-center gap-2">
+                              <motion.button
+                                whileTap={{ scale: 0.93 }}
+                                type="button"
+                                disabled={isLocked || isNA}
+                                onClick={() => stepField(item.id, 'added', -1)}
+                                aria-label={`Restar surtido ${item.name}`}
+                                className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-orange-200 bg-orange-50 text-orange-800 hover:bg-orange-100 disabled:opacity-40 cursor-pointer"
+                              >
+                                <Minus className="w-5 h-5" />
+                              </motion.button>
+                              <input
+                                type="number"
+                                inputMode="decimal"
+                                min={0}
+                                step="any"
+                                disabled={isLocked || isNA}
+                                value={isNA ? '' : row.added}
+                                onChange={(e) =>
+                                  handleNumberInput(
+                                    item.id,
+                                    'added',
+                                    e.target.value,
+                                    e.target.validity.badInput,
+                                  )
+                                }
+                                className="min-w-0 flex-1 h-12 text-center font-mono tabular-nums text-xl font-bold rounded-xl border border-orange-300 bg-orange-50/40 text-stone-900 focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:bg-stone-100"
+                              />
+                              <motion.button
+                                whileTap={{ scale: 0.93 }}
+                                type="button"
+                                disabled={isLocked || isNA}
+                                onClick={() => stepField(item.id, 'added', 1)}
+                                aria-label={`Sumar surtido ${item.name}`}
+                                className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-orange-200 bg-orange-50 text-orange-800 hover:bg-orange-100 disabled:opacity-40 cursor-pointer"
+                              >
+                                <Plus className="w-5 h-5" />
+                              </motion.button>
+                            </div>
                           </div>
                         </div>
 
-                        <div className="space-y-1.5">
-                          <label className="block text-xs font-semibold text-orange-700">
-                            ¿Llegó producto hoy? / Surtido (+)
-                          </label>
-                          <div className="flex items-center gap-2">
-                            <motion.button
-                              whileTap={{ scale: 0.93 }}
+                        {!isLocked && (
+                          <div className="grid grid-cols-2 gap-2">
+                            <button
                               type="button"
-                              disabled={isLocked}
-                              onClick={() => stepField(item.id, 'added', -1)}
-                              aria-label={`Restar surtido ${item.name}`}
-                              className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-orange-200 bg-orange-50 text-orange-800 hover:bg-orange-100 disabled:opacity-40 cursor-pointer"
+                              onClick={() => markZeroExplicit(item.id, 'opening')}
+                              className={`min-h-[42px] px-3 py-2 text-xs font-semibold rounded-xl border transition-colors cursor-pointer ${
+                                hasOpeningVal && row.opening === 0
+                                  ? 'bg-stone-900 text-white border-stone-900'
+                                  : 'bg-white text-stone-700 border-stone-200 hover:bg-stone-100'
+                              }`}
                             >
-                              <Minus className="w-5 h-5" />
-                            </motion.button>
-                            <input
-                              type="number"
-                              inputMode="decimal"
-                              min={0}
-                              step="any"
-                              disabled={isLocked}
-                              value={row.added}
-                              onChange={(e) =>
-                                updateField(item.id, 'added', parseFloat(e.target.value))
-                              }
-                              className="min-w-0 flex-1 h-12 text-center font-mono tabular-nums text-xl font-bold rounded-xl border border-orange-300 bg-orange-50/40 text-stone-900 focus:outline-none focus:ring-2 focus:ring-orange-500"
-                            />
-                            <motion.button
-                              whileTap={{ scale: 0.93 }}
+                              0 / Sin existencia
+                            </button>
+                            <button
                               type="button"
-                              disabled={isLocked}
-                              onClick={() => stepField(item.id, 'added', 1)}
-                              aria-label={`Sumar surtido ${item.name}`}
-                              className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-orange-200 bg-orange-50 text-orange-800 hover:bg-orange-100 disabled:opacity-40 cursor-pointer"
+                              onClick={() => toggleNotApplicable(item.id)}
+                              className={`min-h-[42px] inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-xl border transition-colors cursor-pointer ${
+                                isNA
+                                  ? 'bg-stone-700 text-white border-stone-700'
+                                  : 'bg-white text-stone-600 border-stone-200 hover:bg-stone-100'
+                              }`}
                             >
-                              <Plus className="w-5 h-5" />
-                            </motion.button>
+                              <Ban className="w-3.5 h-3.5 shrink-0" />
+                              {isNA ? 'Marcado: No aplica' : 'No aplica hoy'}
+                            </button>
                           </div>
-                        </div>
+                        )}
                       </div>
                     ) : (
-                      /* CLOSING PHASE (11 PM - 2 AM or Boss View) */
+                      /* CLOSING PHASE OR BOSS VIEW */
                       <>
-                        <div className="space-y-1.5">
+                        <div className="space-y-2">
                           <label
                             htmlFor={`mobile-close-${item.id}`}
                             className="block text-xs font-semibold text-stone-600"
@@ -805,7 +1304,7 @@ export function StationShiftView({
                             <motion.button
                               whileTap={{ scale: 0.93 }}
                               type="button"
-                              disabled={isLocked}
+                              disabled={isLocked || isNA}
                               onClick={() => stepField(item.id, 'closing', -1)}
                               aria-label={`Restar ${item.name}`}
                               className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
@@ -818,17 +1317,23 @@ export function StationShiftView({
                               inputMode="decimal"
                               min={0}
                               step="any"
-                              disabled={isLocked}
-                              value={row.closing}
+                              disabled={isLocked || isNA}
+                              placeholder="—"
+                              value={hasClosingVal ? row.closing : ''}
                               onChange={(e) =>
-                                updateField(item.id, 'closing', parseFloat(e.target.value))
+                                handleNumberInput(
+                                  item.id,
+                                  'closing',
+                                  e.target.value,
+                                  e.target.validity.badInput,
+                                )
                               }
-                              className={`min-w-0 flex-1 h-12 text-center font-mono tabular-nums text-xl font-bold rounded-xl border focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:opacity-60 transition-colors ${inputBorderClass}`}
+                              className={`min-w-0 flex-1 h-12 text-center font-mono tabular-nums text-xl font-bold rounded-xl border placeholder:text-stone-300 focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:opacity-60 transition-colors ${inputBorderClass}`}
                             />
                             <motion.button
                               whileTap={{ scale: 0.93 }}
                               type="button"
-                              disabled={isLocked}
+                              disabled={isLocked || isNA}
                               onClick={() => stepField(item.id, 'closing', 1)}
                               aria-label={`Sumar ${item.name}`}
                               className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
@@ -836,10 +1341,38 @@ export function StationShiftView({
                               <Plus className="w-5 h-5" />
                             </motion.button>
                           </div>
+
+                          {!isLocked && (
+                            <div className="grid grid-cols-2 gap-2 pt-0.5">
+                              <button
+                                type="button"
+                                onClick={() => markZeroExplicit(item.id, 'closing')}
+                                className={`min-h-[42px] px-3 py-2 text-xs font-semibold rounded-xl border transition-colors cursor-pointer ${
+                                  hasClosingVal && row.closing === 0
+                                    ? 'bg-red-700 text-white border-red-700'
+                                    : 'bg-white text-stone-700 border-stone-200 hover:bg-stone-100'
+                                }`}
+                              >
+                                0 / No queda
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => toggleNotApplicable(item.id)}
+                                className={`min-h-[42px] inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-xl border transition-colors cursor-pointer ${
+                                  isNA
+                                    ? 'bg-stone-700 text-white border-stone-700'
+                                    : 'bg-white text-stone-600 border-stone-200 hover:bg-stone-100'
+                                }`}
+                              >
+                                <Ban className="w-3.5 h-3.5 shrink-0" />
+                                {isNA ? 'Marcado: No aplica' : 'No aplica hoy'}
+                              </button>
+                            </div>
+                          )}
                         </div>
 
                         <AnimatePresence initial={false}>
-                          {showOpeningDetails && (
+                          {showOpeningDetails && !isNA && (
                             <motion.div
                               initial={{ opacity: 0, height: 0 }}
                               animate={{ opacity: 1, height: 'auto' }}
@@ -867,11 +1400,17 @@ export function StationShiftView({
                                       min={0}
                                       step="any"
                                       disabled={isLocked}
-                                      value={row.opening}
+                                      placeholder="—"
+                                      value={hasOpeningVal ? row.opening : ''}
                                       onChange={(e) =>
-                                        updateField(item.id, 'opening', parseFloat(e.target.value))
+                                        handleNumberInput(
+                                          item.id,
+                                          'opening',
+                                          e.target.value,
+                                          e.target.validity.badInput,
+                                        )
                                       }
-                                      className="min-w-0 w-full h-10 text-center font-mono tabular-nums text-sm font-semibold bg-stone-50 border border-stone-200 rounded-lg"
+                                      className="min-w-0 w-full h-10 text-center font-mono tabular-nums text-base sm:text-sm font-semibold bg-stone-50 border border-stone-200 rounded-lg"
                                     />
                                     <button
                                       type="button"
@@ -907,9 +1446,14 @@ export function StationShiftView({
                                       disabled={isLocked}
                                       value={row.added}
                                       onChange={(e) =>
-                                        updateField(item.id, 'added', parseFloat(e.target.value))
+                                        handleNumberInput(
+                                          item.id,
+                                          'added',
+                                          e.target.value,
+                                          e.target.validity.badInput,
+                                        )
                                       }
-                                      className="min-w-0 w-full h-10 text-center font-mono tabular-nums text-sm font-semibold bg-stone-50 border border-stone-200 rounded-lg"
+                                      className="min-w-0 w-full h-10 text-center font-mono tabular-nums text-base sm:text-sm font-semibold bg-stone-50 border border-stone-200 rounded-lg"
                                     />
                                     <button
                                       type="button"
@@ -938,7 +1482,7 @@ export function StationShiftView({
               <table className="w-full text-left border-collapse">
                 <thead>
                   <tr className="border-b border-stone-200 bg-stone-50 text-xs font-semibold text-stone-600">
-                    <th className="py-3.5 px-5 min-w-[220px]">Insumo</th>
+                    <th className="py-3.5 px-5 min-w-[210px]">Insumo</th>
                     {(isWorkerOpeningPhase || showOpeningDetails) && (
                       <>
                         <th className="py-3.5 px-3 text-center">Inicio del día</th>
@@ -946,10 +1490,14 @@ export function StationShiftView({
                       </>
                     )}
                     {isWorkerOpeningPhase ? (
-                      <th className="py-3.5 px-5 text-right">Total disponible</th>
+                      <>
+                        <th className="py-3.5 px-4 text-center">Opciones</th>
+                        <th className="py-3.5 px-5 text-right">Total disponible</th>
+                      </>
                     ) : (
                       <>
                         <th className="py-3.5 px-4 text-center">¿Cuánto quedó hoy? (Cierre)</th>
+                        <th className="py-3.5 px-3 text-center">Opciones</th>
                         {showOpeningDetails && <th className="py-3.5 px-4 text-right">Consumo</th>}
                         <th className="py-3.5 px-5">Estado / Alerta</th>
                       </>
@@ -958,7 +1506,7 @@ export function StationShiftView({
                 </thead>
                 <tbody className="divide-y divide-stone-100 text-sm">
                   {filteredItems.map((item) => {
-                    const row = drafts[item.id] ?? {
+                    const row: DraftEntryRow = drafts[item.id] ?? {
                       itemId: item.id,
                       itemName: item.name,
                       unit: item.unit,
@@ -969,9 +1517,15 @@ export function StationShiftView({
                       closing: 0,
                       hasOpening: false,
                       hasClosing: false,
+                      notApplicable: false,
                     };
-                    const hasValue = row.hasClosing || isCompleted;
-                    const consumed = Math.max(0, row.opening + row.added - row.closing);
+                    const isNA = Boolean(row.notApplicable);
+                    const hasOpeningVal = row.hasOpening && !isNA;
+                    const hasValue = row.hasClosing && !isNA;
+                    const consumed =
+                      hasOpeningVal && hasValue
+                        ? Math.max(0, row.opening + row.added - row.closing)
+                        : null;
                     const level = getStockLevel(row.closing, item.minStock);
                     const meta = getStockLevelMeta(level);
                     const suggestBuy = getSuggestedPurchase(
@@ -981,14 +1535,17 @@ export function StationShiftView({
                     );
 
                     return (
-                      <tr key={item.id} className="hover:bg-stone-50/70 transition-colors">
+                      <tr
+                        key={item.id}
+                        className={`transition-colors ${isNA ? 'bg-stone-50/90' : 'hover:bg-stone-50/70'}`}
+                      >
                         <td className="py-4 px-5">
                           <div className="text-base font-semibold text-stone-900">
                             {item.name}
                           </div>
                           <div className="text-xs text-stone-500 font-mono tabular-nums mt-0.5">
                             {item.unit} · Mínimo: {item.minStock}
-                            {!isWorkerOpeningPhase && !showOpeningDetails && row.hasOpening
+                            {!isWorkerOpeningPhase && !showOpeningDetails && hasOpeningVal
                               ? ` · Base día: ${row.opening + row.added}`
                               : ''}
                           </div>
@@ -1000,7 +1557,7 @@ export function StationShiftView({
                               <div className="flex items-center justify-center gap-1">
                                 <button
                                   type="button"
-                                  disabled={isLocked}
+                                  disabled={isLocked || isNA}
                                   onClick={() => stepField(item.id, 'opening', -1)}
                                   aria-label={`Restar inicio de ${item.name}`}
                                   className="w-9 h-10 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
@@ -1011,17 +1568,23 @@ export function StationShiftView({
                                   type="number"
                                   min={0}
                                   step="any"
-                                  disabled={isLocked}
+                                  disabled={isLocked || isNA}
+                                  placeholder="—"
                                   aria-label={`Inicio de ${item.name}`}
-                                  value={row.opening}
+                                  value={hasOpeningVal ? row.opening : ''}
                                   onChange={(e) =>
-                                    updateField(item.id, 'opening', parseFloat(e.target.value))
+                                    handleNumberInput(
+                                      item.id,
+                                      'opening',
+                                      e.target.value,
+                                      e.target.validity.badInput,
+                                    )
                                   }
-                                  className="w-16 h-10 text-center font-mono tabular-nums text-sm font-medium bg-stone-50 border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500 focus:bg-white disabled:opacity-60"
+                                  className="w-16 h-10 text-center font-mono tabular-nums text-sm font-medium bg-stone-50 border border-stone-200 rounded-lg placeholder:text-stone-300 focus:outline-none focus:ring-2 focus:ring-orange-500 focus:bg-white disabled:opacity-60"
                                 />
                                 <button
                                   type="button"
-                                  disabled={isLocked}
+                                  disabled={isLocked || isNA}
                                   onClick={() => stepField(item.id, 'opening', 1)}
                                   aria-label={`Sumar inicio de ${item.name}`}
                                   className="w-9 h-10 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
@@ -1035,7 +1598,7 @@ export function StationShiftView({
                               <div className="flex items-center justify-center gap-1">
                                 <button
                                   type="button"
-                                  disabled={isLocked}
+                                  disabled={isLocked || isNA}
                                   onClick={() => stepField(item.id, 'added', -1)}
                                   aria-label={`Restar surtido de ${item.name}`}
                                   className="w-9 h-10 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
@@ -1046,17 +1609,22 @@ export function StationShiftView({
                                   type="number"
                                   min={0}
                                   step="any"
-                                  disabled={isLocked}
+                                  disabled={isLocked || isNA}
                                   aria-label={`Surtido de ${item.name}`}
-                                  value={row.added}
+                                  value={isNA ? '' : row.added}
                                   onChange={(e) =>
-                                    updateField(item.id, 'added', parseFloat(e.target.value))
+                                    handleNumberInput(
+                                      item.id,
+                                      'added',
+                                      e.target.value,
+                                      e.target.validity.badInput,
+                                    )
                                   }
                                   className="w-16 h-10 text-center font-mono tabular-nums text-sm bg-stone-50 border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500 focus:bg-white disabled:opacity-60"
                                 />
                                 <button
                                   type="button"
-                                  disabled={isLocked}
+                                  disabled={isLocked || isNA}
                                   onClick={() => stepField(item.id, 'added', 1)}
                                   aria-label={`Sumar surtido de ${item.name}`}
                                   className="w-9 h-10 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
@@ -1069,9 +1637,43 @@ export function StationShiftView({
                         )}
 
                         {isWorkerOpeningPhase ? (
-                          <td className="py-4 px-5 text-right font-mono tabular-nums font-bold text-stone-900">
-                            {row.opening + row.added} {item.unit}
-                          </td>
+                          <>
+                            <td className="py-4 px-3">
+                              <div className="flex items-center justify-center gap-1.5">
+                                <button
+                                  type="button"
+                                  disabled={isLocked}
+                                  onClick={() => markZeroExplicit(item.id, 'opening')}
+                                  className={`min-h-[36px] px-2.5 py-1 text-xs font-semibold rounded-lg border whitespace-nowrap cursor-pointer disabled:opacity-50 ${
+                                    hasOpeningVal && row.opening === 0
+                                      ? 'bg-stone-900 text-white border-stone-900'
+                                      : 'bg-white text-stone-700 border-stone-200 hover:bg-stone-100'
+                                  }`}
+                                >
+                                  0
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={isLocked}
+                                  onClick={() => toggleNotApplicable(item.id)}
+                                  className={`min-h-[36px] px-2.5 py-1 text-xs font-semibold rounded-lg border whitespace-nowrap cursor-pointer disabled:opacity-50 ${
+                                    isNA
+                                      ? 'bg-stone-700 text-white border-stone-700'
+                                      : 'bg-white text-stone-600 border-stone-200 hover:bg-stone-100'
+                                  }`}
+                                >
+                                  No aplica
+                                </button>
+                              </div>
+                            </td>
+                            <td className="py-4 px-5 text-right font-mono tabular-nums font-bold text-stone-900">
+                              {isNA
+                                ? 'No aplica'
+                                : hasOpeningVal
+                                  ? `${row.opening + row.added} ${item.unit}`
+                                  : 'Por contar'}
+                            </td>
+                          </>
                         ) : (
                           <>
                             <td className="py-4 px-4">
@@ -1079,7 +1681,7 @@ export function StationShiftView({
                                 <motion.button
                                   whileTap={{ scale: 0.93 }}
                                   type="button"
-                                  disabled={isLocked}
+                                  disabled={isLocked || isNA}
                                   onClick={() => stepField(item.id, 'closing', -1)}
                                   aria-label={`Restar cierre de ${item.name}`}
                                   className="w-11 h-11 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
@@ -1090,22 +1692,30 @@ export function StationShiftView({
                                   type="number"
                                   min={0}
                                   step="any"
-                                  disabled={isLocked}
+                                  disabled={isLocked || isNA}
+                                  placeholder="—"
                                   aria-label={`Cierre de ${item.name}`}
-                                  value={row.closing}
+                                  value={hasValue ? row.closing : ''}
                                   onChange={(e) =>
-                                    updateField(item.id, 'closing', parseFloat(e.target.value))
+                                    handleNumberInput(
+                                      item.id,
+                                      'closing',
+                                      e.target.value,
+                                      e.target.validity.badInput,
+                                    )
                                   }
-                                  className={`w-20 h-11 text-center font-mono tabular-nums text-base font-bold rounded-xl border focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:opacity-60 transition-colors ${
-                                    hasValue
-                                      ? 'bg-white border-orange-500 text-stone-900'
-                                      : 'bg-stone-50 border-stone-300 text-stone-800'
+                                  className={`w-20 h-11 text-center font-mono tabular-nums text-base font-bold rounded-xl border placeholder:text-stone-300 focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:opacity-60 transition-colors ${
+                                    isNA
+                                      ? 'bg-stone-100 border-stone-200 text-stone-400'
+                                      : hasValue
+                                        ? 'bg-white border-orange-500 text-stone-900'
+                                        : 'bg-stone-50 border-stone-300 text-stone-800'
                                   }`}
                                 />
                                 <motion.button
                                   whileTap={{ scale: 0.93 }}
                                   type="button"
-                                  disabled={isLocked}
+                                  disabled={isLocked || isNA}
                                   onClick={() => stepField(item.id, 'closing', 1)}
                                   aria-label={`Sumar cierre de ${item.name}`}
                                   className="w-11 h-11 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
@@ -1115,14 +1725,47 @@ export function StationShiftView({
                               </div>
                             </td>
 
+                            <td className="py-4 px-3">
+                              <div className="flex items-center justify-center gap-1.5">
+                                <button
+                                  type="button"
+                                  disabled={isLocked}
+                                  onClick={() => markZeroExplicit(item.id, 'closing')}
+                                  className={`min-h-[38px] px-2.5 py-1 text-xs font-semibold rounded-lg border whitespace-nowrap cursor-pointer disabled:opacity-50 ${
+                                    hasValue && row.closing === 0
+                                      ? 'bg-red-700 text-white border-red-700'
+                                      : 'bg-white text-stone-700 border-stone-200 hover:bg-stone-100'
+                                  }`}
+                                >
+                                  0 / No queda
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={isLocked}
+                                  onClick={() => toggleNotApplicable(item.id)}
+                                  className={`min-h-[38px] px-2.5 py-1 text-xs font-semibold rounded-lg border whitespace-nowrap cursor-pointer disabled:opacity-50 ${
+                                    isNA
+                                      ? 'bg-stone-700 text-white border-stone-700'
+                                      : 'bg-white text-stone-600 border-stone-200 hover:bg-stone-100'
+                                  }`}
+                                >
+                                  No aplica
+                                </button>
+                              </div>
+                            </td>
+
                             {showOpeningDetails && (
                               <td className="py-4 px-4 text-right font-mono tabular-nums text-stone-700">
-                                {consumed} {item.unit}
+                                {consumed !== null ? `${consumed} ${item.unit}` : '—'}
                               </td>
                             )}
 
                             <td className="py-4 px-5 whitespace-nowrap">
-                              {!hasValue ? (
+                              {isNA ? (
+                                <span className="text-xs font-semibold text-stone-500">
+                                  No aplica hoy
+                                </span>
+                              ) : !hasValue ? (
                                 <span className="text-xs font-medium text-stone-400">
                                   Por contar
                                 </span>
@@ -1174,26 +1817,49 @@ export function StationShiftView({
               maxLength={MAX_NOTES_LENGTH}
               disabled={isLocked}
               value={notes}
-              onChange={(e) => setNotes(e.target.value)}
+              onChange={(e) => handleNotesChange(e.target.value)}
               placeholder={
                 isWorkerOpeningPhase
                   ? 'Ej: Llegaron 2 cajas de gaseosa y 3 bolsas de papa...'
                   : 'Ej: Llegó pedido de gaseosas hoy, o falta comprar hielo urgente...'
               }
-              className="w-full px-3.5 py-2.5 text-sm bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 focus:bg-white disabled:opacity-60"
+              className="w-full px-3.5 py-2.5 text-base sm:text-sm bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 focus:bg-white disabled:opacity-60"
             />
           </div>
+
+          {!isLocked && !allAccounted && (
+            <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2.5 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900">
+              <span>
+                <strong>{countedCount} de {stationItems.length} contados.</strong> Faltan{' '}
+                {missingCount} {missingCount === 1 ? 'insumo' : 'insumos'} para poder enviar.
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  setItemFilter('pendientes');
+                  listSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }}
+                className="font-bold text-orange-700 underline hover:text-orange-900 cursor-pointer"
+              >
+                Ver los {missingCount} faltantes
+              </button>
+            </div>
+          )}
 
           <div className="flex flex-col-reverse sm:flex-row sm:items-center justify-end gap-3">
             {isWorkerOpeningPhase ? (
               <button
                 type="button"
-                disabled={isLocked || savingMode !== null}
+                disabled={isLocked || savingMode !== null || !allAccounted}
                 onClick={() => handleSave('opening')}
-                className="min-h-[48px] inline-flex items-center justify-center gap-2 px-6 py-3 text-sm sm:text-base font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.99] disabled:opacity-50 transition-all whitespace-nowrap shrink-0 cursor-pointer"
+                className="min-h-[48px] inline-flex items-center justify-center gap-2 px-6 py-3 text-sm sm:text-base font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.99] disabled:opacity-50 disabled:cursor-not-allowed transition-all whitespace-nowrap shrink-0 cursor-pointer"
               >
                 <Save className="w-5 h-5" />
-                {savingMode === 'opening' ? 'Guardando apertura...' : 'Guardar apertura y surtido'}
+                {savingMode === 'opening'
+                  ? 'Guardando apertura...'
+                  : allAccounted
+                    ? 'Guardar apertura y surtido'
+                    : `Faltan ${missingCount} por contar`}
               </button>
             ) : (
               <>
@@ -1211,12 +1877,16 @@ export function StationShiftView({
 
                 <button
                   type="button"
-                  disabled={isLocked || savingMode !== null}
+                  disabled={isLocked || savingMode !== null || !allAccounted}
                   onClick={() => handleSave('closing')}
-                  className="min-h-[48px] inline-flex items-center justify-center gap-2 px-6 py-3 text-sm sm:text-base font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.99] disabled:opacity-50 transition-all whitespace-nowrap shrink-0 cursor-pointer"
+                  className="min-h-[48px] inline-flex items-center justify-center gap-2 px-6 py-3 text-sm sm:text-base font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.99] disabled:opacity-50 disabled:cursor-not-allowed transition-all whitespace-nowrap shrink-0 cursor-pointer"
                 >
                   <CheckCircle2 className="w-5 h-5" />
-                  {savingMode === 'closing' ? 'Enviando cierre...' : 'Enviar cierre del día al jefe'}
+                  {savingMode === 'closing'
+                    ? 'Enviando cierre...'
+                    : allAccounted
+                      ? 'Enviar cierre del día al jefe'
+                      : `Faltan ${missingCount} por contar`}
                 </button>
               </>
             )}

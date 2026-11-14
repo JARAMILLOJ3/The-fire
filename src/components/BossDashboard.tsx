@@ -55,7 +55,7 @@ interface BossDashboardProps {
 }
 
 type ViewTab = 'compras' | 'completo';
-type StockFilter = 'todos' | 'comprar' | 'medio' | 'suficiente';
+type StockFilter = 'todos' | 'comprar' | 'medio' | 'suficiente' | 'sin_dato';
 
 function getTimeGreeting(): string {
   const hour = new Date().getHours();
@@ -113,11 +113,18 @@ export function BossDashboard({
     ).length;
     const anyReportedStations = stations.filter((s) => Boolean(reportsByStation[s.id])).length;
     const toBuy = consolidatedRows.filter(
-      (r) => r.stockLevel === 'agotado' || r.stockLevel === 'comprar',
+      (r) => r.hasCountedClosing && (r.stockLevel === 'agotado' || r.stockLevel === 'comprar'),
     ).length;
-    const lowSoon = consolidatedRows.filter((r) => r.stockLevel === 'medio').length;
-    const outOfStock = consolidatedRows.filter((r) => r.stockLevel === 'agotado').length;
-    const sufficient = consolidatedRows.filter((r) => r.stockLevel === 'suficiente').length;
+    const lowSoon = consolidatedRows.filter(
+      (r) => r.hasCountedClosing && r.stockLevel === 'medio',
+    ).length;
+    const outOfStock = consolidatedRows.filter(
+      (r) => r.hasCountedClosing && r.stockLevel === 'agotado',
+    ).length;
+    const sufficient = consolidatedRows.filter(
+      (r) => r.hasCountedClosing && r.stockLevel === 'suficiente',
+    ).length;
+    const pendingCount = consolidatedRows.filter((r) => r.stockLevel === 'sin_dato').length;
 
     return {
       completedStations,
@@ -126,6 +133,7 @@ export function BossDashboard({
       lowSoon,
       outOfStock,
       sufficient,
+      pendingCount,
     };
   }, [consolidatedRows, reportsByStation, stations]);
 
@@ -173,6 +181,7 @@ export function BossDashboard({
       comprar: 1,
       medio: 2,
       suficiente: 3,
+      sin_dato: 4,
     };
     return [...filteredRows].sort((a, b) => {
       if (priority[a.stockLevel] !== priority[b.stockLevel]) {
@@ -475,12 +484,14 @@ export function BossDashboard({
 
                 <div className="pt-3 border-t border-stone-100 flex items-center justify-between gap-2">
                   <span className="text-xs">
-                    {lowCount > 0 ? (
+                    {report?.status !== 'completed' ? (
+                      <span className="text-stone-500">Sin cierre aún</span>
+                    ) : lowCount > 0 ? (
                       <span className="text-red-700 font-semibold">
                         {lowCount} por comprar
                       </span>
                     ) : (
-                      <span className="text-stone-600">Stock en orden</span>
+                      <span className="text-emerald-700 font-medium">Stock en orden</span>
                     )}
                   </span>
                   <button
@@ -562,6 +573,7 @@ export function BossDashboard({
               <option value="comprar">Solo para comprar</option>
               <option value="medio">Pronto a acabarse</option>
               <option value="suficiente">Stock suficiente</option>
+              <option value="sin_dato">Pendiente de contar</option>
             </select>
           </div>
         </div>
@@ -601,6 +613,11 @@ export function BossDashboard({
               {sortedShoppingRows.map((row) => {
                 const meta = getStockLevelMeta(row.stockLevel);
                 const stName = stationMap[row.item.station]?.name ?? row.item.station;
+                const statusText = row.isNotApplicable
+                  ? 'No aplica hoy'
+                  : row.isProvisional
+                    ? 'Provisional (apertura)'
+                    : meta.label;
                 return (
                   <div key={row.item.id} className="p-4 space-y-2">
                     <div className="flex items-start justify-between gap-3">
@@ -616,7 +633,7 @@ export function BossDashboard({
                         {(row.stockLevel === 'agotado' || row.stockLevel === 'comprar') && (
                           <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
                         )}
-                        {meta.label}
+                        {statusText}
                       </span>
                     </div>
 
@@ -624,16 +641,18 @@ export function BossDashboard({
                       <span className="text-stone-700">
                         Quedan:{' '}
                         <strong className="text-stone-900">
-                          {row.hasCountedClosing
-                            ? `${row.currentStock} ${row.item.unit}`
-                            : row.entry?.hasOpening
-                              ? `${row.currentStock}* ${row.item.unit}`
-                              : 'Sin conteo'}
+                          {row.isNotApplicable
+                            ? 'No aplica'
+                            : row.hasCountedClosing && row.currentStock !== null
+                              ? `${row.currentStock} ${row.item.unit}`
+                              : row.isProvisional && row.provisionalStock !== null
+                                ? `${row.provisionalStock} ${row.item.unit} (Provisional)`
+                                : 'Pendiente de contar'}
                         </strong>
                         <span className="text-stone-500 text-xs"> (Mín {row.item.minStock})</span>
                       </span>
 
-                      {row.suggestedBuy > 0 && (
+                      {row.hasCountedClosing && row.suggestedBuy > 0 && (
                         <span className="font-bold text-red-700 shrink-0">
                           Pedir +{row.suggestedBuy} {row.item.unit}
                         </span>
@@ -668,6 +687,11 @@ export function BossDashboard({
                   {sortedShoppingRows.map((row) => {
                     const meta = getStockLevelMeta(row.stockLevel);
                     const stName = stationMap[row.item.station]?.name ?? row.item.station;
+                    const statusText = row.isNotApplicable
+                      ? 'No aplica hoy'
+                      : row.isProvisional
+                        ? 'Provisional'
+                        : meta.label;
                     return (
                       <tr key={row.item.id} className="hover:bg-stone-50/80 transition-colors">
                         <td className="py-3.5 px-5">
@@ -680,25 +704,29 @@ export function BossDashboard({
                         {viewTab === 'completo' && (
                           <>
                             <td className="py-3.5 px-4 text-right font-mono tabular-nums text-stone-700">
-                              {row.entry?.hasOpening ? row.entry.opening : '—'}
+                              {row.entry?.hasOpening && !row.isNotApplicable ? row.entry.opening : '—'}
                             </td>
                             <td className="py-3.5 px-4 text-right font-mono tabular-nums text-stone-500">
-                              {row.entry && row.entry.added > 0 ? `+${row.entry.added}` : '0'}
+                              {row.entry && !row.isNotApplicable && row.entry.added > 0
+                                ? `+${row.entry.added}`
+                                : '—'}
                             </td>
                           </>
                         )}
                         <td className="py-3.5 px-4 text-right font-mono tabular-nums font-semibold text-stone-900">
-                          {row.hasCountedClosing ? (
+                          {row.isNotApplicable ? (
+                            <span className="text-stone-400 font-normal">No aplica</span>
+                          ) : row.hasCountedClosing && row.currentStock !== null ? (
                             row.currentStock
-                          ) : row.entry?.hasOpening ? (
+                          ) : row.isProvisional && row.provisionalStock !== null ? (
                             <span
-                              className="text-stone-500 font-normal"
-                              title="Cierre aún pendiente"
+                              className="text-amber-700 font-medium"
+                              title="Valor provisional de apertura; no entra en alertas de compra"
                             >
-                              {row.currentStock}*
+                              {row.provisionalStock} (prov.)
                             </span>
                           ) : (
-                            <span className="text-stone-400 font-normal">Sin conteo</span>
+                            <span className="text-stone-400 font-normal">Pendiente de contar</span>
                           )}
                         </td>
                         {viewTab === 'completo' && (
@@ -710,7 +738,7 @@ export function BossDashboard({
                           {row.item.minStock}
                         </td>
                         <td className="py-3.5 px-4 text-right font-mono tabular-nums font-bold">
-                          {row.suggestedBuy > 0 ? (
+                          {row.hasCountedClosing && row.suggestedBuy > 0 ? (
                             <span className="text-red-700">
                               +{row.suggestedBuy} {row.item.unit}
                             </span>
@@ -725,7 +753,7 @@ export function BossDashboard({
                             {(row.stockLevel === 'agotado' || row.stockLevel === 'comprar') && (
                               <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
                             )}
-                            {meta.label}
+                            {statusText}
                           </span>
                         </td>
                       </tr>
@@ -739,7 +767,7 @@ export function BossDashboard({
 
         {sortedShoppingRows.some((r) => !r.hasCountedClosing) && (
           <div className="px-5 py-3 bg-stone-50 border-t border-stone-200 text-xs text-stone-600">
-            Nota: Los valores marcados con &ldquo;Sin conteo&rdquo; o * corresponden a puestos que aún no envían su cierre del día seleccionado.
+            Nota: Los insumos sin cierre definitivo figuran como &ldquo;Pendiente de contar&rdquo; o &ldquo;Provisional&rdquo; y no generan alertas falsas de compra ni entran al WhatsApp.
           </div>
         )}
       </section>

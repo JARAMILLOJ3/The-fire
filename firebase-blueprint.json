@@ -379,6 +379,9 @@
         "hasClosing": {
           "type": "boolean"
         },
+        "notApplicable": {
+          "type": "boolean"
+        },
         "updatedByUid": {
           "type": "string",
           "pattern": "^[a-zA-Z0-9_\\-]+$",

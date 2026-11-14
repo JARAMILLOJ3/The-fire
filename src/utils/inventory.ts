@@ -98,6 +98,13 @@ export function getStockLevelMeta(level: StockLevel): {
         bgClass: 'bg-emerald-50',
         borderClass: 'border-emerald-200',
       };
+    case 'sin_dato':
+      return {
+        label: 'Pendiente de contar',
+        textClass: 'text-stone-600',
+        bgClass: 'bg-stone-100',
+        borderClass: 'border-stone-200',
+      };
   }
 }
 
@@ -112,18 +119,32 @@ export function buildConsolidatedRows(
       const entry = entriesByItemId[item.id] ?? null;
       const report = reportsByStation[item.station];
       const reportStatus = report?.status ?? 'open';
-      const hasCountedClosing = Boolean(entry?.hasClosing);
-      const currentStock = entry
-        ? entry.hasClosing
-          ? entry.closing
-          : entry.hasOpening
-            ? entry.opening + entry.added
-            : 0
-        : 0;
-      const consumed =
-        entry && entry.hasOpening && entry.hasClosing
-          ? Math.max(0, entry.opening + entry.added - entry.closing)
-          : null;
+      const isStationCompleted = reportStatus === 'completed';
+      const isNotApplicable = Boolean(entry?.notApplicable);
+      const hasCountedClosing = isStationCompleted && Boolean(entry?.hasClosing) && !isNotApplicable;
+      const hasProvisionalOpening = Boolean(entry?.hasOpening) && !isNotApplicable && !hasCountedClosing;
+      const provisionalStock = hasProvisionalOpening && entry ? entry.opening + entry.added : null;
+
+      if (!hasCountedClosing || !entry) {
+        return {
+          item,
+          entry,
+          reportStatus,
+          currentStock: null,
+          hasCountedClosing: false,
+          isProvisional: hasProvisionalOpening,
+          isNotApplicable,
+          provisionalStock,
+          consumed: null,
+          stockLevel: 'sin_dato' as StockLevel,
+          suggestedBuy: 0,
+        };
+      }
+
+      const currentStock = entry.closing;
+      const consumed = entry.hasOpening
+        ? Math.max(0, entry.opening + entry.added - entry.closing)
+        : null;
       const stockLevel = getStockLevel(currentStock, item.minStock);
       const suggestedBuy = getSuggestedPurchase(currentStock, item.minStock, item.targetStock);
 
@@ -132,7 +153,10 @@ export function buildConsolidatedRows(
         entry,
         reportStatus,
         currentStock,
-        hasCountedClosing,
+        hasCountedClosing: true,
+        isProvisional: false,
+        isNotApplicable: false,
+        provisionalStock: null,
         consumed,
         stockLevel,
         suggestedBuy,
@@ -145,11 +169,18 @@ export function buildWhatsAppShoppingList(
   rows: ConsolidatedItemRow[],
   stations: Workstation[],
 ): string {
-  const toBuy = rows.filter((r) => r.stockLevel === 'agotado' || r.stockLevel === 'comprar');
-  const lowSoon = rows.filter((r) => r.stockLevel === 'medio');
+  const anyCompleted = rows.some((r) => r.hasCountedClosing);
+  const toBuy = rows.filter(
+    (r) => r.hasCountedClosing && (r.stockLevel === 'agotado' || r.stockLevel === 'comprar'),
+  );
+  const lowSoon = rows.filter((r) => r.hasCountedClosing && r.stockLevel === 'medio');
+
+  if (!anyCompleted) {
+    return `The Fire Inventario (${formatDateHuman(dateStr)}): Aún no hay cierres completados para generar lista de compras.`;
+  }
 
   if (toBuy.length === 0 && lowSoon.length === 0) {
-    return `The Fire Inventario (${formatDateHuman(dateStr)}): Todo con stock suficiente. No hay compras urgentes para mañana.`;
+    return `The Fire Inventario (${formatDateHuman(dateStr)}): Todo con stock suficiente en los puestos cerrados. No hay compras urgentes.`;
   }
 
   const lines: string[] = [`*The Fire Inventario — Lista de compras (${formatDateHuman(dateStr)})*`, ''];
@@ -196,19 +227,27 @@ export function downloadDailyCsvReport(
     'SugeridoComprar',
   ];
 
-  const csvRows = rows.map((r) => [
-    dateStr,
-    `"${(stationNameMap.get(r.item.station) ?? r.item.station).replace(/"/g, '""')}"`,
-    `"${r.item.name.replace(/"/g, '""')}"`,
-    `"${r.item.unit.replace(/"/g, '""')}"`,
-    r.entry?.hasOpening ? r.entry.opening : '',
-    r.entry ? r.entry.added : '',
-    r.entry?.hasClosing ? r.entry.closing : '',
-    r.consumed !== null ? r.consumed : '',
-    r.item.minStock,
-    getStockLevelMeta(r.stockLevel).label,
-    r.suggestedBuy,
-  ]);
+  const csvRows = rows.map((r) => {
+    const statusLabel = r.isNotApplicable
+      ? 'No aplica'
+      : r.isProvisional
+        ? 'Provisional (solo apertura)'
+        : getStockLevelMeta(r.stockLevel).label;
+
+    return [
+      dateStr,
+      `"${(stationNameMap.get(r.item.station) ?? r.item.station).replace(/"/g, '""')}"`,
+      `"${r.item.name.replace(/"/g, '""')}"`,
+      `"${r.item.unit.replace(/"/g, '""')}"`,
+      r.entry?.hasOpening && !r.isNotApplicable ? r.entry.opening : '',
+      r.entry && !r.isNotApplicable ? r.entry.added : '',
+      r.hasCountedClosing && r.currentStock !== null ? r.currentStock : '',
+      r.consumed !== null ? r.consumed : '',
+      r.item.minStock,
+      `"${statusLabel}"`,
+      r.hasCountedClosing ? r.suggestedBuy : 0,
+    ];
+  });
 
   const content = [headers.join(','), ...csvRows.map((row) => row.join(','))].join('\n');
   const blob = new Blob(['\uFEFF' + content], { type: 'text/csv;charset=utf-8;' });

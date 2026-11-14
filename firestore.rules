@@ -211,7 +211,7 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'workspaceId', 'ownerUid', 'authorizedEmails', 'reportId', 'itemId',
           'station', 'date', 'itemName', 'unit', 'minStock', 'targetStock',
-          'opening', 'added', 'closing', 'hasOpening', 'hasClosing',
+          'opening', 'added', 'closing', 'hasOpening', 'hasClosing', 'notApplicable',
           'updatedByUid', 'updatedByName', 'createdAt', 'updatedAt'
         ])
         && isValidId(data.workspaceId)
@@ -230,6 +230,7 @@ service cloud.firestore {
         && data.closing is number && data.closing >= 0 && data.closing <= 100000
         && data.hasOpening is bool
         && data.hasClosing is bool
+        && (!('notApplicable' in data) || data.notApplicable is bool)
         && isValidId(data.updatedByUid)
         && data.updatedByName is string && data.updatedByName.size() >= 1 && data.updatedByName.size() <= 80
         && data.createdAt is timestamp
@@ -578,7 +579,7 @@ service cloud.firestore {
               canManageWorkspace(existing().workspaceId)
               && incoming().diff(existing()).affectedKeys().hasOnly([
                 'authorizedEmails', 'opening', 'added', 'closing', 'hasOpening', 'hasClosing',
-                'itemName', 'unit', 'minStock', 'targetStock',
+                'notApplicable', 'itemName', 'unit', 'minStock', 'targetStock',
                 'updatedByUid', 'updatedByName', 'updatedAt'
               ])
             )
@@ -586,7 +587,7 @@ service cloud.firestore {
               get(/databases/$(database)/documents/dailyReports/$(reportId)).data.status != 'completed'
               && incoming().diff(existing()).affectedKeys().hasOnly([
                 'opening', 'added', 'closing', 'hasOpening', 'hasClosing',
-                'itemName', 'unit', 'minStock', 'targetStock',
+                'notApplicable', 'itemName', 'unit', 'minStock', 'targetStock',
                 'updatedByUid', 'updatedByName', 'updatedAt'
               ])
             )
