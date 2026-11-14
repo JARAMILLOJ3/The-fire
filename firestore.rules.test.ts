@@ -559,5 +559,14 @@ describe('Firestore Security Rules (Emulator Suite)', () => {
         updatedAt: serverTimestamp(),
       }),
     );
+
+    // Non-existent previous-day report lookup (resource == null)
+    const missingYesterdayMesera = `${WS_ID}_2026-11-13_mesera`;
+    const missingYesterdayAsados = `${WS_ID}_2026-11-13_asados`;
+    await assertSucceeds(getDoc(doc(bossDb, 'dailyReports', missingYesterdayMesera)));
+    await assertSucceeds(getDoc(doc(bossDb, 'dailyReports', missingYesterdayAsados)));
+    await assertSucceeds(getDoc(doc(workerDb, 'dailyReports', missingYesterdayMesera)));
+    await assertFails(getDoc(doc(workerDb, 'dailyReports', missingYesterdayAsados)));
+    await assertFails(getDoc(doc(attackerDb, 'dailyReports', missingYesterdayMesera)));
   });
 });

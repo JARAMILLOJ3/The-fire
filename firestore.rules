@@ -160,7 +160,10 @@ service cloud.firestore {
         || wsId == 'ws_' + request.auth.uid
         || (
           exists(/databases/$(database)/documents/workspaces/$(wsId))
-          && get(/databases/$(database)/documents/workspaces/$(wsId)).data.ownerUid == request.auth.uid
+          && (
+            get(/databases/$(database)/documents/workspaces/$(wsId)).data.ownerUid == request.auth.uid
+            || request.auth.token.email in get(/databases/$(database)/documents/workspaces/$(wsId)).data.authorizedEmails
+          )
         )
         || (
           hasActiveMemberDoc()
@@ -168,6 +171,20 @@ service cloud.firestore {
           && memberDoc().station == 'jefe'
         )
       );
+    }
+
+    function canManageReportId(reportId) {
+      return isAdmin()
+        || reportId.matches('^ws_' + request.auth.uid + '_[0-9]{4}-[0-9]{2}-[0-9]{2}_[a-zA-Z0-9_\\-]+$')
+        || (
+          reportId.matches('^restaurante_principal_[0-9]{4}-[0-9]{2}-[0-9]{2}_[a-zA-Z0-9_\\-]+$')
+          && canManageWorkspace('restaurante_principal')
+        )
+        || (
+          hasActiveMemberDoc()
+          && memberDoc().station == 'jefe'
+          && reportId.matches('^' + memberDoc().workspaceId + '_[0-9]{4}-[0-9]{2}-[0-9]{2}_[a-zA-Z0-9_\\-]+$')
+        );
     }
 
     function canReportStation(wsId, station) {
@@ -403,12 +420,18 @@ service cloud.firestore {
       allow get: if isValidId(stationId) && isVerifiedUser() && (
         (
           resource == null
-          && hasActiveMemberDoc()
-          && memberDoc().station == stationId
+          && (
+            isAdmin()
+            || (
+              hasActiveMemberDoc()
+              && (memberDoc().station == stationId || memberDoc().station == 'jefe')
+            )
+          )
         )
         || (
           resource != null && (
-            existing().ownerUid == request.auth.uid
+            isAdmin()
+            || existing().ownerUid == request.auth.uid
             || request.auth.token.email in existing().authorizedEmails
             || (
               hasActiveMemberDoc()
@@ -485,12 +508,18 @@ service cloud.firestore {
       allow get: if isValidId(itemId) && isVerifiedUser() && (
         (
           resource == null
-          && hasActiveMemberDoc()
-          && itemId.matches('^' + memberDoc().station + '_[0-9]+$')
+          && (
+            isAdmin()
+            || (
+              hasActiveMemberDoc()
+              && (memberDoc().station == 'jefe' || itemId.matches('^' + memberDoc().station + '_[0-9]+$'))
+            )
+          )
         )
         || (
           resource != null && (
-            existing().ownerUid == request.auth.uid
+            isAdmin()
+            || existing().ownerUid == request.auth.uid
             || request.auth.token.email in existing().authorizedEmails
             || (
               hasActiveMemberDoc()
@@ -537,12 +566,18 @@ service cloud.firestore {
       allow get: if isValidId(reportId) && isVerifiedUser() && (
         (
           resource == null
-          && hasActiveMemberDoc()
-          && reportId.matches('^' + memberDoc().workspaceId + '_[0-9]{4}-[0-9]{2}-[0-9]{2}_' + memberDoc().station + '$')
+          && (
+            canManageReportId(reportId)
+            || (
+              hasActiveMemberDoc()
+              && reportId.matches('^' + memberDoc().workspaceId + '_[0-9]{4}-[0-9]{2}-[0-9]{2}_' + memberDoc().station + '$')
+            )
+          )
         )
         || (
           resource != null && (
-            existing().ownerUid == request.auth.uid
+            isAdmin()
+            || existing().ownerUid == request.auth.uid
             || request.auth.token.email in existing().authorizedEmails
             || (
               hasActiveMemberDoc()
@@ -615,14 +650,20 @@ service cloud.firestore {
           && (
             (
               resource == null
-              && hasActiveMemberDoc()
-              && reportId.matches('^' + memberDoc().workspaceId + '_[0-9]{4}-[0-9]{2}-[0-9]{2}_' + memberDoc().station + '$')
+              && (
+                canManageReportId(reportId)
+                || (
+                  hasActiveMemberDoc()
+                  && reportId.matches('^' + memberDoc().workspaceId + '_[0-9]{4}-[0-9]{2}-[0-9]{2}_' + memberDoc().station + '$')
+                )
+              )
             )
             || (
               resource != null
               && exists(/databases/$(database)/documents/dailyReports/$(reportId))
               && (
-                existing().ownerUid == request.auth.uid
+                isAdmin()
+                || existing().ownerUid == request.auth.uid
                 || request.auth.token.email in existing().authorizedEmails
                 || (
                   hasActiveMemberDoc()
