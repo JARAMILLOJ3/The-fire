@@ -64,6 +64,13 @@ export function handleFirestoreError(
   operationType: OperationType,
   path: string | null,
 ): never {
+  const rawCode =
+    error &&
+    typeof error === 'object' &&
+    'code' in error &&
+    typeof (error as { code?: unknown }).code === 'string'
+      ? (error as { code: string }).code
+      : undefined;
   const errInfo: FirestoreErrorInfo = {
     error: error instanceof Error ? error.message : String(error),
     authInfo: {
@@ -82,7 +89,9 @@ export function handleFirestoreError(
     path,
   };
   console.error('Firestore Error: ', JSON.stringify(errInfo));
-  throw new Error(JSON.stringify(errInfo));
+  const wrapped = new Error(JSON.stringify(errInfo)) as Error & { code?: string };
+  if (rawCode) wrapped.code = rawCode;
+  throw wrapped;
 }
 
 async function testConnection() {

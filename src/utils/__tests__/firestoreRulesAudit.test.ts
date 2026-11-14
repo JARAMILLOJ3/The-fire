@@ -40,4 +40,12 @@ describe('firestore.rules structural security audit', () => {
       expect(ruleBlock).not.toMatch(/\b(get|exists|getAfter|existsAfter)\s*\(/);
     });
   });
+
+  it('uses single-get helpers for worker entry creation and checks worker branch before canManageWorkspace', () => {
+    expect(rulesText).toContain('function isActiveStationWorker(wsId, station)');
+    expect(rulesText).toContain('function reportAfterMatchesEntry(reportData, entry)');
+    expect(rulesText).toContain('function entryMatchesItem(entry, itemData)');
+    expect(rulesText).toContain('entryMatchesItem(\n                incoming(),\n                get(/databases/$(database)/documents/items/$(itemId)).data');
+    expect(rulesText).not.toContain('exists(/databases/$(database)/documents/items/$(itemId))');
+  });
 });

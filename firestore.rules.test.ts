@@ -17,6 +17,7 @@ import {
   Timestamp,
   updateDoc,
   where,
+  writeBatch,
 } from 'firebase/firestore';
 import { afterAll, beforeAll, beforeEach, describe, it } from 'vitest';
 
@@ -568,5 +569,176 @@ describe('Firestore Security Rules (Emulator Suite)', () => {
     await assertSucceeds(getDoc(doc(workerDb, 'dailyReports', missingYesterdayMesera)));
     await assertFails(getDoc(doc(workerDb, 'dailyReports', missingYesterdayAsados)));
     await assertFails(getDoc(doc(attackerDb, 'dailyReports', missingYesterdayMesera)));
+  });
+
+  it('allows comida_rapida worker 10-item batch create + update, rejects mismatched item fields and out-of-schedule writes', async () => {
+    const opDate = getBogotaDateForNow();
+    const comidaUid = 'dQIuTI0yC5Y1V9jlieaI99ZP9yb2';
+    const comidaEmail = 'juan.jaramillo.galeano@correounivalle.edu.co';
+
+    await testEnv.withSecurityRulesDisabled(async (ctx) => {
+      const db = ctx.firestore();
+      const nowTs = Timestamp.now();
+
+      await setDoc(doc(db, 'stations', 'comida_rapida'), {
+        workspaceId: WS_ID,
+        ownerUid: OWNER_UID,
+        authorizedEmails: [OWNER_EMAIL],
+        name: 'Comida Rápida',
+        area: 'Plancha',
+        workerName: 'Juan',
+        description: 'Hamburguesas',
+        accessCode: 'tf_comidarapidacode12',
+        nextItemSlot: 11,
+        active: true,
+        sortOrder: 2,
+        createdAt: nowTs,
+        updatedAt: nowTs,
+      });
+
+      await setDoc(doc(db, 'teamMembers', comidaUid), {
+        workspaceId: WS_ID,
+        ownerUid: OWNER_UID,
+        uid: comidaUid,
+        email: comidaEmail,
+        displayName: 'Juan',
+        station: 'comida_rapida',
+        inviteId: 'tf_comidarapidacode12',
+        active: true,
+        createdAt: nowTs,
+        updatedAt: nowTs,
+      });
+
+      for (let i = 1; i <= 10; i++) {
+        await setDoc(doc(db, 'items', `comida_rapida_${i}`), {
+          workspaceId: WS_ID,
+          ownerUid: OWNER_UID,
+          authorizedEmails: [OWNER_EMAIL],
+          station: 'comida_rapida',
+          name: `Insumo ${i}`,
+          unit: 'und',
+          minStock: 10,
+          targetStock: 30,
+          active: true,
+          sortOrder: i,
+          createdAt: nowTs,
+          updatedAt: nowTs,
+        });
+      }
+    });
+
+    const workerDb = testEnv
+      .authenticatedContext(comidaUid, { email: comidaEmail, email_verified: true })
+      .firestore();
+    const reportId = `${WS_ID}_${opDate}_comida_rapida`;
+
+    // 10-item create batch must stay under read limit and succeed
+    const createBatch = writeBatch(workerDb);
+    createBatch.set(doc(workerDb, 'dailyReports', reportId), {
+      workspaceId: WS_ID,
+      ownerUid: OWNER_UID,
+      authorizedEmails: [OWNER_EMAIL],
+      date: opDate,
+      station: 'comida_rapida',
+      status: 'opening_saved',
+      reportedByUid: comidaUid,
+      reportedByName: 'Juan',
+      notes: '',
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    for (let i = 1; i <= 10; i++) {
+      createBatch.set(doc(workerDb, 'dailyReports', reportId, 'entries', `comida_rapida_${i}`), {
+        workspaceId: WS_ID,
+        ownerUid: OWNER_UID,
+        authorizedEmails: [OWNER_EMAIL],
+        reportId,
+        itemId: `comida_rapida_${i}`,
+        station: 'comida_rapida',
+        date: opDate,
+        itemName: `Insumo ${i}`,
+        unit: 'und',
+        minStock: 10,
+        targetStock: 30,
+        opening: 12,
+        added: 0,
+        closing: 0,
+        hasOpening: true,
+        hasClosing: false,
+        notApplicable: false,
+        updatedByUid: comidaUid,
+        updatedByName: 'Juan',
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    }
+    await assertSucceeds(createBatch.commit());
+
+    // Mismatched itemName/minStock must fail
+    const badBatch = writeBatch(workerDb);
+    badBatch.set(doc(workerDb, 'dailyReports', `${WS_ID}_${opDate}_comida_rapida_bad`), {
+      workspaceId: WS_ID,
+      ownerUid: OWNER_UID,
+      authorizedEmails: [OWNER_EMAIL],
+      date: opDate,
+      station: 'comida_rapida',
+      status: 'opening_saved',
+      reportedByUid: comidaUid,
+      reportedByName: 'Juan',
+      notes: '',
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    badBatch.set(
+      doc(workerDb, 'dailyReports', `${WS_ID}_${opDate}_comida_rapida_bad`, 'entries', 'comida_rapida_1'),
+      {
+        workspaceId: WS_ID,
+        ownerUid: OWNER_UID,
+        authorizedEmails: [OWNER_EMAIL],
+        reportId: `${WS_ID}_${opDate}_comida_rapida_bad`,
+        itemId: 'comida_rapida_1',
+        station: 'comida_rapida',
+        date: opDate,
+        itemName: 'Insumo ALTERADO',
+        unit: 'und',
+        minStock: 99,
+        targetStock: 30,
+        opening: 12,
+        added: 0,
+        closing: 0,
+        hasOpening: true,
+        hasClosing: false,
+        notApplicable: false,
+        updatedByUid: comidaUid,
+        updatedByName: 'Juan',
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      },
+    );
+    await assertFails(badBatch.commit());
+
+    // 10-item update to completed must also succeed
+    const updateBatch = writeBatch(workerDb);
+    updateBatch.update(doc(workerDb, 'dailyReports', reportId), {
+      status: 'completed',
+      reportedByUid: comidaUid,
+      reportedByName: 'Juan',
+      notes: 'Todo contado',
+      updatedAt: serverTimestamp(),
+    });
+    for (let i = 1; i <= 10; i++) {
+      updateBatch.update(doc(workerDb, 'dailyReports', reportId, 'entries', `comida_rapida_${i}`), {
+        opening: 12,
+        added: 0,
+        closing: 6,
+        hasOpening: true,
+        hasClosing: true,
+        notApplicable: false,
+        updatedByUid: comidaUid,
+        updatedByName: 'Juan',
+        updatedAt: serverTimestamp(),
+      });
+    }
+    await assertSucceeds(updateBatch.commit());
   });
 });

@@ -20,6 +20,7 @@ import {
   Search,
   Sun,
   WifiOff,
+  X,
 } from 'lucide-react';
 import { MAX_NOTES_LENGTH } from '../constants';
 import {
@@ -44,6 +45,7 @@ import {
   detectEntryAnomalies,
   detectReportAnomalies,
   formatDateHuman,
+  formatStationSaveError,
   formatTimeShort,
   getOpeningRowState,
   getPreviousDateStr,
@@ -53,6 +55,7 @@ import {
   parseQuantityInput,
   sanitizeStockQuantity,
   type EntryAnomaly,
+  type StationSaveErrorInfo,
 } from '../utils/inventory';
 import type { WorkerScheduleStatus } from '../utils/schedule';
 import { ShiftOutsideHoursView } from './shift/ShiftOutsideHoursView';
@@ -273,6 +276,7 @@ export function StationShiftView({
   const [searchTerm, setSearchTerm] = useState('');
   const [itemFilter, setItemFilter] = useState<ItemFilter>('todos');
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [saveError, setSaveError] = useState<StationSaveErrorInfo | null>(null);
   const [remoteChangedBy, setRemoteChangedBy] = useState<string | null>(null);
   const [pendingConflict, setPendingConflict] = useState<{
     mode: 'opening' | 'closing';
@@ -378,6 +382,7 @@ export function StationShiftView({
     setConfirmModalState(null);
     setShowSubmittedDetails(false);
     setFeedback(null);
+    setSaveError(null);
   }, [workspace.id, station.id, selectedDate, report?.id, draftMode, storageKey]);
 
   // 2. Merge remote snapshot updates WITHOUT overwriting touched local fields or preloaded previousClosing
@@ -891,25 +896,48 @@ export function StationShiftView({
     setRestoredFromLocal(false);
     setRemoteChangedBy(null);
     setPendingConflict(null);
+    setSaveError(null);
     setFeedback({
       type: 'success',
       text: 'Planilla sincronizada con los últimos datos guardados en el servidor.',
     });
   };
 
+  const buildRowsForSubmit = () =>
+    stationItems
+      .map((it) => {
+        const d = drafts[it.id];
+        if (!d) return null;
+        return {
+          ...d,
+          itemName: it.name,
+          unit: it.unit,
+          minStock: it.minStock,
+          targetStock: it.targetStock,
+        };
+      })
+      .filter((r): r is DraftEntryRow => r !== null);
+
   const requestSaveWithConfirmation = (mode: 'opening' | 'closing') => {
+    setSaveError(null);
     const check = canSubmitMode(mode);
     if (!check.ok && (mode === 'closing' || isWorkerOpeningPhase)) {
       setItemFilter('pendientes');
+      const reasonMsg =
+        check.reasonText ?? 'Completa los conteos faltantes antes de enviar.';
       setFeedback({
         type: 'error',
-        text: check.reasonText ?? 'Completa los conteos faltantes antes de enviar.',
+        text: reasonMsg,
+      });
+      setSaveError({
+        title: 'Faltan insumos por revisar o contar',
+        detail: reasonMsg,
       });
       listSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
       return;
     }
 
-    const rows = stationItems.map((it) => drafts[it.id]).filter(Boolean);
+    const rows = buildRowsForSubmit();
     const anomalies = detectReportAnomalies(rows, mode);
     setConfirmModalState({ mode, anomalies });
   };
@@ -920,11 +948,12 @@ export function StationShiftView({
   ) => {
     if (stationItems.length === 0) return;
 
-    const rows = stationItems.map((it) => drafts[it.id]).filter(Boolean);
+    const rows = buildRowsForSubmit();
     setConfirmModalState(null);
     setPendingConflict(null);
     setSavingMode(mode);
     setFeedback(null);
+    setSaveError(null);
 
     try {
       const saveResult = await saveStationReportBatch({
@@ -947,6 +976,7 @@ export function StationShiftView({
       notesTouchedRef.current = false;
       setRestoredFromLocal(false);
       setRemoteChangedBy(null);
+      setSaveError(null);
 
       setFeedback({
         type: 'success',
@@ -962,21 +992,31 @@ export function StationShiftView({
     } catch (err) {
       if (err instanceof ConcurrencyConflictError) {
         if (err.reason === 'completed_locked') {
+          setSaveError({
+            title: 'Planilla ya enviada y bloqueada',
+            detail: err.message,
+          });
           setFeedback({ type: 'error', text: err.message });
         } else {
           setPendingConflict({ mode, message: err.message });
+          setSaveError({
+            title: 'Otro dispositivo actualizó esta planilla',
+            detail: err.message,
+          });
           setFeedback({ type: 'error', text: err.message });
         }
         return;
       }
 
-      const rawMsg = err instanceof Error ? err.message : '';
-      const isPerm = rawMsg.includes('permission') || rawMsg.includes('insufficient');
+      const formatted = formatStationSaveError(err, {
+        schedulePhase: scheduleStatus.phase,
+        inGracePeriod: scheduleStatus.inGracePeriod,
+        isOnline,
+      });
+      setSaveError(formatted);
       setFeedback({
         type: 'error',
-        text: isPerm
-          ? 'No se pudo guardar porque el horario terminó o el cierre ya fue enviado. Pídele al jefe revisar la planilla. Tu borrador sigue guardado aquí.'
-          : 'Ocurrió un error al guardar el inventario. Tu borrador sigue guardado en este celular.',
+        text: `${formatted.title}: ${formatted.detail}${formatted.code ? ` (${formatted.code})` : ''}`,
       });
     } finally {
       setSavingMode(null);
@@ -2263,6 +2303,37 @@ export function StationShiftView({
             </div>
           )}
 
+          {/* Save error inline right beside Desktop Action Row */}
+          {saveError && !isLocked && (
+            <div
+              role="alert"
+              className="hidden lg:flex items-start justify-between gap-3 p-3.5 rounded-xl bg-red-50 border border-red-300 text-red-950"
+            >
+              <div className="flex items-start gap-2.5 min-w-0">
+                <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                <div className="text-xs space-y-0.5 min-w-0">
+                  <p className="font-bold">
+                    {saveError.title}
+                    {saveError.code ? (
+                      <span className="ml-2 font-mono font-semibold text-red-700">
+                        ({saveError.code})
+                      </span>
+                    ) : null}
+                  </p>
+                  <p className="text-red-900 leading-relaxed">{saveError.detail}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSaveError(null)}
+                aria-label="Cerrar error de guardado"
+                className="p-1 text-red-700 hover:bg-red-100 rounded-lg shrink-0 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+
           {/* Desktop Action Row */}
           <div className="hidden lg:flex items-center justify-end gap-3">
             {isWorkerOpeningPhase ? (
@@ -2318,37 +2389,69 @@ export function StationShiftView({
 
       {/* Mobile Sticky Bottom CTA Bar (compact <= 15% mobile viewport height) */}
       {stationItems.length > 0 && !isLocked && (
-        <div className="lg:hidden fixed bottom-0 left-0 right-0 z-30 bg-white/95 backdrop-blur-md border-t border-stone-200 px-4 py-2.5 shadow-lg no-print">
-          <div className="max-w-lg mx-auto flex items-center gap-3">
-            <div className="min-w-0 flex-1">
-              <p className="text-xs font-mono tabular-nums font-bold text-stone-900 truncate">
-                {counts.pendingConfirm > 0
-                  ? `${counts.pendingConfirm} por confirmar`
-                  : counts.missingCount > 0
-                    ? `Faltan ${counts.missingCount} por contar`
-                    : `${counts.total} de ${counts.total} listos`}
-              </p>
-              <p className="text-[11px] text-stone-500 truncate">
-                {isWorkerOpeningPhase ? 'Apertura del día' : 'Cierre del día'}
-              </p>
-            </div>
-
-            <button
-              type="button"
-              disabled={savingMode !== null || !primaryBlockStatus.ok}
-              onClick={() => requestSaveWithConfirmation(draftMode)}
-              className="min-h-[46px] px-4 py-2.5 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed transition-all whitespace-nowrap shrink-0 cursor-pointer"
+        <div className="lg:hidden fixed bottom-0 left-0 right-0 z-30 bg-white/95 backdrop-blur-md border-t border-stone-200 shadow-lg no-print">
+          {saveError && (
+            <div
+              role="alert"
+              className="px-4 py-2.5 bg-red-50 border-b border-red-200 text-red-950"
             >
-              {savingMode !== null
-                ? 'Guardando...'
-                : counts.pendingConfirm > 0
-                  ? `${counts.pendingConfirm} por confirmar`
-                  : counts.missingCount > 0
-                    ? `Faltan ${counts.missingCount}`
-                    : isWorkerOpeningPhase
-                      ? 'Guardar apertura'
-                      : 'Enviar cierre'}
-            </button>
+              <div className="max-w-lg mx-auto flex items-start justify-between gap-2">
+                <div className="flex items-start gap-2 min-w-0">
+                  <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                  <div className="text-xs min-w-0">
+                    <p className="font-bold leading-snug">
+                      {saveError.title}
+                      {saveError.code ? (
+                        <span className="ml-1.5 font-mono text-red-700">({saveError.code})</span>
+                      ) : null}
+                    </p>
+                    <p className="text-red-900 leading-snug mt-0.5">{saveError.detail}</p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSaveError(null)}
+                  aria-label="Cerrar error de guardado"
+                  className="p-1 text-red-700 hover:bg-red-100 rounded-lg shrink-0 cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          )}
+
+          <div className="px-4 py-2.5">
+            <div className="max-w-lg mx-auto flex items-center gap-3">
+              <div className="min-w-0 flex-1">
+                <p className="text-xs font-mono tabular-nums font-bold text-stone-900 truncate">
+                  {counts.pendingConfirm > 0
+                    ? `${counts.pendingConfirm} por confirmar`
+                    : counts.missingCount > 0
+                      ? `Faltan ${counts.missingCount} por contar`
+                      : `${counts.total} de ${counts.total} listos`}
+                </p>
+                <p className="text-[11px] text-stone-500 truncate">
+                  {isWorkerOpeningPhase ? 'Apertura del día' : 'Cierre del día'}
+                </p>
+              </div>
+
+              <button
+                type="button"
+                disabled={savingMode !== null || !primaryBlockStatus.ok}
+                onClick={() => requestSaveWithConfirmation(draftMode)}
+                className="min-h-[46px] px-4 py-2.5 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed transition-all whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                {savingMode !== null
+                  ? 'Guardando...'
+                  : counts.pendingConfirm > 0
+                    ? `${counts.pendingConfirm} por confirmar`
+                    : counts.missingCount > 0
+                      ? `Faltan ${counts.missingCount}`
+                      : isWorkerOpeningPhase
+                        ? 'Guardar apertura'
+                        : 'Enviar cierre'}
+              </button>
+            </div>
           </div>
         </div>
       )}

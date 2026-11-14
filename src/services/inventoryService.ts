@@ -1138,7 +1138,14 @@ export async function saveStationReportBatch(params: {
     MAX_NAME_LENGTH,
   );
   const cleanNotes = clampString(notes, MAX_NOTES_LENGTH);
-  const authorizedEmails = workspace.authorizedEmails.slice(0, 15);
+  const rawAuthorizedEmails = (workspace.authorizedEmails ?? [])
+    .map((e) => e.trim().toLowerCase())
+    .filter((e) => e.length >= 3 && e.includes('@'))
+    .slice(0, 15);
+  const authorizedEmails =
+    rawAuthorizedEmails.length > 0
+      ? rawAuthorizedEmails
+      : [workspace.ownerEmail.trim().toLowerCase()];
   const reportRef = doc(db, 'dailyReports', reportId);
 
   let detectedOffline = typeof navigator !== 'undefined' && !navigator.onLine;
@@ -1195,8 +1202,7 @@ export async function saveStationReportBatch(params: {
 
   // Merge any remote entries created concurrently so we use batch.update instead of batch.set
   const mergedExistingEntries: Record<string, DailyReportEntry> = { ...existingEntries };
-  const clientUpdatedAtMs = existingReport?.updatedAt?.toMillis?.() ?? null;
-  if (!detectedOffline && serverExists && (!existingReport || serverUpdatedAtMs !== clientUpdatedAtMs)) {
+  if (!detectedOffline && serverExists) {
     const missingIds = rows
       .map((r) => r.itemId)
       .filter((id) => !mergedExistingEntries[id]);
@@ -1217,31 +1223,13 @@ export async function saveStationReportBatch(params: {
     }
   }
 
-  const batch = writeBatch(db);
-
-  if (serverExists) {
-    batch.update(reportRef, {
-      status: guard.effectiveStatus,
-      reportedByUid: user.uid,
-      reportedByName: reporterName,
-      notes: cleanNotes,
-      updatedAt: serverTimestamp(),
-    });
-  } else {
-    batch.set(reportRef, {
-      workspaceId: workspace.id,
-      ownerUid: workspace.ownerUid,
-      authorizedEmails,
-      date,
-      station,
-      status: guard.effectiveStatus,
-      reportedByUid: user.uid,
-      reportedByName: reporterName,
-      notes: cleanNotes,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
+  interface EntryWriteOp {
+    ref: ReturnType<typeof doc>;
+    kind: 'update' | 'set';
+    payload: Record<string, unknown>;
   }
+
+  const entryOperations: EntryWriteOp[] = [];
 
   rows.forEach((row) => {
     const prev = mergedExistingEntries[row.itemId];
@@ -1308,7 +1296,7 @@ export async function saveStationReportBatch(params: {
         updatePayload.minStock = clampNumber(row.minStock);
         updatePayload.targetStock = clampNumber(row.targetStock);
       }
-      batch.update(entryRef, updatePayload);
+      entryOperations.push({ ref: entryRef, kind: 'update', payload: updatePayload });
     } else {
       const createPayload: Record<string, unknown> = {
         workspaceId: workspace.id,
@@ -1320,8 +1308,8 @@ export async function saveStationReportBatch(params: {
         date,
         itemName: row.itemName,
         unit: row.unit,
-        minStock: clampNumber(row.minStock),
-        targetStock: clampNumber(row.targetStock),
+        minStock: canManage ? clampNumber(row.minStock) : Number(row.minStock),
+        targetStock: canManage ? clampNumber(row.targetStock) : Number(row.targetStock),
         opening: openingVal,
         added: effectiveAdded,
         closing: closingVal,
@@ -1339,14 +1327,78 @@ export async function saveStationReportBatch(params: {
       if (derivedOpeningStatus !== undefined) {
         createPayload.openingStatus = derivedOpeningStatus;
       }
-      batch.set(entryRef, createPayload);
+      entryOperations.push({ ref: entryRef, kind: 'set', payload: createPayload });
     }
   });
 
+  // Chunk into batches of <= 8 entries so Firestore security rules stay safely under the 20-read batch limit
+  const MAX_ENTRIES_PER_BATCH = 8;
+  const entryChunks: EntryWriteOp[][] = [];
+  if (entryOperations.length === 0) {
+    entryChunks.push([]);
+  } else {
+    for (let i = 0; i < entryOperations.length; i += MAX_ENTRIES_PER_BATCH) {
+      entryChunks.push(entryOperations.slice(i, i + MAX_ENTRIES_PER_BATCH));
+    }
+  }
+
+  const intermediateStatus: ReportStatus =
+    serverExists && serverStatus === 'completed' ? 'completed' : 'opening_saved';
+
+  const batches = entryChunks.map((chunk, chunkIdx) => {
+    const chunkBatch = writeBatch(db);
+    const isFirst = chunkIdx === 0;
+    const isLast = chunkIdx === entryChunks.length - 1;
+    const chunkStatus = isLast ? guard.effectiveStatus : intermediateStatus;
+
+    if (isFirst) {
+      if (serverExists) {
+        chunkBatch.update(reportRef, {
+          status: chunkStatus,
+          reportedByUid: user.uid,
+          reportedByName: reporterName,
+          notes: cleanNotes,
+          updatedAt: serverTimestamp(),
+        });
+      } else {
+        chunkBatch.set(reportRef, {
+          workspaceId: workspace.id,
+          ownerUid: workspace.ownerUid,
+          authorizedEmails,
+          date,
+          station,
+          status: chunkStatus,
+          reportedByUid: user.uid,
+          reportedByName: reporterName,
+          notes: cleanNotes,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+    } else if (isLast) {
+      chunkBatch.update(reportRef, {
+        status: guard.effectiveStatus,
+        reportedByUid: user.uid,
+        reportedByName: reporterName,
+        notes: cleanNotes,
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    chunk.forEach((op) => {
+      if (op.kind === 'update') {
+        chunkBatch.update(op.ref, op.payload);
+      } else {
+        chunkBatch.set(op.ref, op.payload);
+      }
+    });
+
+    return chunkBatch;
+  });
+
   if (detectedOffline) {
-    // Firestore persistentLocalCache durably queues the batch in IndexedDB; resolve once queued
-    const commitPromise = batch.commit();
-    commitPromise.catch((error) => {
+    // Firestore persistentLocalCache durably queues the batches in IndexedDB; resolve once queued
+    Promise.all(batches.map((b) => b.commit())).catch((error) => {
       console.error('Error al sincronizar envío offline al reconectar:', error);
     });
     await new Promise((resolve) => window.setTimeout(resolve, 120));
@@ -1354,7 +1406,9 @@ export async function saveStationReportBatch(params: {
   }
 
   try {
-    await batch.commit();
+    for (const b of batches) {
+      await b.commit();
+    }
     return { queuedOffline: false };
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, `dailyReports/${reportId}`);

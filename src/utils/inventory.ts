@@ -439,3 +439,111 @@ export function downloadDailyCsvReport(
   document.body.removeChild(link);
   URL.revokeObjectURL(url);
 }
+
+export interface StationSaveErrorInfo {
+  title: string;
+  detail: string;
+  code?: string;
+}
+
+export function formatStationSaveError(
+  error: unknown,
+  context: {
+    schedulePhase?: 'opening' | 'closing' | 'outside' | 'unrestricted';
+    inGracePeriod?: boolean;
+    isOnline?: boolean;
+  } = {},
+): StationSaveErrorInfo {
+  let code =
+    error &&
+    typeof error === 'object' &&
+    'code' in error &&
+    typeof (error as { code?: unknown }).code === 'string'
+      ? (error as { code: string }).code
+      : undefined;
+
+  let rawMessage = error instanceof Error ? error.message : String(error ?? '');
+
+  if (rawMessage.startsWith('{') && rawMessage.includes('"error"')) {
+    try {
+      const parsed = JSON.parse(rawMessage) as { error?: unknown };
+      if (typeof parsed.error === 'string' && parsed.error.trim()) {
+        rawMessage = parsed.error;
+      }
+    } catch {
+      // Keep original message if not valid JSON
+    }
+  }
+
+  const lower = rawMessage.toLowerCase();
+  if (!code) {
+    if (lower.includes('permission') || lower.includes('insufficient')) {
+      code = 'permission-denied';
+    } else if (lower.includes('unauthenticated')) {
+      code = 'unauthenticated';
+    } else if (lower.includes('unavailable') || lower.includes('offline')) {
+      code = 'unavailable';
+    } else if (lower.includes('deadline')) {
+      code = 'deadline-exceeded';
+    }
+  }
+
+  if (
+    context.isOnline === false ||
+    code === 'unavailable' ||
+    code === 'deadline-exceeded' ||
+    lower.includes('offline') ||
+    lower.includes('network')
+  ) {
+    return {
+      title: 'Sin conexión estable con el servidor',
+      detail:
+        'Revisa tu señal de internet e intenta enviar de nuevo. Tu borrador sigue guardado en este dispositivo.',
+      code: code ?? 'unavailable',
+    };
+  }
+
+  if (code === 'unauthenticated') {
+    return {
+      title: 'Tu sesión de Google venció',
+      detail:
+        'Cierra este aviso e inicia sesión otra vez con tu cuenta de Google para poder enviar el inventario. Tu borrador no se perdió.',
+      code,
+    };
+  }
+
+  if (code === 'permission-denied') {
+    if (context.schedulePhase === 'outside') {
+      return {
+        title: 'Fuera del horario permitido',
+        detail:
+          'El horario del turno ya terminó (hora de Colombia). Pídele al jefe revisar o guardar el registro. Tu borrador sigue guardado aquí.',
+        code,
+      };
+    }
+
+    if (context.inGracePeriod) {
+      return {
+        title: 'Horario terminado o cierre ya bloqueado',
+        detail:
+          'Puede que los minutos de tolerancia se hayan cumplido justo al enviar, o que el cierre ya estuviera guardado. Pídele al jefe revisar la planilla.',
+        code,
+      };
+    }
+
+    return {
+      title: 'Permiso rechazado al guardar en el servidor',
+      detail:
+        'Firebase rechazó el envío (puede ser cierre ya bloqueado, algún insumo desactualizado respecto al catálogo del jefe o acceso del puesto revocado). Recarga la página o avísale al jefe; tu borrador sigue guardado aquí.',
+      code,
+    };
+  }
+
+  return {
+    title: 'No se pudo guardar el inventario',
+    detail:
+      'Ocurrió un error al enviar al servidor. Tu borrador sigue guardado en este dispositivo; intenta de nuevo en unos segundos.',
+    code,
+  };
+}
+

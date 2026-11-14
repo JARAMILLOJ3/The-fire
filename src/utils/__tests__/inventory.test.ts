@@ -275,4 +275,37 @@ describe('inventory.ts (sanitización, sin_dato, anomalías y compras)', () => {
     expect(bulkResult.nextRows.mesera_2.openingStatus).toBe('adjusted');
     expect(bulkResult.nextRows.mesera_3.hasOpening).toBe(false);
   });
+
+  it('formats save errors in Spanish with clear causes and Firestore error codes', async () => {
+    const { formatStationSaveError } = await import('../inventory');
+
+    const wrappedPerm = new Error(
+      JSON.stringify({
+        error: 'Missing or insufficient permissions.',
+        operationType: 'write',
+        path: 'dailyReports/restaurante_principal_2026-11-14_comida_rapida',
+      }),
+    );
+
+    const outsideErr = formatStationSaveError(wrappedPerm, {
+      schedulePhase: 'outside',
+      isOnline: true,
+    });
+    expect(outsideErr.code).toBe('permission-denied');
+    expect(outsideErr.title).toContain('Fuera del horario');
+
+    const insidePermErr = formatStationSaveError(wrappedPerm, {
+      schedulePhase: 'closing',
+      inGracePeriod: false,
+      isOnline: true,
+    });
+    expect(insidePermErr.code).toBe('permission-denied');
+    expect(insidePermErr.detail).toContain('catálogo');
+
+    const offlineErr = formatStationSaveError(new Error('Client is offline'), {
+      isOnline: false,
+    });
+    expect(offlineErr.code).toBe('unavailable');
+    expect(offlineErr.title).toContain('Sin conexión');
+  });
 });

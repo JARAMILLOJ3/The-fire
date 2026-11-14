@@ -132,16 +132,19 @@ service cloud.firestore {
       return dateVal == bogotaOpDateStr() || dateVal == bogotaPrevOpDateStr();
     }
 
-    function isWorkerWithinSchedule(wsId) {
-      return !('shiftSchedule' in get(/databases/$(database)/documents/workspaces/$(wsId)).data)
+    function isWorkspaceWithinSchedule(wsData) {
+      return !('shiftSchedule' in wsData)
         ? (
           inWindowWithGrace(bogotaMinutesNow(), '16:00', '18:00', 10)
           || inWindowWithGrace(bogotaMinutesNow(), '23:00', '02:00', 10)
         )
-        : isScheduleAllowed(
-          get(/databases/$(database)/documents/workspaces/$(wsId)).data.shiftSchedule,
-          bogotaMinutesNow()
-        );
+        : isScheduleAllowed(wsData.shiftSchedule, bogotaMinutesNow());
+    }
+
+    function isWorkerWithinSchedule(wsId) {
+      return isWorkspaceWithinSchedule(
+        get(/databases/$(database)/documents/workspaces/$(wsId)).data
+      );
     }
 
     function hasActiveMemberDoc() {
@@ -152,6 +155,28 @@ service cloud.firestore {
 
     function memberDoc() {
       return get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data;
+    }
+
+    function isActiveStationWorker(wsId, station) {
+      return hasActiveMemberDoc()
+        && memberDoc().workspaceId == wsId
+        && memberDoc().station == station;
+    }
+
+    function reportAfterMatchesEntry(reportData, entry) {
+      return reportData.workspaceId == entry.workspaceId
+        && reportData.ownerUid == entry.ownerUid
+        && reportData.date == entry.date
+        && reportData.station == entry.station;
+    }
+
+    function entryMatchesItem(entry, itemData) {
+      return itemData.workspaceId == entry.workspaceId
+        && itemData.station == entry.station
+        && itemData.name == entry.itemName
+        && itemData.unit == entry.unit
+        && itemData.minStock == entry.minStock
+        && itemData.targetStock == entry.targetStock;
     }
 
     function canManageWorkspace(wsId) {
@@ -600,14 +625,17 @@ service cloud.firestore {
         && incoming().reportedByUid == request.auth.uid
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time
-        && exists(/databases/$(database)/documents/workspaces/$(incoming().workspaceId))
-        && incoming().ownerUid == get(/databases/$(database)/documents/workspaces/$(incoming().workspaceId)).data.ownerUid
         && (
-          canManageWorkspace(incoming().workspaceId)
-          || (
-            canReportStation(incoming().workspaceId, incoming().station)
+          (
+            isActiveStationWorker(incoming().workspaceId, incoming().station)
             && isValidWorkerOperationalDate(incoming().date)
-            && isWorkerWithinSchedule(incoming().workspaceId)
+            && isWorkspaceWithinSchedule(get(/databases/$(database)/documents/workspaces/$(incoming().workspaceId)).data)
+            && incoming().ownerUid == get(/databases/$(database)/documents/workspaces/$(incoming().workspaceId)).data.ownerUid
+          )
+          || (
+            canManageWorkspace(incoming().workspaceId)
+            && exists(/databases/$(database)/documents/workspaces/$(incoming().workspaceId))
+            && incoming().ownerUid == get(/databases/$(database)/documents/workspaces/$(incoming().workspaceId)).data.ownerUid
           )
         );
 
@@ -622,19 +650,19 @@ service cloud.firestore {
         && incoming().updatedAt == request.time
         && (
           (
-            canManageWorkspace(existing().workspaceId)
-            && incoming().diff(existing()).affectedKeys().hasOnly([
-              'authorizedEmails', 'status', 'reportedByUid', 'reportedByName', 'notes', 'updatedAt'
-            ])
-          )
-          || (
-            canReportStation(existing().workspaceId, existing().station)
+            isActiveStationWorker(existing().workspaceId, existing().station)
             && existing().status != 'completed'
             && isValidWorkerOperationalDate(existing().date)
             && isWorkerWithinSchedule(existing().workspaceId)
             && incoming().reportedByUid == request.auth.uid
             && incoming().diff(existing()).affectedKeys().hasOnly([
               'status', 'reportedByUid', 'reportedByName', 'notes', 'updatedAt'
+            ])
+          )
+          || (
+            canManageWorkspace(existing().workspaceId)
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'authorizedEmails', 'status', 'reportedByUid', 'reportedByName', 'notes', 'updatedAt'
             ])
           )
         );
@@ -688,30 +716,23 @@ service cloud.firestore {
           && incoming().updatedByUid == request.auth.uid
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time
-          && (
-            exists(/databases/$(database)/documents/dailyReports/$(reportId))
-            || existsAfter(/databases/$(database)/documents/dailyReports/$(reportId))
+          && reportAfterMatchesEntry(
+            getAfter(/databases/$(database)/documents/dailyReports/$(reportId)).data,
+            incoming()
           )
-          && getAfter(/databases/$(database)/documents/dailyReports/$(reportId)).data.workspaceId == incoming().workspaceId
-          && getAfter(/databases/$(database)/documents/dailyReports/$(reportId)).data.station == incoming().station
-          && getAfter(/databases/$(database)/documents/dailyReports/$(reportId)).data.ownerUid == incoming().ownerUid
-          && getAfter(/databases/$(database)/documents/dailyReports/$(reportId)).data.date == incoming().date
           && (
-            canManageWorkspace(incoming().workspaceId)
-            || (
-              canReportStation(incoming().workspaceId, incoming().station)
+            (
+              isActiveStationWorker(incoming().workspaceId, incoming().station)
               && (!exists(/databases/$(database)/documents/dailyReports/$(reportId))
                   || get(/databases/$(database)/documents/dailyReports/$(reportId)).data.status != 'completed')
               && isValidWorkerOperationalDate(incoming().date)
               && isWorkerWithinSchedule(incoming().workspaceId)
-              && exists(/databases/$(database)/documents/items/$(itemId))
-              && get(/databases/$(database)/documents/items/$(itemId)).data.workspaceId == incoming().workspaceId
-              && get(/databases/$(database)/documents/items/$(itemId)).data.station == incoming().station
-              && get(/databases/$(database)/documents/items/$(itemId)).data.name == incoming().itemName
-              && get(/databases/$(database)/documents/items/$(itemId)).data.unit == incoming().unit
-              && get(/databases/$(database)/documents/items/$(itemId)).data.minStock == incoming().minStock
-              && get(/databases/$(database)/documents/items/$(itemId)).data.targetStock == incoming().targetStock
+              && entryMatchesItem(
+                incoming(),
+                get(/databases/$(database)/documents/items/$(itemId)).data
+              )
             )
+            || canManageWorkspace(incoming().workspaceId)
           );
 
         allow update: if isValidId(reportId)
@@ -727,19 +748,9 @@ service cloud.firestore {
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
           && incoming().updatedByUid == request.auth.uid
-          && exists(/databases/$(database)/documents/dailyReports/$(reportId))
           && (
             (
-              canManageWorkspace(existing().workspaceId)
-              && incoming().diff(existing()).affectedKeys().hasOnly([
-                'authorizedEmails', 'opening', 'added', 'closing', 'hasOpening', 'hasClosing',
-                'notApplicable', 'previousClosing', 'openingStatus',
-                'itemName', 'unit', 'minStock', 'targetStock',
-                'updatedByUid', 'updatedByName', 'updatedAt'
-              ])
-            )
-            || (
-              canReportStation(existing().workspaceId, existing().station)
+              isActiveStationWorker(existing().workspaceId, existing().station)
               && get(/databases/$(database)/documents/dailyReports/$(reportId)).data.status != 'completed'
               && isValidWorkerOperationalDate(existing().date)
               && isWorkerWithinSchedule(existing().workspaceId)
@@ -750,6 +761,16 @@ service cloud.firestore {
               && incoming().diff(existing()).affectedKeys().hasOnly([
                 'opening', 'added', 'closing', 'hasOpening', 'hasClosing',
                 'notApplicable', 'previousClosing', 'openingStatus',
+                'updatedByUid', 'updatedByName', 'updatedAt'
+              ])
+            )
+            || (
+              canManageWorkspace(existing().workspaceId)
+              && exists(/databases/$(database)/documents/dailyReports/$(reportId))
+              && incoming().diff(existing()).affectedKeys().hasOnly([
+                'authorizedEmails', 'opening', 'added', 'closing', 'hasOpening', 'hasClosing',
+                'notApplicable', 'previousClosing', 'openingStatus',
+                'itemName', 'unit', 'minStock', 'targetStock',
                 'updatedByUid', 'updatedByName', 'updatedAt'
               ])
             )
