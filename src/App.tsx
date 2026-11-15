@@ -150,6 +150,7 @@ export default function App() {
     effectiveItems,
     reportsForSelectedDate,
     effectiveEntriesByReportId,
+    dashboardEntriesByReportId,
     consolidatedEntriesByItemId,
     todayAllEntries,
     invites,
@@ -164,6 +165,7 @@ export default function App() {
     canManage,
     role,
     effectiveSelectedDate,
+    todayStr,
     yesterdayStr,
   });
 
@@ -620,6 +622,8 @@ export default function App() {
                         items={effectiveItems}
                         reportsByStation={reportsForSelectedDate}
                         entriesByItemId={consolidatedEntriesByItemId}
+                        allReports={allReports}
+                        entriesByReportId={dashboardEntriesByReportId}
                         onSelectDate={handleSelectDate}
                         onOpenStation={(stId) => navigateTo(stId)}
                         onGoToWorkstations={() => navigateTo('puestos')}

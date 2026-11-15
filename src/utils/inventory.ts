@@ -1,11 +1,13 @@
 import type { Timestamp } from 'firebase/firestore';
-import { MAX_STOCK_VALUE } from '../constants';
+import { MAX_STOCK_VALUE, WORKER_GRACE_MINUTES } from '../constants';
 import type {
   ConsolidatedItemRow,
   DailyReport,
   DailyReportEntry,
   DraftEntryRow,
   InventoryItem,
+  ShiftSchedule,
+  StationId,
   StockLevel,
   Workstation,
 } from '../types';
@@ -13,7 +15,9 @@ import {
   BOGOTA_TIME_ZONE,
   getOperationalDateStr,
   getPreviousDateStr,
+  shiftDateStr,
 } from './date';
+import { hasClosingDeadlinePassed } from './schedule';
 
 export { getOperationalDateStr, getPreviousDateStr };
 
@@ -229,6 +233,10 @@ export function confirmAllPendingOpeningRows(
   return { nextRows, confirmedIds };
 }
 
+export function hasTargetBelowMin(minStock: number, targetStock: number): boolean {
+  return targetStock < minStock;
+}
+
 export function getStockLevel(closingQty: number, minStock: number): StockLevel {
   if (closingQty <= 0) return 'agotado';
   if (closingQty <= minStock) return 'comprar';
@@ -238,8 +246,72 @@ export function getStockLevel(closingQty: number, minStock: number): StockLevel 
 
 export function getSuggestedPurchase(currentQty: number, minStock: number, targetStock: number): number {
   if (currentQty > minStock) return 0;
-  const goal = Math.max(targetStock, minStock * 2);
-  return Math.max(0, Math.ceil(goal - currentQty));
+  if (minStock === 0 && currentQty <= 0) {
+    return Math.max(1, Math.ceil(targetStock - currentQty));
+  }
+  return Math.max(0, Math.ceil(targetStock - currentQty));
+}
+
+export function normalizeCatalogItemName(name: string): string {
+  return name.trim().replace(/\s+/g, ' ').toLocaleLowerCase('es');
+}
+
+export interface CatalogItemValidationResult {
+  valid: boolean;
+  error: string | null;
+  warning: string | null;
+}
+
+export function validateCatalogItemInput(params: {
+  name: string;
+  unit: string;
+  station: StationId;
+  minStock: number;
+  targetStock: number;
+  existingItems: InventoryItem[];
+  editingItemId?: string;
+}): CatalogItemValidationResult {
+  const cleanName = params.name.trim();
+  const cleanUnit = params.unit.trim();
+
+  if (!cleanName) {
+    return { valid: false, error: 'Escribe el nombre del insumo.', warning: null };
+  }
+  if (!cleanUnit) {
+    return {
+      valid: false,
+      error: 'La unidad de medida es obligatoria (ej: und, kg, paq).',
+      warning: null,
+    };
+  }
+  if (!Number.isFinite(params.minStock) || params.minStock < 0) {
+    return { valid: false, error: 'El stock mínimo no puede ser negativo.', warning: null };
+  }
+  if (!Number.isFinite(params.targetStock) || params.targetStock < 0) {
+    return { valid: false, error: 'El stock ideal no puede ser negativo.', warning: null };
+  }
+
+  const normalizedName = normalizeCatalogItemName(cleanName);
+  const duplicate = params.existingItems.find(
+    (it) =>
+      it.active &&
+      it.station === params.station &&
+      it.id !== params.editingItemId &&
+      normalizeCatalogItemName(it.name) === normalizedName,
+  );
+  if (duplicate) {
+    return {
+      valid: false,
+      error: `Ya existe un insumo activo llamado "${duplicate.name}" en este puesto.`,
+      warning: null,
+    };
+  }
+
+  const warning = hasTargetBelowMin(params.minStock, params.targetStock)
+    ? `El stock ideal (${params.targetStock}) es menor que el stock mínimo (${params.minStock}). Ajusta el stock ideal para calcular compras completas.`
+    : null;
+
+  return { valid: true, error: null, warning };
 }
 
 export function getStockLevelMeta(level: StockLevel): {
@@ -386,11 +458,20 @@ export function buildWhatsAppShoppingList(
   return lines.join('\n').trim();
 }
 
-export function downloadDailyCsvReport(
+const CSV_FORMULA_PREFIX_PATTERN = /^[\t\r ]*[=+\-@]|^[\t\r]/;
+
+export function escapeCsvCell(value: string | number | null | undefined): string {
+  if (value === null || value === undefined) return '""';
+  const raw = String(value);
+  const safe = CSV_FORMULA_PREFIX_PATTERN.test(raw) ? `'${raw}` : raw;
+  return `"${safe.replace(/"/g, '""')}"`;
+}
+
+export function buildDailyCsvContent(
   dateStr: string,
   rows: ConsolidatedItemRow[],
   stations: Workstation[],
-): void {
+): string {
   const stationNameMap = new Map(stations.map((s) => [s.id, s.name]));
   const headers = [
     'Fecha',
@@ -404,7 +485,7 @@ export function downloadDailyCsvReport(
     'Minimo',
     'Estado',
     'SugeridoComprar',
-  ];
+  ].map(escapeCsvCell);
 
   const csvRows = rows.map((r) => {
     const statusLabel = r.isNotApplicable
@@ -414,21 +495,29 @@ export function downloadDailyCsvReport(
         : getStockLevelMeta(r.stockLevel).label;
 
     return [
-      dateStr,
-      `"${(stationNameMap.get(r.item.station) ?? r.item.station).replace(/"/g, '""')}"`,
-      `"${r.item.name.replace(/"/g, '""')}"`,
-      `"${r.item.unit.replace(/"/g, '""')}"`,
-      r.entry?.hasOpening && !r.isNotApplicable ? r.entry.opening : '',
-      r.entry && !r.isNotApplicable ? r.entry.added : '',
-      r.hasCountedClosing && r.currentStock !== null ? r.currentStock : '',
-      r.consumed !== null ? r.consumed : '',
-      r.item.minStock,
-      `"${statusLabel}"`,
-      r.hasCountedClosing ? r.suggestedBuy : 0,
+      escapeCsvCell(dateStr),
+      escapeCsvCell(stationNameMap.get(r.item.station) ?? r.item.station),
+      escapeCsvCell(r.item.name),
+      escapeCsvCell(r.item.unit),
+      escapeCsvCell(r.entry?.hasOpening && !r.isNotApplicable ? r.entry.opening : ''),
+      escapeCsvCell(r.entry && !r.isNotApplicable ? r.entry.added : ''),
+      escapeCsvCell(r.hasCountedClosing && r.currentStock !== null ? r.currentStock : ''),
+      escapeCsvCell(r.consumed !== null ? r.consumed : ''),
+      escapeCsvCell(r.item.minStock),
+      escapeCsvCell(statusLabel),
+      escapeCsvCell(r.hasCountedClosing ? r.suggestedBuy : 0),
     ];
   });
 
-  const content = [headers.join(','), ...csvRows.map((row) => row.join(','))].join('\n');
+  return [headers.join(','), ...csvRows.map((row) => row.join(','))].join('\n');
+}
+
+export function downloadDailyCsvReport(
+  dateStr: string,
+  rows: ConsolidatedItemRow[],
+  stations: Workstation[],
+): void {
+  const content = buildDailyCsvContent(dateStr, rows, stations);
   const blob = new Blob(['\uFEFF' + content], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
@@ -438,6 +527,229 @@ export function downloadDailyCsvReport(
   link.click();
   document.body.removeChild(link);
   URL.revokeObjectURL(url);
+}
+
+export interface WeeklyStationDayCell {
+  date: string;
+  status: 'completed' | 'opening_saved' | 'open';
+  isLate: boolean;
+  anomalyCount: number;
+  lowStockCount: number;
+}
+
+export interface WeeklyStationHistoryRow {
+  station: Workstation;
+  days: WeeklyStationDayCell[];
+  completedCount: number;
+  lateCount: number;
+}
+
+export interface WeeklyStationHistoryResult {
+  dates: string[];
+  rows: WeeklyStationHistoryRow[];
+}
+
+export function buildWeeklyStationHistory(params: {
+  endDateStr: string;
+  stations: Workstation[];
+  items: InventoryItem[];
+  allReports: DailyReport[];
+  entriesByReportId: Record<string, Record<string, DailyReportEntry>>;
+  schedule?: ShiftSchedule;
+  now?: Date;
+}): WeeklyStationHistoryResult {
+  const {
+    endDateStr,
+    stations,
+    items,
+    allReports,
+    entriesByReportId,
+    schedule,
+    now = new Date(),
+  } = params;
+
+  const dates = Array.from({ length: 7 }, (_, idx) => shiftDateStr(endDateStr, idx - 6));
+  const reportByDateAndStation = new Map<string, DailyReport>();
+  allReports.forEach((rep) => {
+    reportByDateAndStation.set(`${rep.date}|${rep.station}`, rep);
+  });
+
+  const activeItemsByStation = new Map<string, InventoryItem[]>();
+  items
+    .filter((it) => it.active)
+    .forEach((it) => {
+      const list = activeItemsByStation.get(it.station) ?? [];
+      list.push(it);
+      activeItemsByStation.set(it.station, list);
+    });
+
+  const rows: WeeklyStationHistoryRow[] = stations.map((station) => {
+    const stationItems = activeItemsByStation.get(station.id) ?? [];
+    let completedCount = 0;
+    let lateCount = 0;
+
+    const days: WeeklyStationDayCell[] = dates.map((date) => {
+      const rep = reportByDateAndStation.get(`${date}|${station.id}`);
+      const status = rep?.status ?? 'open';
+      const isLate =
+        status !== 'completed' &&
+        hasClosingDeadlinePassed(now, date, schedule, WORKER_GRACE_MINUTES);
+
+      if (status === 'completed') completedCount += 1;
+      if (isLate) lateCount += 1;
+
+      const entries = rep ? entriesByReportId[rep.id] : undefined;
+      let anomalyCount = 0;
+      let lowStockCount = 0;
+
+      if (entries) {
+        stationItems.forEach((item) => {
+          const entry = entries[item.id];
+          if (!entry || entry.notApplicable) return;
+          if (entry.hasOpening && entry.hasClosing) {
+            const available = sanitizeStockQuantity(entry.opening + entry.added);
+            if (entry.closing > available) {
+              anomalyCount += 1;
+            }
+          }
+          if (status === 'completed' && entry.hasClosing) {
+            const lvl = getStockLevel(entry.closing, item.minStock);
+            if (lvl === 'agotado' || lvl === 'comprar') {
+              lowStockCount += 1;
+            }
+          }
+        });
+      }
+
+      return {
+        date,
+        status,
+        isLate,
+        anomalyCount,
+        lowStockCount,
+      };
+    });
+
+    return {
+      station,
+      days,
+      completedCount,
+      lateCount,
+    };
+  });
+
+  return { dates, rows };
+}
+
+export type DashboardConsumptionAnomalyKind =
+  | 'closing_exceeds_available'
+  | 'above_average_consumption';
+
+export interface DashboardConsumptionAnomaly {
+  itemId: string;
+  itemName: string;
+  unit: string;
+  stationId: StationId;
+  stationName: string;
+  kind: DashboardConsumptionAnomalyKind;
+  opening: number;
+  added: number;
+  closing: number;
+  consumed: number;
+  averageConsumed?: number;
+  ratioToAverage?: number;
+  sampleDays?: number;
+  summary: string;
+}
+
+export function detectDashboardConsumptionAnomalies(params: {
+  selectedDate: string;
+  rows: ConsolidatedItemRow[];
+  stations: Workstation[];
+  allReports: DailyReport[];
+  entriesByReportId: Record<string, Record<string, DailyReportEntry>>;
+}): DashboardConsumptionAnomaly[] {
+  const { selectedDate, rows, stations, allReports, entriesByReportId } = params;
+  const stationNameMap = new Map(stations.map((s) => [s.id, s.name]));
+  const minLookbackDate = shiftDateStr(selectedDate, -7);
+
+  const priorCompletedReports = allReports.filter(
+    (rep) =>
+      rep.status === 'completed' &&
+      rep.date < selectedDate &&
+      rep.date >= minLookbackDate,
+  );
+
+  const anomalies: DashboardConsumptionAnomaly[] = [];
+
+  rows.forEach((row) => {
+    const entry = row.entry;
+    if (!entry || entry.notApplicable || !entry.hasClosing) return;
+
+    const stationName = stationNameMap.get(row.item.station) ?? row.item.station;
+    const available = sanitizeStockQuantity(entry.opening + entry.added);
+
+    if (entry.hasOpening && entry.closing > available) {
+      const excess = sanitizeStockQuantity(entry.closing - available);
+      anomalies.push({
+        itemId: row.item.id,
+        itemName: row.item.name,
+        unit: row.item.unit,
+        stationId: row.item.station,
+        stationName,
+        kind: 'closing_exceeds_available',
+        opening: entry.opening,
+        added: entry.added,
+        closing: entry.closing,
+        consumed: 0,
+        summary: `Cierre (${entry.closing} ${row.item.unit}) mayor que inicio + surtido (${available} ${row.item.unit}). Sobra +${excess} ${row.item.unit}.`,
+      });
+      return;
+    }
+
+    if (!row.hasCountedClosing || !entry.hasOpening || row.consumed === null || row.consumed <= 0) {
+      return;
+    }
+
+    const priorSamples: number[] = [];
+    priorCompletedReports.forEach((rep) => {
+      if (rep.station !== row.item.station) return;
+      const prevEntry = entriesByReportId[rep.id]?.[row.item.id];
+      if (!prevEntry || prevEntry.notApplicable || !prevEntry.hasOpening || !prevEntry.hasClosing) {
+        return;
+      }
+      const prevAvailable = sanitizeStockQuantity(prevEntry.opening + prevEntry.added);
+      if (prevEntry.closing <= prevAvailable) {
+        priorSamples.push(sanitizeStockQuantity(prevAvailable - prevEntry.closing));
+      }
+    });
+
+    if (priorSamples.length >= 2) {
+      const avg = priorSamples.reduce((sum, val) => sum + val, 0) / priorSamples.length;
+      const roundedAvg = Math.round(avg * 10) / 10;
+      if (avg > 0 && row.consumed >= avg * 1.8 && row.consumed - avg >= 2) {
+        const ratio = Math.round((row.consumed / avg) * 10) / 10;
+        anomalies.push({
+          itemId: row.item.id,
+          itemName: row.item.name,
+          unit: row.item.unit,
+          stationId: row.item.station,
+          stationName,
+          kind: 'above_average_consumption',
+          opening: entry.opening,
+          added: entry.added,
+          closing: entry.closing,
+          consumed: row.consumed,
+          averageConsumed: roundedAvg,
+          ratioToAverage: ratio,
+          sampleDays: priorSamples.length,
+          summary: `Consumo de ${row.consumed} ${row.item.unit} (${ratio}x su promedio de ${roundedAvg} ${row.item.unit} en ${priorSamples.length} días).`,
+        });
+      }
+    }
+  });
+
+  return anomalies;
 }
 
 export interface StationSaveErrorInfo {

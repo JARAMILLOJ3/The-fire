@@ -1,6 +1,6 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { Pencil, Plus, Sparkles, Trash2, X } from 'lucide-react';
+import { AlertTriangle, Archive, ArchiveRestore, Pencil, Plus, Sparkles, X } from 'lucide-react';
 import {
   MAX_NAME_LENGTH,
   MAX_UNIT_LENGTH,
@@ -8,11 +8,12 @@ import {
 } from '../constants';
 import {
   createInventoryItem,
-  deleteInventoryItem,
   seedDefaultWorkstationsAndCatalog,
+  setInventoryItemActive,
   updateInventoryItem,
 } from '../services/inventoryService';
 import type { InventoryItem, StationId, Workspace, Workstation } from '../types';
+import { hasTargetBelowMin, validateCatalogItemInput } from '../utils/inventory';
 
 interface CatalogManagerProps {
   workspace: Workspace;
@@ -28,12 +29,14 @@ export function CatalogManager({
   initialFilterStation = 'all',
 }: CatalogManagerProps) {
   const [stationFilter, setStationFilter] = useState<'all' | StationId>(initialFilterStation);
+  const [statusFilter, setStatusFilter] = useState<'active' | 'archived'>('active');
   const [showForm, setShowForm] = useState(false);
   const [editingItem, setEditingItem] = useState<InventoryItem | null>(null);
-  const [confirmDelete, setConfirmDelete] = useState<InventoryItem | null>(null);
+  const [confirmArchive, setConfirmArchive] = useState<InventoryItem | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [seeding, setSeeding] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [actionFeedback, setActionFeedback] = useState<string | null>(null);
 
   const [name, setName] = useState('');
   const [stationId, setStationId] = useState<StationId>(stations[0]?.id ?? 'mesera');
@@ -45,10 +48,31 @@ export function CatalogManager({
     setStationFilter(initialFilterStation);
   }, [initialFilterStation]);
 
-  const stationNameMap = new Map(stations.map((s) => [s.id, s.name]));
+  const stationNameMap = useMemo(
+    () => new Map(stations.map((s) => [s.id, s.name])),
+    [stations],
+  );
 
-  const filteredItems = items.filter((it) =>
+  const activeItems = useMemo(() => items.filter((it) => it.active), [items]);
+  const archivedItems = useMemo(() => items.filter((it) => !it.active), [items]);
+  const scopedStatusItems = statusFilter === 'active' ? activeItems : archivedItems;
+
+  const filteredItems = scopedStatusItems.filter((it) =>
     stationFilter === 'all' ? true : it.station === stationFilter,
+  );
+
+  const formValidation = useMemo(
+    () =>
+      validateCatalogItemInput({
+        name,
+        unit,
+        station: stationId,
+        minStock,
+        targetStock,
+        existingItems: items,
+        editingItemId: editingItem?.id,
+      }),
+    [name, unit, stationId, minStock, targetStock, items, editingItem?.id],
   );
 
   const openCreateForm = () => {
@@ -59,6 +83,7 @@ export function CatalogManager({
     setMinStock(5);
     setTargetStock(15);
     setErrorMsg(null);
+    setActionFeedback(null);
     setShowForm(true);
   };
 
@@ -70,23 +95,27 @@ export function CatalogManager({
     setMinStock(item.minStock);
     setTargetStock(item.targetStock);
     setErrorMsg(null);
+    setActionFeedback(null);
     setShowForm(true);
   };
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    if (!name.trim()) {
-      setErrorMsg('Escribe el nombre del insumo.');
+    if (!formValidation.valid) {
+      setErrorMsg(formValidation.error ?? 'Revisa los datos del insumo.');
       return;
     }
+
     setSubmitting(true);
     setErrorMsg(null);
     try {
+      const cleanName = name.trim();
+      const cleanUnit = unit.trim();
       if (editingItem) {
         await updateInventoryItem(editingItem.id, {
           station: stationId,
-          name,
-          unit,
+          name: cleanName,
+          unit: cleanUnit,
           minStock,
           targetStock,
           active: editingItem.active,
@@ -95,8 +124,8 @@ export function CatalogManager({
         const targetStationObj = stations.find((s) => s.id === stationId);
         await createInventoryItem(workspace, targetStationObj, {
           station: stationId,
-          name,
-          unit,
+          name: cleanName,
+          unit: cleanUnit,
           minStock,
           targetStock,
           sortOrder: (items.length + 1) * 10,
@@ -110,14 +139,43 @@ export function CatalogManager({
     }
   };
 
-  const handleDelete = async () => {
-    if (!confirmDelete) return;
+  const handleArchive = async () => {
+    if (!confirmArchive) return;
+    setSubmitting(true);
+    setActionFeedback(null);
+    try {
+      await setInventoryItemActive(confirmArchive.id, false);
+      setConfirmArchive(null);
+    } catch {
+      setActionFeedback('No se pudo archivar el insumo. Intenta nuevamente.');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleRestore = async (item: InventoryItem) => {
+    setActionFeedback(null);
+    const check = validateCatalogItemInput({
+      name: item.name,
+      unit: item.unit,
+      station: item.station,
+      minStock: item.minStock,
+      targetStock: item.targetStock,
+      existingItems: items,
+      editingItemId: item.id,
+    });
+    if (!check.valid) {
+      setActionFeedback(
+        check.error ?? 'Ya existe un insumo activo con ese nombre en el mismo puesto.',
+      );
+      return;
+    }
+
     setSubmitting(true);
     try {
-      await deleteInventoryItem(confirmDelete.id);
-      setConfirmDelete(null);
+      await setInventoryItemActive(item.id, true);
     } catch {
-      setErrorMsg('No se pudo eliminar el insumo.');
+      setActionFeedback('No se pudo reactivar el insumo. Intenta nuevamente.');
     } finally {
       setSubmitting(false);
     }
@@ -132,18 +190,23 @@ export function CatalogManager({
     }
   };
 
+  const misconfiguredActiveCount = activeItems.filter((it) =>
+    hasTargetBelowMin(it.minStock, it.targetStock),
+  ).length;
+
   return (
     <div className="space-y-6 min-w-0">
       <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
         <div className="min-w-0">
           <p className="text-xs font-semibold text-orange-600">
-            Configuración · {items.length} insumos totales
+            Configuración · {activeItems.length} activos
+            {archivedItems.length > 0 ? ` · ${archivedItems.length} archivados` : ''}
           </p>
           <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-stone-900 mt-1">
             Catálogo de Insumos
           </h1>
           <p className="text-sm text-stone-600 mt-1">
-            Administra los productos de cada puesto y su stock mínimo para alertas de compra.
+            Administra los productos de cada puesto. Los insumos archivados conservan todo su historial sin aparecer en planillas nuevas.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -170,36 +233,92 @@ export function CatalogManager({
         </div>
       </div>
 
-      {/* Filter Tabs */}
-      <div className="flex items-center gap-1 p-1 bg-stone-200/70 rounded-xl w-full sm:w-fit max-w-full overflow-x-auto">
-        <button
-          type="button"
-          onClick={() => setStationFilter('all')}
-          className={`min-h-[36px] px-3 py-1.5 text-xs font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
-            stationFilter === 'all'
-              ? 'bg-white text-stone-900 shadow-sm'
-              : 'text-stone-600 hover:text-stone-900'
-          }`}
+      {misconfiguredActiveCount > 0 && (
+        <div
+          role="status"
+          className="px-4 py-3 rounded-2xl bg-amber-50 border border-amber-200 flex items-start gap-2.5 text-xs sm:text-sm text-amber-950"
         >
-          Todos ({items.length})
-        </button>
-        {stations.map((st) => {
-          const count = items.filter((i) => i.station === st.id).length;
-          return (
-            <button
-              key={st.id}
-              type="button"
-              onClick={() => setStationFilter(st.id)}
-              className={`min-h-[36px] px-3 py-1.5 text-xs font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
-                stationFilter === st.id
-                  ? 'bg-white text-stone-900 shadow-sm'
-                  : 'text-stone-600 hover:text-stone-900'
-              }`}
-            >
-              {st.name} ({count})
-            </button>
-          );
-        })}
+          <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+          <span>
+            Hay <strong>{misconfiguredActiveCount}</strong>{' '}
+            {misconfiguredActiveCount === 1 ? 'insumo' : 'insumos'} con{' '}
+            <strong>stock ideal menor que el stock mínimo</strong>. Edítalos para que la cantidad sugerida de compra sea correcta.
+          </span>
+        </div>
+      )}
+
+      {actionFeedback && (
+        <div
+          role="alert"
+          className="px-4 py-3 rounded-2xl bg-red-50 border border-red-200 text-xs sm:text-sm text-red-800"
+        >
+          {actionFeedback}
+        </div>
+      )}
+
+      {/* Filter Bar: Station + Active/Archived */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-1 p-1 bg-stone-200/70 rounded-xl w-full sm:w-fit max-w-full overflow-x-auto">
+          <button
+            type="button"
+            onClick={() => setStationFilter('all')}
+            className={`min-h-[36px] px-3 py-1.5 text-xs font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+              stationFilter === 'all'
+                ? 'bg-white text-stone-900 shadow-sm'
+                : 'text-stone-600 hover:text-stone-900'
+            }`}
+          >
+            Todos ({scopedStatusItems.length})
+          </button>
+          {stations.map((st) => {
+            const count = scopedStatusItems.filter((i) => i.station === st.id).length;
+            return (
+              <button
+                key={st.id}
+                type="button"
+                onClick={() => setStationFilter(st.id)}
+                className={`min-h-[36px] px-3 py-1.5 text-xs font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+                  stationFilter === st.id
+                    ? 'bg-white text-stone-900 shadow-sm'
+                    : 'text-stone-600 hover:text-stone-900'
+                }`}
+              >
+                {st.name} ({count})
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="flex items-center gap-1 p-1 bg-stone-200/70 rounded-xl shrink-0">
+          <button
+            type="button"
+            onClick={() => {
+              setStatusFilter('active');
+              setActionFeedback(null);
+            }}
+            className={`min-h-[36px] px-3 py-1.5 text-xs font-semibold rounded-lg transition-all whitespace-nowrap cursor-pointer ${
+              statusFilter === 'active'
+                ? 'bg-white text-stone-900 shadow-sm'
+                : 'text-stone-600 hover:text-stone-900'
+            }`}
+          >
+            Activos ({activeItems.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setStatusFilter('archived');
+              setActionFeedback(null);
+            }}
+            className={`min-h-[36px] px-3 py-1.5 text-xs font-semibold rounded-lg transition-all whitespace-nowrap cursor-pointer ${
+              statusFilter === 'archived'
+                ? 'bg-white text-stone-900 shadow-sm'
+                : 'text-stone-600 hover:text-stone-900'
+            }`}
+          >
+            Archivados ({archivedItems.length})
+          </button>
+        </div>
       </div>
 
       {/* Responsive Table / Mobile Cards */}
@@ -207,9 +326,11 @@ export function CatalogManager({
         {filteredItems.length === 0 ? (
           <div className="p-10 text-center space-y-2">
             <p className="text-sm font-medium text-stone-700">
-              No hay insumos en esta vista.
+              {statusFilter === 'archived'
+                ? 'No hay insumos archivados en este filtro.'
+                : 'No hay insumos activos en esta vista.'}
             </p>
-            {stations.length > 0 && (
+            {statusFilter === 'active' && stations.length > 0 && (
               <button
                 type="button"
                 onClick={openCreateForm}
@@ -223,37 +344,60 @@ export function CatalogManager({
           <>
             {/* Mobile Compact List (< sm) */}
             <div className="sm:hidden divide-y divide-stone-200">
-              {filteredItems.map((item) => (
-                <div key={item.id} className="p-4 flex items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <p className="text-sm font-semibold text-stone-900 truncate">{item.name}</p>
-                    <p className="text-xs text-stone-500 truncate">
-                      {stationNameMap.get(item.station) ?? item.station} · {item.unit}
-                    </p>
-                    <p className="text-xs font-mono tabular-nums text-stone-600 mt-0.5">
-                      Mín: {item.minStock} · Ideal: {item.targetStock}
-                    </p>
+              {filteredItems.map((item) => {
+                const targetLow = hasTargetBelowMin(item.minStock, item.targetStock);
+                return (
+                  <div key={item.id} className="p-4 flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold text-stone-900 truncate">{item.name}</p>
+                      <p className="text-xs text-stone-500 truncate">
+                        {stationNameMap.get(item.station) ?? item.station} · {item.unit}
+                      </p>
+                      <p className="text-xs font-mono tabular-nums text-stone-600 mt-0.5">
+                        Mín: {item.minStock} · Ideal: {item.targetStock}
+                      </p>
+                      {targetLow && (
+                        <p className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-800 mt-1">
+                          <AlertTriangle className="w-3 h-3 shrink-0" />
+                          Stock ideal menor que mínimo
+                        </p>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => openEditForm(item)}
+                        aria-label={`Editar ${item.name}`}
+                        className="p-2 text-stone-500 hover:text-stone-900 hover:bg-stone-100 rounded-lg cursor-pointer"
+                      >
+                        <Pencil className="w-4 h-4" />
+                      </button>
+                      {item.active ? (
+                        <button
+                          type="button"
+                          onClick={() => setConfirmArchive(item)}
+                          aria-label={`Archivar ${item.name}`}
+                          title="Archivar insumo"
+                          className="p-2 text-stone-500 hover:text-amber-700 hover:bg-amber-50 rounded-lg cursor-pointer"
+                        >
+                          <Archive className="w-4 h-4" />
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          disabled={submitting}
+                          onClick={() => handleRestore(item)}
+                          aria-label={`Reactivar ${item.name}`}
+                          title="Reactivar insumo"
+                          className="p-2 text-emerald-700 hover:bg-emerald-50 rounded-lg cursor-pointer"
+                        >
+                          <ArchiveRestore className="w-4 h-4" />
+                        </button>
+                      )}
+                    </div>
                   </div>
-                  <div className="flex items-center gap-1 shrink-0">
-                    <button
-                      type="button"
-                      onClick={() => openEditForm(item)}
-                      aria-label={`Editar ${item.name}`}
-                      className="p-2 text-stone-500 hover:text-stone-900 hover:bg-stone-100 rounded-lg cursor-pointer"
-                    >
-                      <Pencil className="w-4 h-4" />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setConfirmDelete(item)}
-                      aria-label={`Eliminar ${item.name}`}
-                      className="p-2 text-stone-500 hover:text-red-700 hover:bg-red-50 rounded-lg cursor-pointer"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
 
             {/* Desktop Table (sm+) */}
@@ -270,41 +414,71 @@ export function CatalogManager({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-stone-100 text-sm">
-                  {filteredItems.map((item) => (
-                    <tr key={item.id} className="hover:bg-stone-50/80 transition-colors">
-                      <td className="py-3 px-4 font-medium text-stone-900">{item.name}</td>
-                      <td className="py-3 px-4 text-stone-600">
-                        {stationNameMap.get(item.station) ?? item.station}
-                      </td>
-                      <td className="py-3 px-4 text-stone-600 font-mono text-xs">{item.unit}</td>
-                      <td className="py-3 px-4 text-right font-mono tabular-nums text-stone-800">
-                        {item.minStock}
-                      </td>
-                      <td className="py-3 px-4 text-right font-mono tabular-nums text-stone-600">
-                        {item.targetStock}
-                      </td>
-                      <td className="py-3 px-4 text-right">
-                        <div className="inline-flex items-center gap-1">
-                          <button
-                            type="button"
-                            onClick={() => openEditForm(item)}
-                            aria-label={`Editar ${item.name}`}
-                            className="p-2 text-stone-500 hover:text-stone-900 hover:bg-stone-100 rounded-lg cursor-pointer"
-                          >
-                            <Pencil className="w-4 h-4" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setConfirmDelete(item)}
-                            aria-label={`Eliminar ${item.name}`}
-                            className="p-2 text-stone-500 hover:text-red-700 hover:bg-red-50 rounded-lg cursor-pointer"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
+                  {filteredItems.map((item) => {
+                    const targetLow = hasTargetBelowMin(item.minStock, item.targetStock);
+                    return (
+                      <tr key={item.id} className="hover:bg-stone-50/80 transition-colors">
+                        <td className="py-3 px-4">
+                          <div className="font-medium text-stone-900">{item.name}</div>
+                          {targetLow && (
+                            <div className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-800 mt-0.5">
+                              <AlertTriangle className="w-3 h-3 shrink-0" />
+                              Ideal menor que mínimo
+                            </div>
+                          )}
+                        </td>
+                        <td className="py-3 px-4 text-stone-600">
+                          {stationNameMap.get(item.station) ?? item.station}
+                        </td>
+                        <td className="py-3 px-4 text-stone-600 font-mono text-xs">{item.unit}</td>
+                        <td className="py-3 px-4 text-right font-mono tabular-nums text-stone-800">
+                          {item.minStock}
+                        </td>
+                        <td
+                          className={`py-3 px-4 text-right font-mono tabular-nums ${
+                            targetLow ? 'text-amber-800 font-semibold' : 'text-stone-600'
+                          }`}
+                        >
+                          {item.targetStock}
+                        </td>
+                        <td className="py-3 px-4 text-right">
+                          <div className="inline-flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => openEditForm(item)}
+                              aria-label={`Editar ${item.name}`}
+                              className="p-2 text-stone-500 hover:text-stone-900 hover:bg-stone-100 rounded-lg cursor-pointer"
+                            >
+                              <Pencil className="w-4 h-4" />
+                            </button>
+                            {item.active ? (
+                              <button
+                                type="button"
+                                onClick={() => setConfirmArchive(item)}
+                                aria-label={`Archivar ${item.name}`}
+                                title="Archivar insumo"
+                                className="p-2 text-stone-500 hover:text-amber-700 hover:bg-amber-50 rounded-lg cursor-pointer"
+                              >
+                                <Archive className="w-4 h-4" />
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                disabled={submitting}
+                                onClick={() => handleRestore(item)}
+                                aria-label={`Reactivar ${item.name}`}
+                                title="Reactivar insumo"
+                                className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg hover:bg-emerald-100 cursor-pointer"
+                              >
+                                <ArchiveRestore className="w-3.5 h-3.5" />
+                                Reactivar
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -348,6 +522,16 @@ export function CatalogManager({
                 </div>
               )}
 
+              {!errorMsg && formValidation.warning && (
+                <div
+                  role="alert"
+                  className="p-3 text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-2"
+                >
+                  <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                  <span>{formValidation.warning}</span>
+                </div>
+              )}
+
               <form onSubmit={handleSubmit} className="space-y-4">
                 <div>
                   <label className="block text-xs font-semibold text-stone-700 mb-1">
@@ -358,7 +542,10 @@ export function CatalogManager({
                     required
                     maxLength={MAX_NAME_LENGTH}
                     value={name}
-                    onChange={(e) => setName(e.target.value)}
+                    onChange={(e) => {
+                      setName(e.target.value);
+                      if (errorMsg) setErrorMsg(null);
+                    }}
                     placeholder="Ej: Pulpa de maracuyá"
                     className="w-full min-h-[42px] px-3 py-2 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
                   />
@@ -371,7 +558,10 @@ export function CatalogManager({
                     </label>
                     <select
                       value={stationId}
-                      onChange={(e) => setStationId(e.target.value)}
+                      onChange={(e) => {
+                        setStationId(e.target.value);
+                        if (errorMsg) setErrorMsg(null);
+                      }}
                       className="w-full min-h-[42px] px-3 py-2 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 bg-white"
                     >
                       {stations.map((s) => (
@@ -384,7 +574,7 @@ export function CatalogManager({
 
                   <div>
                     <label className="block text-xs font-semibold text-stone-700 mb-1">
-                      Unidad de medida
+                      Unidad de medida <span className="text-red-600">*</span>
                     </label>
                     <input
                       type="text"
@@ -392,7 +582,11 @@ export function CatalogManager({
                       required
                       maxLength={MAX_UNIT_LENGTH}
                       value={unit}
-                      onChange={(e) => setUnit(e.target.value)}
+                      onChange={(e) => {
+                        setUnit(e.target.value);
+                        if (errorMsg) setErrorMsg(null);
+                      }}
+                      placeholder="Ej: und, kg, paq"
                       className="w-full min-h-[42px] px-3 py-2 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
                     />
                     <datalist id="unit-suggestions">
@@ -456,9 +650,9 @@ export function CatalogManager({
         )}
       </AnimatePresence>
 
-      {/* Delete Confirmation Modal */}
+      {/* Archive Confirmation Modal */}
       <AnimatePresence>
-        {confirmDelete && (
+        {confirmArchive && (
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
@@ -472,17 +666,17 @@ export function CatalogManager({
               className="bg-white border border-stone-200 rounded-2xl w-full max-w-sm p-6 space-y-4 shadow-2xl"
             >
               <h3 className="font-display text-lg font-bold text-stone-900">
-                Eliminar insumo
+                Archivar insumo
               </h3>
               <p className="text-sm text-stone-600">
-                ¿Seguro que deseas eliminar{' '}
-                <span className="font-semibold text-stone-900">{confirmDelete.name}</span> del
-                catálogo? Los reportes de días pasados conservarán su registro histórico.
+                ¿Deseas archivar{' '}
+                <span className="font-semibold text-stone-900">{confirmArchive.name}</span>?
+                Dejará de aparecer en la planilla de las trabajadoras, conservará todo su historial y podrás reactivarlo cuando lo necesites.
               </p>
               <div className="flex items-center justify-end gap-2 pt-1">
                 <button
                   type="button"
-                  onClick={() => setConfirmDelete(null)}
+                  onClick={() => setConfirmArchive(null)}
                   className="min-h-[40px] px-4 py-2 text-sm font-medium text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 cursor-pointer"
                 >
                   Cancelar
@@ -490,10 +684,10 @@ export function CatalogManager({
                 <button
                   type="button"
                   disabled={submitting}
-                  onClick={handleDelete}
-                  className="min-h-[40px] px-4 py-2 text-sm font-semibold text-white bg-red-600 rounded-xl hover:bg-red-700 disabled:opacity-60 cursor-pointer"
+                  onClick={handleArchive}
+                  className="min-h-[40px] px-4 py-2 text-sm font-semibold text-white bg-amber-600 rounded-xl hover:bg-amber-700 disabled:opacity-60 cursor-pointer"
                 >
-                  {submitting ? 'Eliminando...' : 'Eliminar'}
+                  {submitting ? 'Archivando...' : 'Archivar'}
                 </button>
               </div>
             </motion.div>
@@ -503,3 +697,4 @@ export function CatalogManager({
     </div>
   );
 }
+

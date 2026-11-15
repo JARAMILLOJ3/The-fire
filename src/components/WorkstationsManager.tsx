@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from 'react';
 import QRCode from 'qrcode';
 import { AnimatePresence, motion } from 'motion/react';
 import {
+  AlertTriangle,
   Check,
   Copy,
   Download,
@@ -33,6 +34,7 @@ import {
   updateWorkstation,
 } from '../services/inventoryService';
 import type { InventoryItem, StationLink, Workspace, Workstation } from '../types';
+import { hasTargetBelowMin, normalizeCatalogItemName } from '../utils/inventory';
 
 interface WorkstationsManagerProps {
   workspace: Workspace;
@@ -141,6 +143,23 @@ export function WorkstationsManager({
       return;
     }
 
+    if (!editingStation) {
+      const filledItems = draftItems.filter((d) => d.name.trim().length > 0);
+      const seenNames = new Set<string>();
+      for (const item of filledItems) {
+        if (!item.unit.trim()) {
+          setErrorMsg(`El insumo "${item.name.trim()}" debe tener una unidad de medida.`);
+          return;
+        }
+        const norm = normalizeCatalogItemName(item.name);
+        if (seenNames.has(norm)) {
+          setErrorMsg(`El insumo "${item.name.trim()}" está repetido en la lista.`);
+          return;
+        }
+        seenNames.add(norm);
+      }
+    }
+
     setSubmitting(true);
     setErrorMsg(null);
     try {
@@ -152,7 +171,13 @@ export function WorkstationsManager({
           description,
         });
       } else {
-        const validItems = draftItems.filter((d) => d.name.trim().length > 0);
+        const validItems = draftItems
+          .filter((d) => d.name.trim().length > 0)
+          .map((d) => ({
+            ...d,
+            name: d.name.trim(),
+            unit: d.unit.trim(),
+          }));
         await createWorkstation(workspace, {
           name,
           area,
@@ -604,6 +629,16 @@ export function WorkstationsManager({
                         <option key={u} value={u} />
                       ))}
                     </datalist>
+                    {draftItems.some(
+                      (row) => row.name.trim().length > 0 && hasTargetBelowMin(row.minStock, row.targetStock),
+                    ) && (
+                      <div className="p-2.5 text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-2">
+                        <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                        <span>
+                          Uno o más insumos tienen stock ideal menor que el mínimo. Ajusta el stock ideal para evitar compras incompletas.
+                        </span>
+                      </div>
+                    )}
                   </div>
                 )}
 

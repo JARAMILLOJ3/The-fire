@@ -1,7 +1,6 @@
 import type { User } from 'firebase/auth';
 import {
   collection,
-  deleteDoc,
   doc,
   getDoc,
   getDocs,
@@ -22,7 +21,6 @@ import {
   MAX_EMAIL_LENGTH,
   MAX_NAME_LENGTH,
   MAX_NOTES_LENGTH,
-  MAX_STOCK_VALUE,
   MAX_UNIT_LENGTH,
 } from '../constants';
 import { db, handleFirestoreError, OperationType } from '../firebase';
@@ -893,19 +891,6 @@ export async function deleteWorkstation(
   }
 }
 
-export async function updateWorkspaceName(workspaceId: string, name: string): Promise<void> {
-  const cleanName = clampString(name, MAX_NAME_LENGTH);
-  if (cleanName.length < 2) return;
-  try {
-    await updateDoc(doc(db, 'workspaces', workspaceId), {
-      name: cleanName,
-      updatedAt: serverTimestamp(),
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.UPDATE, `workspaces/${workspaceId}`);
-  }
-}
-
 export async function updateWorkspaceProfile(
   workspaceId: string,
   payload: { ownerName?: string; name?: string },
@@ -1030,11 +1015,14 @@ export async function updateInventoryItem(
   }
 }
 
-export async function deleteInventoryItem(itemId: string): Promise<void> {
+export async function setInventoryItemActive(itemId: string, active: boolean): Promise<void> {
   try {
-    await deleteDoc(doc(db, 'items', itemId));
+    await updateDoc(doc(db, 'items', itemId), {
+      active,
+      updatedAt: serverTimestamp(),
+    });
   } catch (error) {
-    handleFirestoreError(error, OperationType.DELETE, `items/${itemId}`);
+    handleFirestoreError(error, OperationType.UPDATE, `items/${itemId}`);
   }
 }
 

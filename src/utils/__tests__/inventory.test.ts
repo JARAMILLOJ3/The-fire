@@ -316,4 +316,291 @@ describe('inventory.ts (sanitización, sin_dato, anomalías y compras)', () => {
     expect(formatTime12h('23:00')).toBe('11:00 p. m.');
     expect(formatTime12h('02:00')).toBe('2:00 a. m.');
   });
+
+  it('handles minStock=0 at zero stock and warns instead of silently raising targetStock < minStock', async () => {
+    const { hasTargetBelowMin } = await import('../inventory');
+
+    // minStock=0, stock=0 -> minimum suggested purchase of 1 even when targetStock=0
+    expect(getSuggestedPurchase(0, 0, 0)).toBe(1);
+    expect(getSuggestedPurchase(0, 0, 5)).toBe(5);
+    expect(getSuggestedPurchase(1, 0, 5)).toBe(0);
+
+    // targetStock < minStock -> do NOT silently inflate to minStock * 2
+    expect(hasTargetBelowMin(10, 5)).toBe(true);
+    expect(hasTargetBelowMin(10, 10)).toBe(false);
+    expect(getSuggestedPurchase(8, 10, 15)).toBe(7);
+  });
+
+  it('protects CSV cells from formula injection and quotes all columns', async () => {
+    const { escapeCsvCell, buildDailyCsvContent } = await import('../inventory');
+
+    expect(escapeCsvCell('=SUM(A1:A2)')).toBe(`"'=SUM(A1:A2)"`);
+    expect(escapeCsvCell('+1234')).toBe(`"'+1234"`);
+    expect(escapeCsvCell('-1234')).toBe(`"'-1234"`);
+    expect(escapeCsvCell('@cmd')).toBe(`"'@cmd"`);
+    expect(escapeCsvCell('\t=1+1')).toBe(`"'\t=1+1"`);
+    expect(escapeCsvCell('  +cmd')).toBe(`"'  +cmd"`);
+    expect(escapeCsvCell('Queso "Doble"')).toBe(`"Queso ""Doble"""`);
+
+    const dangerItem = makeItem({ name: '=HYPERLINK("http://evil")', unit: '+und' });
+    const rows = buildConsolidatedRows(
+      [dangerItem],
+      { mesera_1: makeEntry({ itemName: dangerItem.name, closing: 5, hasClosing: true }) },
+      {
+        mesera: {
+          id: 'ws_1_2026-11-13_mesera',
+          workspaceId: 'ws_1',
+          ownerUid: 'owner_1',
+          authorizedEmails: ['boss@example.com'],
+          date: '2026-11-13',
+          station: 'mesera',
+          status: 'completed',
+          reportedByUid: 'worker_1',
+          reportedByName: 'Ana',
+          notes: '',
+        },
+      },
+    );
+
+    const csv = buildDailyCsvContent('2026-11-13', rows, [makeStation()]);
+    const lines = csv.split('\n');
+    expect(lines).toHaveLength(2);
+    // Every cell in header and data row starts and ends with double quote
+    lines[0].split(',').forEach((cell) => {
+      expect(cell.startsWith('"') && cell.endsWith('"')).toBe(true);
+    });
+    expect(lines[1]).toContain(`"'=HYPERLINK(""http://evil"")"`);
+    expect(lines[1]).toContain(`"'+und"`);
+  });
+
+  it('validates catalog items for required unit, active duplicate names in same station, and target < min warning', async () => {
+    const { validateCatalogItemInput } = await import('../inventory');
+
+    const existing = [
+      makeItem({ id: 'm1', station: 'mesera', name: 'Coca-Cola 400ml', active: true }),
+      makeItem({ id: 'm2', station: 'mesera', name: 'Gaseosa Vieja', active: false }),
+      makeItem({ id: 'c1', station: 'cocina', name: 'Sal', active: true }),
+    ];
+
+    // Missing unit -> invalid
+    const missingUnit = validateCatalogItemInput({
+      name: 'Sprite',
+      unit: '   ',
+      station: 'mesera',
+      minStock: 5,
+      targetStock: 10,
+      existingItems: existing,
+    });
+    expect(missingUnit.valid).toBe(false);
+    expect(missingUnit.error).toContain('unidad');
+
+    // Duplicate active name in same station (case/spaces normalized) -> invalid
+    const dup = validateCatalogItemInput({
+      name: '  coca-cola   400ml ',
+      unit: 'und',
+      station: 'mesera',
+      minStock: 5,
+      targetStock: 10,
+      existingItems: existing,
+    });
+    expect(dup.valid).toBe(false);
+    expect(dup.error).toContain('Ya existe');
+
+    // Same name in different station or archived item -> valid
+    const crossStation = validateCatalogItemInput({
+      name: 'Sal',
+      unit: 'kg',
+      station: 'mesera',
+      minStock: 2,
+      targetStock: 5,
+      existingItems: existing,
+    });
+    expect(crossStation.valid).toBe(true);
+
+    const reuseArchived = validateCatalogItemInput({
+      name: 'Gaseosa Vieja',
+      unit: 'und',
+      station: 'mesera',
+      minStock: 2,
+      targetStock: 5,
+      existingItems: existing,
+    });
+    expect(reuseArchived.valid).toBe(true);
+
+    // targetStock < minStock -> valid with warning (non-blocking, not silently overwritten)
+    const warnTarget = validateCatalogItemInput({
+      name: 'Postobón',
+      unit: 'und',
+      station: 'mesera',
+      minStock: 10,
+      targetStock: 4,
+      existingItems: existing,
+    });
+    expect(warnTarget.valid).toBe(true);
+    expect(warnTarget.warning).toContain('menor que el stock mínimo');
+  });
+
+  it('builds 7-day weekly station history and flags late stations', async () => {
+    const { buildWeeklyStationHistory } = await import('../inventory');
+
+    const station = makeStation();
+    const item = makeItem();
+    const reports: DailyReport[] = [
+      {
+        id: 'ws_1_2026-11-12_mesera',
+        workspaceId: 'ws_1',
+        ownerUid: 'owner_1',
+        authorizedEmails: ['boss@example.com'],
+        date: '2026-11-12',
+        station: 'mesera',
+        status: 'completed',
+        reportedByUid: 'w1',
+        reportedByName: 'Ana',
+        notes: '',
+      },
+      {
+        id: 'ws_1_2026-11-13_mesera',
+        workspaceId: 'ws_1',
+        ownerUid: 'owner_1',
+        authorizedEmails: ['boss@example.com'],
+        date: '2026-11-13',
+        station: 'mesera',
+        status: 'opening_saved',
+        reportedByUid: 'w1',
+        reportedByName: 'Ana',
+        notes: '',
+      },
+    ];
+
+    const history = buildWeeklyStationHistory({
+      endDateStr: '2026-11-13',
+      stations: [station],
+      items: [item],
+      allReports: reports,
+      entriesByReportId: {
+        'ws_1_2026-11-12_mesera': {
+          mesera_1: makeEntry({
+            reportId: 'ws_1_2026-11-12_mesera',
+            date: '2026-11-12',
+            closing: 4,
+            hasClosing: true,
+          }),
+        },
+      },
+      schedule: {
+        enabled: true,
+        openingStart: '16:00',
+        openingEnd: '18:00',
+        closingStart: '23:00',
+        closingEnd: '02:00',
+      },
+      // 2026-11-14 02:30 Bogota = 07:30Z -> past deadline for 2026-11-13
+      now: new Date('2026-11-14T07:30:00Z'),
+    });
+
+    expect(history.dates).toHaveLength(7);
+    expect(history.dates[0]).toBe('2026-11-07');
+    expect(history.dates[6]).toBe('2026-11-13');
+    expect(history.rows[0].completedCount).toBe(1);
+    expect(history.rows[0].lateCount).toBe(6);
+    const day12 = history.rows[0].days.find((d) => d.date === '2026-11-12');
+    expect(day12?.status).toBe('completed');
+    expect(day12?.lowStockCount).toBe(1);
+    const day13 = history.rows[0].days.find((d) => d.date === '2026-11-13');
+    expect(day13?.status).toBe('opening_saved');
+    expect(day13?.isLate).toBe(true);
+  });
+
+  it('detects closing > available and above-average consumption anomalies across 7-day history', async () => {
+    const { detectDashboardConsumptionAnomalies } = await import('../inventory');
+
+    const station = makeStation();
+    const itemA = makeItem({ id: 'mesera_1', name: 'Coca-Cola 400ml' });
+    const itemB = makeItem({ id: 'mesera_2', name: 'Papas' });
+
+    const priorReports: DailyReport[] = [
+      {
+        id: 'ws_1_2026-11-11_mesera',
+        workspaceId: 'ws_1',
+        ownerUid: 'owner_1',
+        authorizedEmails: ['boss@example.com'],
+        date: '2026-11-11',
+        station: 'mesera',
+        status: 'completed',
+        reportedByUid: 'w1',
+        reportedByName: 'Ana',
+        notes: '',
+      },
+      {
+        id: 'ws_1_2026-11-12_mesera',
+        workspaceId: 'ws_1',
+        ownerUid: 'owner_1',
+        authorizedEmails: ['boss@example.com'],
+        date: '2026-11-12',
+        station: 'mesera',
+        status: 'completed',
+        reportedByUid: 'w1',
+        reportedByName: 'Ana',
+        notes: '',
+      },
+      {
+        id: 'ws_1_2026-11-13_mesera',
+        workspaceId: 'ws_1',
+        ownerUid: 'owner_1',
+        authorizedEmails: ['boss@example.com'],
+        date: '2026-11-13',
+        station: 'mesera',
+        status: 'completed',
+        reportedByUid: 'w1',
+        reportedByName: 'Ana',
+        notes: '',
+      },
+    ];
+
+    const todayRows = buildConsolidatedRows(
+      [itemA, itemB],
+      {
+        // High consumption today: 20 + 10 - 5 = 25 vs prior avg 5 (5x)
+        mesera_1: makeEntry({
+          itemId: 'mesera_1',
+          opening: 20,
+          added: 10,
+          closing: 5,
+          hasOpening: true,
+          hasClosing: true,
+        }),
+        // Closing > opening + added: 10 + 0 < 15
+        mesera_2: makeEntry({
+          itemId: 'mesera_2',
+          itemName: 'Papas',
+          opening: 10,
+          added: 0,
+          closing: 15,
+          hasOpening: true,
+          hasClosing: true,
+        }),
+      },
+      { mesera: priorReports[2] },
+    );
+
+    const anomalies = detectDashboardConsumptionAnomalies({
+      selectedDate: '2026-11-13',
+      rows: todayRows,
+      stations: [station],
+      allReports: priorReports,
+      entriesByReportId: {
+        'ws_1_2026-11-11_mesera': {
+          mesera_1: makeEntry({ opening: 10, added: 0, closing: 5, hasOpening: true, hasClosing: true }),
+        },
+        'ws_1_2026-11-12_mesera': {
+          mesera_1: makeEntry({ opening: 10, added: 0, closing: 5, hasOpening: true, hasClosing: true }),
+        },
+      },
+    });
+
+    expect(anomalies).toHaveLength(2);
+    expect(anomalies.find((a) => a.itemId === 'mesera_1')?.kind).toBe('above_average_consumption');
+    expect(anomalies.find((a) => a.itemId === 'mesera_1')?.ratioToAverage).toBe(5);
+    expect(anomalies.find((a) => a.itemId === 'mesera_2')?.kind).toBe('closing_exceeds_available');
+  });
 });

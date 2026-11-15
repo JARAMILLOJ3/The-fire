@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import {
+  AlertOctagon,
   AlertTriangle,
   ArrowRight,
   CalendarClock,
@@ -11,6 +12,7 @@ import {
   Copy,
   Download,
   GitCompareArrows,
+  History,
   MessageSquareText,
   Package,
   Printer,
@@ -18,8 +20,10 @@ import {
   Search,
   Settings,
   ShoppingBag,
+  TrendingUp,
   Users,
 } from 'lucide-react';
+import { WORKER_GRACE_MINUTES } from '../constants';
 import type {
   ConsolidatedItemRow,
   DailyReport,
@@ -31,14 +35,21 @@ import type {
 } from '../types';
 import {
   buildConsolidatedRows,
+  buildWeeklyStationHistory,
   buildWhatsAppShoppingList,
+  detectDashboardConsumptionAnomalies,
   downloadDailyCsvReport,
   formatDateHuman,
   formatTimeShort,
   getStockLevelMeta,
+  hasTargetBelowMin,
 } from '../utils/inventory';
-import { getBogotaNowParts } from '../utils/date';
-import { formatTime12h, normalizeShiftSchedule } from '../utils/schedule';
+import { BOGOTA_TIME_ZONE, getBogotaNowParts } from '../utils/date';
+import {
+  formatTime12h,
+  hasClosingDeadlinePassed,
+  normalizeShiftSchedule,
+} from '../utils/schedule';
 
 interface BossDashboardProps {
   workspaceName: string;
@@ -53,6 +64,8 @@ interface BossDashboardProps {
   items: InventoryItem[];
   reportsByStation: Record<string, DailyReport | undefined>;
   entriesByItemId: Record<string, DailyReportEntry>;
+  allReports: DailyReport[];
+  entriesByReportId: Record<string, Record<string, DailyReportEntry>>;
   onSelectDate: (dateStr: string) => void;
   onOpenStation: (stationId: StationId) => void;
   onGoToWorkstations: () => void;
@@ -99,6 +112,19 @@ function formatSignedDelta(delta: number): string {
   return rounded > 0 ? `+${rounded}` : String(rounded);
 }
 
+function formatShortDayHeader(dateStr: string): { weekday: string; dayNum: string } {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  if (!y || !m || !d) return { weekday: '', dayNum: dateStr };
+  const dt = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+  const weekday = new Intl.DateTimeFormat('es-CO', {
+    timeZone: BOGOTA_TIME_ZONE,
+    weekday: 'short',
+  })
+    .format(dt)
+    .replace('.', '');
+  return { weekday, dayNum: String(d) };
+}
+
 export function BossDashboard({
   workspaceName,
   ownerName,
@@ -112,6 +138,8 @@ export function BossDashboard({
   items,
   reportsByStation,
   entriesByItemId,
+  allReports,
+  entriesByReportId,
   onSelectDate,
   onOpenStation,
   onGoToWorkstations,
@@ -233,6 +261,60 @@ export function BossDashboard({
       })
       .filter((n): n is { stationName: string; workerName: string; notes: string } => Boolean(n));
   }, [stations, reportsByStation]);
+
+  const closingDeadlinePassed = useMemo(
+    () =>
+      hasClosingDeadlinePassed(
+        new Date(),
+        selectedDate,
+        normalizedSchedule,
+        WORKER_GRACE_MINUTES,
+      ),
+    [selectedDate, normalizedSchedule],
+  );
+
+  const overdueStations = useMemo(() => {
+    if (!closingDeadlinePassed) return [];
+    return stations.filter((st) => reportsByStation[st.id]?.status !== 'completed');
+  }, [closingDeadlinePassed, stations, reportsByStation]);
+
+  const consumptionAnomalies = useMemo(
+    () =>
+      detectDashboardConsumptionAnomalies({
+        selectedDate,
+        rows: consolidatedRows,
+        stations,
+        allReports,
+        entriesByReportId,
+      }),
+    [selectedDate, consolidatedRows, stations, allReports, entriesByReportId],
+  );
+
+  const consumptionAnomalyByItemId = useMemo(() => {
+    const map: Record<string, (typeof consumptionAnomalies)[number]> = {};
+    consumptionAnomalies.forEach((a) => {
+      map[a.itemId] = a;
+    });
+    return map;
+  }, [consumptionAnomalies]);
+
+  const weeklyHistory = useMemo(
+    () =>
+      buildWeeklyStationHistory({
+        endDateStr: todayStr,
+        stations,
+        items,
+        allReports,
+        entriesByReportId,
+        schedule: normalizedSchedule,
+      }),
+    [todayStr, stations, items, allReports, entriesByReportId, normalizedSchedule],
+  );
+
+  const targetBelowMinCount = useMemo(
+    () => items.filter((it) => it.active && hasTargetBelowMin(it.minStock, it.targetStock)).length,
+    [items],
+  );
 
   const filteredRows = useMemo(() => {
     const term = searchTerm.trim().toLowerCase();
@@ -379,6 +461,14 @@ export function BossDashboard({
           </button>
           <button
             type="button"
+            onClick={onOpenScheduleModal}
+            className="min-h-[44px] inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-semibold text-stone-800 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            <Clock className="w-4 h-4 text-orange-600" />
+            <span>Horarios</span>
+          </button>
+          <button
+            type="button"
             onClick={handleExportCsv}
             aria-label="Exportar CSV"
             className="min-h-[44px] inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-medium text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
@@ -397,6 +487,62 @@ export function BossDashboard({
           </button>
         </div>
       </div>
+
+      {/* Visible Late-Closing Warning */}
+      {overdueStations.length > 0 && (
+        <div
+          role="alert"
+          className="bg-red-50 border border-red-200 rounded-2xl px-4 sm:px-5 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+        >
+          <div className="flex items-start gap-3 text-sm text-red-950 min-w-0">
+            <AlertOctagon className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
+            <div className="min-w-0 space-y-0.5">
+              <p className="font-bold">
+                {overdueStations.length === 1
+                  ? '1 puesto no ha cerrado pasada la hora límite'
+                  : `${overdueStations.length} puestos no han cerrado pasada la hora límite`}
+              </p>
+              <p className="text-xs text-red-800 leading-relaxed">
+                Pasó la hora de cierre ({formatTime12h(normalizedSchedule.closingEnd)} +{WORKER_GRACE_MINUTES} min). Faltan:{' '}
+                <strong>{overdueStations.map((s) => s.name).join(', ')}</strong>.
+              </p>
+            </div>
+          </div>
+          {overdueStations.length === 1 && (
+            <button
+              type="button"
+              onClick={() => onOpenStation(overdueStations[0].id)}
+              className="min-h-[38px] px-3.5 py-1.5 text-xs font-semibold text-white bg-red-600 rounded-xl hover:bg-red-700 whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              Revisar planilla
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Catalog threshold warning if any item has targetStock < minStock */}
+      {targetBelowMinCount > 0 && (
+        <div
+          role="status"
+          className="bg-amber-50 border border-amber-200 rounded-2xl px-4 sm:px-5 py-3 flex flex-wrap items-center justify-between gap-2 text-xs sm:text-sm text-amber-950 no-print"
+        >
+          <div className="flex items-start sm:items-center gap-2 min-w-0">
+            <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5 sm:mt-0" />
+            <span>
+              Hay <strong>{targetBelowMinCount}</strong>{' '}
+              {targetBelowMinCount === 1 ? 'insumo' : 'insumos'} en el catálogo con{' '}
+              <strong>stock ideal menor que el stock mínimo</strong>.
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={onGoToCatalog}
+            className="text-xs font-semibold text-amber-900 underline hover:text-amber-700 whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            Ajustar en catálogo
+          </button>
+        </div>
+      )}
 
       {/* Single Clean Contextual Date Banner (only shown when helpful) */}
       {showSwitchToYesterday ? (
@@ -598,6 +744,49 @@ export function BossDashboard({
         </section>
       )}
 
+      {/* Anomalous Consumption Items */}
+      {consumptionAnomalies.length > 0 && (
+        <section className="bg-red-50/70 border border-red-200 rounded-2xl p-4 sm:p-5 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-sm font-bold text-red-950">
+              <TrendingUp className="w-4 h-4 text-red-600 shrink-0" />
+              <span>Insumos con consumo anómalo ({consumptionAnomalies.length})</span>
+            </div>
+            <span className="text-xs text-red-800">
+              Cierre mayor a inicio + surtido o muy por encima del promedio (7 días)
+            </span>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+            {consumptionAnomalies.map((anomaly) => (
+              <div
+                key={`${anomaly.itemId}-${anomaly.kind}`}
+                className="bg-white border border-red-200/80 rounded-xl px-3.5 py-2.5 flex items-start justify-between gap-3"
+              >
+                <div className="min-w-0 space-y-0.5">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <p className="text-sm font-semibold text-stone-900">{anomaly.itemName}</p>
+                    <span className="text-[11px] font-semibold text-red-700">
+                      {anomaly.kind === 'closing_exceeds_available'
+                        ? 'Sobra al cierre'
+                        : 'Consumo alto vs. promedio'}
+                    </span>
+                  </div>
+                  <p className="text-xs text-stone-500 truncate">{anomaly.stationName}</p>
+                  <p className="text-xs text-stone-700 leading-relaxed">{anomaly.summary}</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => onOpenStation(anomaly.stationId)}
+                  className="text-xs font-semibold text-orange-700 hover:text-orange-800 whitespace-nowrap shrink-0 pt-0.5 cursor-pointer"
+                >
+                  Ver puesto
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
       {/* Actionable Daily Highlights: Notes & Things to Keep in Mind */}
       {stationNotes.length > 0 && (
         <section className="bg-amber-50/70 border border-amber-200 rounded-2xl p-4 sm:p-5 space-y-2.5">
@@ -679,6 +868,15 @@ export function BossDashboard({
                     <div className="flex items-center gap-1.5 text-xs font-semibold text-emerald-700 pt-1">
                       <CheckCircle2 className="w-4 h-4 shrink-0" />
                       <span>Cerrado{closeTime ? ` · ${closeTime}` : ''}</span>
+                    </div>
+                  ) : closingDeadlinePassed ? (
+                    <div className="flex items-center gap-1.5 text-xs font-semibold text-red-700 pt-1">
+                      <AlertOctagon className="w-4 h-4 shrink-0" />
+                      <span>
+                        {report?.status === 'opening_saved'
+                          ? 'Sin cierre · Pasada la hora'
+                          : 'Sin reporte · Pasada la hora'}
+                      </span>
                     </div>
                   ) : report?.status === 'opening_saved' ? (
                     <div className="flex items-center gap-1.5 text-xs font-semibold text-amber-700 pt-1">
@@ -898,6 +1096,10 @@ export function BossDashboard({
                               <span className="text-sm font-bold text-red-700 whitespace-nowrap">
                                 Pedir +{row.suggestedBuy} {row.item.unit}
                               </span>
+                            ) : hasTargetBelowMin(row.item.minStock, row.item.targetStock) ? (
+                              <span className="text-xs font-semibold text-amber-800 whitespace-nowrap">
+                                Stock ideal &lt; mínimo
+                              </span>
                             ) : (
                               <span className="text-xs font-medium text-amber-800 whitespace-nowrap">
                                 Vigilar reposición
@@ -1060,10 +1262,35 @@ export function BossDashboard({
                           )}
                         </td>
                         <td className="py-3.5 px-4 text-right font-mono tabular-nums text-stone-700">
-                          {row.consumed !== null ? row.consumed : '—'}
+                          {consumptionAnomalyByItemId[row.item.id]?.kind ===
+                          'closing_exceeds_available' ? (
+                            <span
+                              className="text-red-700 font-semibold"
+                              title={consumptionAnomalyByItemId[row.item.id].summary}
+                            >
+                              Anómalo (sobra)
+                            </span>
+                          ) : row.consumed !== null ? (
+                            <span
+                              className={
+                                consumptionAnomalyByItemId[row.item.id]
+                                  ? 'text-red-700 font-semibold'
+                                  : undefined
+                              }
+                            >
+                              {row.consumed}
+                            </span>
+                          ) : (
+                            '—'
+                          )}
                         </td>
                         <td className="py-3.5 px-4 text-right font-mono tabular-nums text-stone-600">
-                          {row.item.minStock}
+                          <div>{row.item.minStock}</div>
+                          {hasTargetBelowMin(row.item.minStock, row.item.targetStock) && (
+                            <div className="text-[10px] font-semibold text-amber-700">
+                              Ideal {row.item.targetStock} &lt; mín
+                            </div>
+                          )}
                         </td>
                         <td className="py-3.5 px-4 text-right font-mono tabular-nums font-bold">
                           {row.hasCountedClosing && row.suggestedBuy > 0 ? (
@@ -1100,6 +1327,145 @@ export function BossDashboard({
         )}
       </section>
 
+      {/* 7-Day Station History */}
+      {stations.length > 0 && (
+        <section className="bg-white border border-stone-200 rounded-2xl overflow-hidden no-print">
+          <div className="px-4 sm:px-5 py-4 border-b border-stone-200 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <History className="w-4 h-4 text-orange-600 shrink-0" />
+              <div>
+                <h2 className="font-display text-base font-bold text-stone-900">
+                  Historial de los últimos 7 días por puesto
+                </h2>
+                <p className="text-xs text-stone-500">
+                  Toca cualquier día para abrir su reporte completo
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-3 text-[11px] font-medium text-stone-600">
+              <span className="inline-flex items-center gap-1">
+                <span className="w-2 h-2 rounded-full bg-emerald-500" />
+                Cerrado
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span className="w-2 h-2 rounded-full bg-amber-500" />
+                Solo apertura
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <span className="w-2 h-2 rounded-full bg-red-500" />
+                Sin cierre
+              </span>
+            </div>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse">
+              <thead>
+                <tr className="border-b border-stone-200 bg-stone-50 text-xs font-semibold text-stone-600">
+                  <th className="py-3 px-4 sm:px-5 min-w-[160px]">Puesto</th>
+                  {weeklyHistory.dates.map((date) => {
+                    const { weekday, dayNum } = formatShortDayHeader(date);
+                    const isSelected = date === selectedDate;
+                    return (
+                      <th key={date} className="py-2.5 px-2 text-center min-w-[64px]">
+                        <button
+                          type="button"
+                          onClick={() => onSelectDate(date)}
+                          className={`px-2 py-1 rounded-lg transition-colors cursor-pointer ${
+                            isSelected
+                              ? 'bg-orange-600 text-white'
+                              : 'hover:bg-stone-200/70 text-stone-700'
+                          }`}
+                        >
+                          <div className="text-[10px] uppercase leading-none opacity-80">
+                            {date === todayStr ? 'Hoy' : weekday}
+                          </div>
+                          <div className="font-mono tabular-nums text-xs font-bold mt-0.5">
+                            {dayNum}
+                          </div>
+                        </button>
+                      </th>
+                    );
+                  })}
+                  <th className="py-3 px-4 text-right whitespace-nowrap">Cumplimiento</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-stone-100 text-xs">
+                {weeklyHistory.rows.map((stRow) => (
+                  <tr key={stRow.station.id} className="hover:bg-stone-50/70">
+                    <td className="py-3 px-4 sm:px-5">
+                      <p className="font-semibold text-stone-900 truncate max-w-[180px]">
+                        {stRow.station.name}
+                      </p>
+                      <p className="text-[11px] text-stone-500 truncate max-w-[180px]">
+                        {stRow.station.workerName}
+                      </p>
+                    </td>
+                    {stRow.days.map((cell) => {
+                      const isSelected = cell.date === selectedDate;
+                      const label =
+                        cell.status === 'completed'
+                          ? 'Listo'
+                          : cell.status === 'opening_saved'
+                            ? cell.isLate
+                              ? 'Sin cierre'
+                              : 'Apertura'
+                            : cell.isLate
+                              ? 'Faltó'
+                              : 'Pend.';
+                      const tone =
+                        cell.status === 'completed'
+                          ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                          : cell.isLate
+                            ? 'bg-red-50 text-red-700 border-red-200'
+                            : cell.status === 'opening_saved'
+                              ? 'bg-amber-50 text-amber-800 border-amber-200'
+                              : 'bg-stone-100 text-stone-600 border-stone-200';
+                      return (
+                        <td key={cell.date} className="py-2.5 px-1.5 text-center">
+                          <button
+                            type="button"
+                            onClick={() => onSelectDate(cell.date)}
+                            title={
+                              cell.anomalyCount > 0
+                                ? `${cell.anomalyCount} anomalía(s) de consumo`
+                                : formatDateHuman(cell.date)
+                            }
+                            className={`w-full px-2 py-1.5 rounded-lg border font-semibold transition-all cursor-pointer ${tone} ${
+                              isSelected ? 'ring-2 ring-orange-500 ring-offset-1' : ''
+                            }`}
+                          >
+                            <div className="leading-tight">{label}</div>
+                            {cell.anomalyCount > 0 && (
+                              <div className="text-[10px] text-red-700 font-mono leading-tight mt-0.5">
+                                {cell.anomalyCount} anom.
+                              </div>
+                            )}
+                          </button>
+                        </td>
+                      );
+                    })}
+                    <td className="py-3 px-4 text-right font-mono tabular-nums whitespace-nowrap">
+                      <span
+                        className={`font-bold ${
+                          stRow.completedCount >= 6
+                            ? 'text-emerald-700'
+                            : stRow.lateCount > 0
+                              ? 'text-red-700'
+                              : 'text-stone-800'
+                        }`}
+                      >
+                        {stRow.completedCount}/7
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
+
       {/* Collapsible Bottom Configuration Section */}
       <section className="bg-white border border-stone-200 rounded-2xl overflow-hidden no-print">
         <button
@@ -1135,7 +1501,7 @@ export function BossDashboard({
               transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
               className="overflow-hidden border-t border-stone-200"
             >
-              <div className="p-4 sm:p-5 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 bg-stone-50/70">
+              <div className="p-4 sm:p-5 grid grid-cols-1 sm:grid-cols-3 gap-3 bg-stone-50/70">
                 <button
                   type="button"
                   onClick={onGoToCatalog}
@@ -1174,20 +1540,6 @@ export function BossDashboard({
                     <p className="text-sm font-semibold text-stone-900">Puestos y códigos QR</p>
                     <p className="text-xs text-stone-600 mt-0.5">
                       Enlaces por puesto e impresión de QR
-                    </p>
-                  </div>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={onOpenScheduleModal}
-                  className="min-h-[64px] bg-white border border-stone-200 rounded-xl p-3.5 text-left hover:border-orange-300 hover:bg-orange-50/40 transition-colors flex items-start gap-3 cursor-pointer"
-                >
-                  <Clock className="w-5 h-5 text-orange-600 shrink-0 mt-0.5" />
-                  <div className="min-w-0">
-                    <p className="text-sm font-semibold text-stone-900">Horarios</p>
-                    <p className="text-xs text-stone-600 mt-0.5">
-                      Ventanas de apertura y cierre (Bogotá)
                     </p>
                   </div>
                 </button>

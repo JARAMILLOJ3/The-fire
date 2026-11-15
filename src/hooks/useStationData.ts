@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { User } from 'firebase/auth';
-import { collection, doc, limit, onSnapshot, query, where } from 'firebase/firestore';
+import { collection, doc, getDocs, limit, onSnapshot, query, where } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../firebase';
 import {
   ensureWorkstationsForExistingWorkspace,
   loadWorkerStationFallback,
   syncAuthorizedEmailsAcrossWorkspace,
 } from '../services/inventoryService';
+import { shiftDateStr } from '../utils/date';
 import type {
   DailyReport,
   DailyReportEntry,
@@ -36,10 +37,19 @@ export function useStationData(params: {
   canManage: boolean;
   role: TeamStationId;
   effectiveSelectedDate: string;
+  todayStr: string;
   yesterdayStr: string;
 }) {
-  const { authReady, user, workspace, canManage, role, effectiveSelectedDate, yesterdayStr } =
-    params;
+  const {
+    authReady,
+    user,
+    workspace,
+    canManage,
+    role,
+    effectiveSelectedDate,
+    todayStr,
+    yesterdayStr,
+  } = params;
 
   const userEmail = (user?.email ?? '').trim().toLowerCase();
 
@@ -53,6 +63,9 @@ export function useStationData(params: {
   const [entriesByReportId, setEntriesByReportId] = useState<
     Record<string, Record<string, DailyReportEntry>>
   >({});
+  const [historicalEntriesByReportId, setHistoricalEntriesByReportId] = useState<
+    Record<string, Record<string, DailyReportEntry>>
+  >({});
   const [invites, setInvites] = useState<Invite[]>([]);
   const [members, setMembers] = useState<TeamMember[]>([]);
   const [stationLinksByCode, setStationLinksByCode] = useState<Record<string, StationLink>>({});
@@ -60,6 +73,7 @@ export function useStationData(params: {
 
   const migrationAttemptedRef = useRef<string | null>(null);
   const syncingEmailsKeyRef = useRef<string>('');
+  const fetchedHistoryVersionRef = useRef<Record<string, number>>({});
 
   // Reset state cleanly on sign-out
   useEffect(() => {
@@ -72,6 +86,8 @@ export function useStationData(params: {
     setReportsLoaded(false);
     setReportHasPendingWrites(false);
     setEntriesByReportId({});
+    setHistoricalEntriesByReportId({});
+    fetchedHistoryVersionRef.current = {};
     setInvites([]);
     setMembers([]);
     setStationLinksByCode({});
@@ -438,6 +454,82 @@ export function useStationData(params: {
     workerStationItemIdsKey,
   ]);
 
+  // Manager mode: load entries for recent 7-day history + selectedDate 7-day consumption average
+  useEffect(() => {
+    if (!authReady || !user || !workspace?.id || !canManage || !userEmail || !reportsLoaded) {
+      return;
+    }
+
+    const weekStart = shiftDateStr(todayStr, -6);
+    const lookbackStart = shiftDateStr(effectiveSelectedDate, -7);
+    const selectedDayReportIds = new Set(existingReportIdsKey ? existingReportIdsKey.split('|') : []);
+
+    const reportsToFetch = allReports.filter((rep) => {
+      if (selectedDayReportIds.has(rep.id)) return false;
+      const inWeeklyWindow = rep.date >= weekStart && rep.date <= todayStr;
+      const inBaselineWindow = rep.date >= lookbackStart && rep.date < effectiveSelectedDate;
+      if (!inWeeklyWindow && !inBaselineWindow) return false;
+      const updatedMs =
+        rep.updatedAt && typeof rep.updatedAt.toMillis === 'function'
+          ? rep.updatedAt.toMillis()
+          : 1;
+      return fetchedHistoryVersionRef.current[rep.id] !== updatedMs;
+    });
+
+    if (reportsToFetch.length === 0) return;
+
+    let cancelled = false;
+    void (async () => {
+      const updates: Record<string, Record<string, DailyReportEntry>> = {};
+      await Promise.all(
+        reportsToFetch.map(async (rep) => {
+          const updatedMs =
+            rep.updatedAt && typeof rep.updatedAt.toMillis === 'function'
+              ? rep.updatedAt.toMillis()
+              : 1;
+          try {
+            const q = query(
+              collection(db, 'dailyReports', rep.id, 'entries'),
+              where('authorizedEmails', 'array-contains', userEmail),
+            );
+            const snap = await getDocs(q);
+            const map: Record<string, DailyReportEntry> = {};
+            snap.forEach((d) => {
+              const entry = { id: d.id, ...d.data() } as DailyReportEntry;
+              map[entry.itemId] = entry;
+            });
+            updates[rep.id] = map;
+            fetchedHistoryVersionRef.current[rep.id] = updatedMs;
+          } catch (err) {
+            console.warn(`No se pudieron leer entradas históricas de ${rep.id}:`, err);
+          }
+        }),
+      );
+
+      if (!cancelled && Object.keys(updates).length > 0) {
+        setHistoricalEntriesByReportId((prev) => ({
+          ...prev,
+          ...updates,
+        }));
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    authReady,
+    user,
+    workspace?.id,
+    canManage,
+    userEmail,
+    reportsLoaded,
+    allReports,
+    todayStr,
+    effectiveSelectedDate,
+    existingReportIdsKey,
+  ]);
+
   // Listen to invites, teamMembers, and stationLinks for managers
   useEffect(() => {
     if (!authReady || !user || !workspace?.id || !canManage) return;
@@ -513,6 +605,14 @@ export function useStationData(params: {
     };
   }, [canManage, entriesByReportId, workerFallback]);
 
+  const dashboardEntriesByReportId = useMemo(() => {
+    if (!canManage) return effectiveEntriesByReportId;
+    return {
+      ...historicalEntriesByReportId,
+      ...effectiveEntriesByReportId,
+    };
+  }, [canManage, historicalEntriesByReportId, effectiveEntriesByReportId]);
+
   const consolidatedEntriesByItemId = useMemo(() => {
     const merged: Record<string, DailyReportEntry> = {};
     Object.values(reportsForSelectedDate).forEach((rep) => {
@@ -579,6 +679,7 @@ export function useStationData(params: {
     effectiveItems,
     reportsForSelectedDate,
     effectiveEntriesByReportId,
+    dashboardEntriesByReportId,
     consolidatedEntriesByItemId,
     todayAllEntries,
     invites,

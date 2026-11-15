@@ -1,6 +1,11 @@
 import { DEFAULT_SHIFT_SCHEDULE, TIME_PATTERN, WORKER_GRACE_MINUTES } from '../constants';
 import type { ShiftSchedule } from '../types';
-import { getBogotaNowParts, getOperationalDateStr, getPreviousDateStr } from './date';
+import {
+  getBogotaNowParts,
+  getOperationalDateStr,
+  getPreviousDateStr,
+  OPERATIONAL_DAY_CUTOFF_HOUR,
+} from './date';
 
 export type WorkerSchedulePhase = 'opening' | 'closing' | 'outside' | 'unrestricted';
 
@@ -280,4 +285,31 @@ export function getNextScheduleWindowInfo(
     dayLabel: nowMinutes + deltaClose >= 1440 ? 'Mañana' : 'Hoy',
     minutesUntil: deltaClose,
   };
+}
+
+export function hasClosingDeadlinePassed(
+  now: Date,
+  targetOperationalDate: string,
+  rawSchedule?: ShiftSchedule,
+  graceMinutes: number = WORKER_GRACE_MINUTES,
+): boolean {
+  const schedule = normalizeShiftSchedule(rawSchedule);
+  if (!schedule.enabled) return false;
+
+  const operationalToday = getOperationalDateStr(now);
+  if (targetOperationalDate > operationalToday) return false;
+  if (targetOperationalDate < operationalToday) return true;
+
+  const bogota = getBogotaNowParts(now);
+  const cutoffMin = OPERATIONAL_DAY_CUTOFF_HOUR * 60;
+  const toOpOffset = (min: number) => (min - cutoffMin + 1440) % 1440;
+
+  const nowOffset = toOpOffset(bogota.totalMinutes);
+  const closeStartOffset = toOpOffset(parseTimeToMinutes(schedule.closingStart));
+  let closeEndOffset = toOpOffset(parseTimeToMinutes(schedule.closingEnd));
+  if (closeEndOffset <= closeStartOffset) {
+    closeEndOffset += 1440;
+  }
+
+  return nowOffset >= closeEndOffset + graceMinutes;
 }

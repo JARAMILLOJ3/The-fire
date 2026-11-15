@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { DEFAULT_SHIFT_SCHEDULE } from '../../constants';
 import {
   formatTime12h,
+  hasClosingDeadlinePassed,
   isTimeInWindow,
   resolveWorkerScheduleStatus,
   validateShiftSchedule,
@@ -139,5 +140,75 @@ describe('schedule.ts (ventanas, medianoche y gracia de 10 min)', () => {
     expect(formatTime12h('16:00')).toBe('4:00 p. m.');
     expect(formatTime12h('02:00')).toBe('2:00 a. m.');
     expect(formatTime12h('00:05')).toBe('12:05 a. m.');
+  });
+
+  it('detects when closing deadline has passed respecting operational day, overnight windows, and grace', () => {
+    // Schedule disabled -> never overdue
+    expect(
+      hasClosingDeadlinePassed(new Date('2026-11-14T08:00:00Z'), '2026-11-13', {
+        ...DEFAULT_SHIFT_SCHEDULE,
+        enabled: false,
+      }),
+    ).toBe(false);
+
+    // 23:30 Bogota on operational day 2026-11-13 (closing 23:00 - 02:00 + 10m grace) -> NOT late
+    expect(
+      hasClosingDeadlinePassed(
+        new Date('2026-11-14T04:30:00Z'),
+        '2026-11-13',
+        DEFAULT_SHIFT_SCHEDULE,
+      ),
+    ).toBe(false);
+
+    // 02:09 Bogota on operational day 2026-11-13 (inside grace) -> NOT late
+    expect(
+      hasClosingDeadlinePassed(
+        new Date('2026-11-14T07:09:00Z'),
+        '2026-11-13',
+        DEFAULT_SHIFT_SCHEDULE,
+      ),
+    ).toBe(false);
+
+    // 02:10 Bogota on operational day 2026-11-13 (deadline passed) -> LATE
+    expect(
+      hasClosingDeadlinePassed(
+        new Date('2026-11-14T07:10:00Z'),
+        '2026-11-13',
+        DEFAULT_SHIFT_SCHEDULE,
+      ),
+    ).toBe(true);
+
+    // Past operational date -> LATE; future operational date -> NOT late
+    expect(
+      hasClosingDeadlinePassed(
+        new Date('2026-11-14T15:00:00Z'),
+        '2026-11-13',
+        DEFAULT_SHIFT_SCHEDULE,
+      ),
+    ).toBe(true);
+    expect(
+      hasClosingDeadlinePassed(
+        new Date('2026-11-14T15:00:00Z'),
+        '2026-11-15',
+        DEFAULT_SHIFT_SCHEDULE,
+      ),
+    ).toBe(false);
+
+    // Daytime closing window 18:00 - 21:00 + 10 min grace
+    const daytimeSchedule = {
+      enabled: true,
+      openingStart: '09:00',
+      openingEnd: '11:00',
+      closingStart: '18:00',
+      closingEnd: '21:00',
+    };
+    // 21:05 Bogota (02:05Z next UTC day) -> inside grace -> false
+    expect(
+      hasClosingDeadlinePassed(new Date('2026-11-14T02:05:00Z'), '2026-11-13', daytimeSchedule),
+    ).toBe(false);
+    // 21:10 Bogota (02:10Z next UTC day) -> passed -> true
+    expect(
+      hasClosingDeadlinePassed(new Date('2026-11-14T02:10:00Z'), '2026-11-13', daytimeSchedule),
+    ).toBe(true);
   });
 });
