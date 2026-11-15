@@ -6,7 +6,7 @@ import {
   removeInviteOrMember,
   updateTeamMemberAccess,
   updateWorkspaceProfile,
-} from '../services/inventoryService';
+} from '../services/bossService';
 import type {
   DailyReport,
   DailyReportEntry,
@@ -230,7 +230,7 @@ export function TeamManager({
                 value={ownerName}
                 onChange={(e) => setOwnerName(e.target.value)}
                 placeholder="Ej: Carlos"
-                className="w-full min-h-[42px] px-3 py-2 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                className="w-full min-h-[44px] px-3 py-2 text-base sm:text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
               />
             </div>
 
@@ -245,14 +245,14 @@ export function TeamManager({
                 maxLength={MAX_NAME_LENGTH}
                 value={restaurantName}
                 onChange={(e) => setRestaurantName(e.target.value)}
-                className="w-full min-h-[42px] px-3 py-2 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                className="w-full min-h-[44px] px-3 py-2 text-base sm:text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
               />
             </div>
 
             <button
               type="submit"
               disabled={savingProfile}
-              className="w-full min-h-[42px] px-4 py-2 text-sm font-semibold text-white bg-stone-950 rounded-xl hover:bg-stone-800 disabled:opacity-60 transition-colors cursor-pointer"
+              className="w-full min-h-[44px] px-4 py-2 text-sm font-semibold text-white bg-stone-950 rounded-xl hover:bg-stone-800 disabled:opacity-60 transition-colors cursor-pointer"
             >
               {savingProfile ? 'Guardando...' : 'Guardar cambios'}
             </button>
@@ -280,7 +280,7 @@ export function TeamManager({
                 value={displayName}
                 onChange={(e) => setDisplayName(e.target.value)}
                 placeholder="Ej: Laura (Salchipapas)"
-                className="w-full min-h-[42px] px-3 py-2 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                className="w-full min-h-[44px] px-3 py-2 text-base sm:text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
               />
             </div>
 
@@ -295,7 +295,7 @@ export function TeamManager({
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 placeholder="ejemplo@gmail.com"
-                className="w-full min-h-[42px] px-3 py-2 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                className="w-full min-h-[44px] px-3 py-2 text-base sm:text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
               />
             </div>
 
@@ -306,7 +306,7 @@ export function TeamManager({
               <select
                 value={station}
                 onChange={(e) => setStation(e.target.value as TeamStationId)}
-                className="w-full min-h-[42px] px-3 py-2 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 bg-white"
+                className="w-full min-h-[44px] px-3 py-2 text-base sm:text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 bg-white"
               >
                 {stations.map((st) => (
                   <option key={st.id} value={st.id}>
@@ -357,19 +357,22 @@ export function TeamManager({
               </div>
 
               {activeMembers.map((m) => (
-                <div key={m.id} className="px-5 py-3.5 flex flex-wrap items-center justify-between gap-3">
+                <div
+                  key={m.id}
+                  className="px-4 sm:px-5 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 sm:gap-3"
+                >
                   <div className="min-w-0 flex-1">
                     <p className="text-sm font-medium text-stone-900 truncate">{m.displayName}</p>
                     <p className="text-xs text-stone-500 truncate">
                       {m.email} · {getRoleLabel(m.station)}
                     </p>
                   </div>
-                  <div className="flex items-center gap-2 shrink-0">
+                  <div className="flex items-center justify-between sm:justify-end gap-2 shrink-0">
                     <select
                       aria-label={`Puesto de ${m.displayName}`}
                       value={m.station}
                       onChange={(e) => handleChangeMemberStation(m, e.target.value as TeamStationId)}
-                      className="min-h-[34px] px-2 py-1 text-xs bg-stone-50 border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500"
+                      className="flex-1 sm:flex-initial min-w-0 min-h-[44px] sm:min-h-[38px] px-2.5 py-1.5 text-base sm:text-xs bg-stone-50 border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500"
                     >
                       {stations.map((st) => (
                         <option key={st.id} value={st.id}>
@@ -383,7 +386,7 @@ export function TeamManager({
                       onClick={() => handleDeactivateMember(m)}
                       aria-label={`Desactivar acceso de ${m.email}`}
                       title="Desactivar acceso"
-                      className="p-2 text-stone-400 hover:text-red-700 hover:bg-red-50 rounded-lg shrink-0 cursor-pointer"
+                      className="min-w-[44px] min-h-[44px] flex items-center justify-center text-stone-400 hover:text-red-700 hover:bg-red-50 rounded-lg shrink-0 cursor-pointer"
                     >
                       <Ban className="w-4 h-4" />
                     </button>
@@ -408,7 +411,7 @@ export function TeamManager({
               </div>
               <div className="divide-y divide-stone-100">
                 {revokedMembers.map((m) => (
-                  <div key={m.id} className="px-5 py-3.5 flex items-center justify-between gap-4">
+                  <div key={m.id} className="px-4 sm:px-5 py-3.5 flex items-center justify-between gap-3">
                     <div className="min-w-0 flex-1">
                       <p className="text-sm font-medium text-stone-500 truncate">{m.displayName}</p>
                       <p className="text-xs text-stone-400 truncate">
@@ -418,7 +421,7 @@ export function TeamManager({
                     <button
                       type="button"
                       onClick={() => handleReactivateMember(m)}
-                      className="min-h-[34px] inline-flex items-center gap-1.5 px-3 py-1 text-xs font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg hover:bg-emerald-100 shrink-0 cursor-pointer"
+                      className="min-h-[44px] sm:min-h-[38px] inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-lg hover:bg-emerald-100 shrink-0 cursor-pointer"
                     >
                       <RotateCcw className="w-3.5 h-3.5" />
                       Reactivar
@@ -447,7 +450,7 @@ export function TeamManager({
             ) : (
               <div className="divide-y divide-stone-100">
                 {invites.map((inv) => (
-                  <div key={inv.id} className="px-5 py-3.5 flex items-center justify-between gap-4">
+                  <div key={inv.id} className="px-4 sm:px-5 py-3.5 flex items-center justify-between gap-3">
                     <div className="min-w-0 flex-1">
                       <p className="text-sm font-medium text-stone-900 truncate">
                         {inv.displayName}
@@ -460,7 +463,7 @@ export function TeamManager({
                       type="button"
                       onClick={() => handleRemoveInvite(inv)}
                       aria-label={`Eliminar invitación de ${inv.email}`}
-                      className="p-2 text-stone-400 hover:text-red-700 hover:bg-red-50 rounded-lg shrink-0 cursor-pointer"
+                      className="min-w-[44px] min-h-[44px] flex items-center justify-center text-stone-400 hover:text-red-700 hover:bg-red-50 rounded-lg shrink-0 cursor-pointer"
                     >
                       <Trash2 className="w-4 h-4" />
                     </button>

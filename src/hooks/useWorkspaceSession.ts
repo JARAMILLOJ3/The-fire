@@ -13,7 +13,7 @@ import {
   fetchStationLinkPreview,
   resolveUserWorkspace,
   SessionAccessError,
-} from '../services/inventoryService';
+} from '../services/sessionService';
 import type { StationId, StationLink, TeamMember, TeamStationId, Workspace } from '../types';
 
 export function normalizeStationId(raw: string): StationId {

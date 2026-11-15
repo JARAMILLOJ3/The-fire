@@ -1,4 +1,3 @@
-import { motion } from 'motion/react';
 import { AlertTriangle, CheckCircle2, X } from 'lucide-react';
 import type { EntryAnomaly } from '../../utils/inventory';
 
@@ -43,13 +42,8 @@ export function ShiftSubmitConfirmModal({
       aria-modal="true"
       aria-labelledby="shift-confirm-title"
     >
-      <motion.div
-        initial={{ opacity: 0, y: 16, scale: 0.98 }}
-        animate={{ opacity: 1, y: 0, scale: 1 }}
-        transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
-        className="w-full sm:max-w-md bg-white border border-stone-200 rounded-t-3xl sm:rounded-2xl overflow-hidden shadow-2xl"
-      >
-        <div className="px-5 py-4 border-b border-stone-200 flex items-center justify-between gap-3">
+      <div className="w-full sm:max-w-md max-h-[90dvh] flex flex-col bg-white border border-stone-200 rounded-t-3xl sm:rounded-2xl overflow-hidden shadow-2xl animate-tf-fade-up">
+        <div className="px-5 py-4 border-b border-stone-200 flex items-center justify-between gap-3 shrink-0">
           <div className="flex items-center gap-2.5 min-w-0">
             <CheckCircle2 className="w-5 h-5 text-orange-600 shrink-0" />
             <h2
@@ -64,13 +58,13 @@ export function ShiftSubmitConfirmModal({
             onClick={onCancel}
             disabled={saving}
             aria-label="Cancelar confirmación"
-            className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-xl text-stone-500 hover:bg-stone-100 hover:text-stone-900 cursor-pointer"
+            className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl text-stone-500 hover:bg-stone-100 hover:text-stone-900 cursor-pointer"
           >
             <X className="w-5 h-5" />
           </button>
         </div>
 
-        <div className="p-5 space-y-4">
+        <div className="p-5 pb-[max(1.25rem,env(safe-area-inset-bottom))] space-y-4 overflow-y-auto flex-1 min-h-0">
           <p className="text-sm text-stone-700 leading-relaxed">
             {isOpening ? (
               <>
@@ -172,7 +166,7 @@ export function ShiftSubmitConfirmModal({
             </button>
           </div>
         </div>
-      </motion.div>
+      </div>
     </div>
   );
 }

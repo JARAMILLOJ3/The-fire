@@ -54,8 +54,8 @@ export function OptionSelect({
 
   const controlSizeClass =
     size === 'sm'
-      ? 'min-h-[38px] px-2.5 py-1.5 text-sm'
-      : 'min-h-[42px] px-3 py-2 text-sm';
+      ? 'min-h-[44px] px-2.5 py-2 text-base sm:text-sm'
+      : 'min-h-[44px] px-3 py-2 text-base sm:text-sm';
 
   const handleSelectChange = (next: string) => {
     if (next === OTHER_OPTION_VALUE) {

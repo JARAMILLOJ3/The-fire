@@ -1,10 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { User } from 'firebase/auth';
-import { AnimatePresence, motion } from 'motion/react';
 import {
   AlertTriangle,
-  Ban,
-  Check,
   CheckCheck,
   CheckCircle2,
   Clock,
@@ -22,9 +19,8 @@ import {
   ConcurrencyConflictError,
   DiagnosticSaveError,
   fetchStationEntriesOnce,
-  reopenStationReport,
   saveStationReportBatch,
-} from '../services/inventoryService';
+} from '../services/workerService';
 import type {
   DailyReport,
   DailyReportEntry,
@@ -38,25 +34,20 @@ import {
   computeOpeningStatusForValue,
   confirmAllPendingOpeningRows,
   confirmPreloadedOpeningRow,
-  detectEntryAnomalies,
   detectReportAnomalies,
   formatDateHuman,
-  formatPreviousClosingForItem,
-  formatSpanishDecimal,
   formatStationSaveError,
   formatTimeShort,
   getOpeningRowState,
-  getPacksPurchaseSummary,
   getPreviousDateStr,
   getStockLevel,
-  getStockLevelMeta,
-  getSuggestedPurchase,
   sanitizeStockQuantity,
   type EntryAnomaly,
   type StationSaveErrorInfo,
 } from '../utils/inventory';
 import { formatTime12h, type WorkerScheduleStatus } from '../utils/schedule';
-import { QuantityCaptureControl } from './shift/QuantityCaptureControl';
+import { ShiftDesktopItemRow } from './shift/ShiftDesktopItemRow';
+import { ShiftMobileItemCard } from './shift/ShiftMobileItemCard';
 import { ShiftOutsideHoursView } from './shift/ShiftOutsideHoursView';
 import { ShiftSubmitConfirmModal } from './shift/ShiftSubmitConfirmModal';
 
@@ -286,6 +277,7 @@ export function StationShiftView({
     mode: 'opening' | 'closing';
     anomalies: EntryAnomaly[];
   } | null>(null);
+  const [isTextInputFocused, setIsTextInputFocused] = useState(false);
 
   const touchedRef = useRef<Record<string, TouchedFlags>>({});
   const notesTouchedRef = useRef(false);
@@ -296,18 +288,65 @@ export function StationShiftView({
   );
   const latestEntriesRef = useRef(entriesByItemId);
   const latestItemsRef = useRef(stationItems);
+  const latestNotesRef = useRef(notes);
   const latestReportNotesRef = useRef(report?.notes ?? '');
   const latestReportUpdatedAtMsRef = useRef<number | null>(null);
   const yesterdayPreloadKeyRef = useRef<string>('');
   const listSectionRef = useRef<HTMLDivElement | null>(null);
+  const viewContainerRef = useRef<HTMLDivElement | null>(null);
+  const blurCheckTimerRef = useRef<number | null>(null);
 
   latestEntriesRef.current = entriesByItemId;
   latestItemsRef.current = stationItems;
+  latestNotesRef.current = notes;
   latestReportNotesRef.current = report?.notes ?? '';
   latestReportUpdatedAtMsRef.current =
     report?.updatedAt && typeof report.updatedAt.toMillis === 'function'
       ? report.updatedAt.toMillis()
       : null;
+
+  useEffect(() => {
+    return () => {
+      if (blurCheckTimerRef.current !== null) {
+        window.clearTimeout(blurCheckTimerRef.current);
+      }
+    };
+  }, []);
+
+  const isVirtualKeyboardTarget = (el: EventTarget | null): boolean => {
+    if (!(el instanceof HTMLElement)) return false;
+    if (el.tagName === 'TEXTAREA') return true;
+    if (el.tagName === 'INPUT') {
+      const inputType = (el as HTMLInputElement).type;
+      return inputType !== 'range' && inputType !== 'checkbox' && inputType !== 'radio';
+    }
+    return false;
+  };
+
+  const handleContainerFocusCapture = (e: React.FocusEvent<HTMLDivElement>) => {
+    if (blurCheckTimerRef.current !== null) {
+      window.clearTimeout(blurCheckTimerRef.current);
+      blurCheckTimerRef.current = null;
+    }
+    if (isVirtualKeyboardTarget(e.target)) {
+      setIsTextInputFocused(true);
+    }
+  };
+
+  const handleContainerBlurCapture = () => {
+    if (blurCheckTimerRef.current !== null) {
+      window.clearTimeout(blurCheckTimerRef.current);
+    }
+    blurCheckTimerRef.current = window.setTimeout(() => {
+      blurCheckTimerRef.current = null;
+      const activeEl = document.activeElement;
+      const stillFocusedInside =
+        Boolean(activeEl) &&
+        Boolean(viewContainerRef.current?.contains(activeEl)) &&
+        isVirtualKeyboardTarget(activeEl);
+      setIsTextInputFocused(stillFocusedInside);
+    }, 90);
+  };
 
   const persistLocalDraft = useCallback(
     (nextDrafts: Record<string, DraftEntryRow>, nextNotes: string) => {
@@ -593,81 +632,90 @@ export function StationShiftView({
     };
   }, [isWorkerOutsideHours, workspace.id, selectedDate, station.id, stationItems]);
 
-  const applyRowMutation = (
-    itemId: string,
-    mutator: (current: DraftEntryRow) => DraftEntryRow,
-    touchedUpdate: TouchedFlags,
-  ) => {
-    if (isLocked) return;
-    touchedRef.current = {
-      ...touchedRef.current,
-      [itemId]: {
-        ...(touchedRef.current[itemId] ?? {}),
-        ...touchedUpdate,
-      },
-    };
-    setDrafts((prev) => {
-      const current = prev[itemId];
-      if (!current) return prev;
-      const next = {
-        ...prev,
-        [itemId]: mutator(current),
+  const applyRowMutation = useCallback(
+    (
+      itemId: string,
+      mutator: (current: DraftEntryRow) => DraftEntryRow,
+      touchedUpdate: TouchedFlags,
+    ) => {
+      if (isLocked) return;
+      touchedRef.current = {
+        ...touchedRef.current,
+        [itemId]: {
+          ...(touchedRef.current[itemId] ?? {}),
+          ...touchedUpdate,
+        },
       };
-      persistLocalDraft(next, notes);
-      return next;
-    });
-  };
+      setDrafts((prev) => {
+        const current = prev[itemId];
+        if (!current) return prev;
+        const next = {
+          ...prev,
+          [itemId]: mutator(current),
+        };
+        persistLocalDraft(next, latestNotesRef.current);
+        return next;
+      });
+    },
+    [isLocked, persistLocalDraft],
+  );
 
-  const commitFieldValue = (
-    itemId: string,
-    field: 'opening' | 'added' | 'closing',
-    nextRawValue: number,
-  ) => {
-    const nextVal = sanitizeStockQuantity(nextRawValue);
-    applyRowMutation(
-      itemId,
-      (row) => ({
-        ...row,
-        [field]: nextVal,
-        notApplicable: field === 'added' ? row.notApplicable : false,
-        hasOpening: field === 'opening' ? true : row.hasOpening,
-        hasClosing: field === 'closing' ? true : row.hasClosing,
-        openingStatus:
-          field === 'opening'
-            ? computeOpeningStatusForValue(nextVal, row.previousClosing)
-            : row.openingStatus,
-      }),
-      {
-        [field]: true,
-        ...(field !== 'added' ? { notApplicable: true } : {}),
-      },
-    );
-  };
+  const commitFieldValue = useCallback(
+    (
+      itemId: string,
+      field: 'opening' | 'added' | 'closing',
+      nextRawValue: number,
+    ) => {
+      const nextVal = sanitizeStockQuantity(nextRawValue);
+      applyRowMutation(
+        itemId,
+        (row) => ({
+          ...row,
+          [field]: nextVal,
+          notApplicable: field === 'added' ? row.notApplicable : false,
+          hasOpening: field === 'opening' ? true : row.hasOpening,
+          hasClosing: field === 'closing' ? true : row.hasClosing,
+          openingStatus:
+            field === 'opening'
+              ? computeOpeningStatusForValue(nextVal, row.previousClosing)
+              : row.openingStatus,
+        }),
+        {
+          [field]: true,
+          ...(field !== 'added' ? { notApplicable: true } : {}),
+        },
+      );
+    },
+    [applyRowMutation],
+  );
 
-  const clearFieldValue = (
-    itemId: string,
-    field: 'opening' | 'added' | 'closing',
-  ) => {
-    applyRowMutation(
-      itemId,
-      (current) => ({
-        ...current,
-        [field]: 0,
-        hasOpening: field === 'opening' ? false : current.hasOpening,
-        hasClosing: field === 'closing' ? false : current.hasClosing,
-        openingStatus: field === 'opening' ? undefined : current.openingStatus,
-      }),
-      { [field]: true },
-    );
-  };
+  const clearFieldValue = useCallback(
+    (itemId: string, field: 'opening' | 'added' | 'closing') => {
+      applyRowMutation(
+        itemId,
+        (current) => ({
+          ...current,
+          [field]: 0,
+          hasOpening: field === 'opening' ? false : current.hasOpening,
+          hasClosing: field === 'closing' ? false : current.hasClosing,
+          openingStatus: field === 'opening' ? undefined : current.openingStatus,
+        }),
+        { [field]: true },
+      );
+    },
+    [applyRowMutation],
+  );
 
-  const confirmSingleOpening = (itemId: string) => {
-    applyRowMutation(
-      itemId,
-      (row) => confirmPreloadedOpeningRow(row),
-      { opening: true, notApplicable: true },
-    );
-  };
+  const confirmSingleOpening = useCallback(
+    (itemId: string) => {
+      applyRowMutation(
+        itemId,
+        (row) => confirmPreloadedOpeningRow(row),
+        { opening: true, notApplicable: true },
+      );
+    },
+    [applyRowMutation],
+  );
 
   const handleConfirmAllUntouched = () => {
     if (isLocked) return;
@@ -687,43 +735,49 @@ export function StationShiftView({
     });
   };
 
-  const markZeroExplicit = (itemId: string, field: 'opening' | 'closing') => {
-    applyRowMutation(
-      itemId,
-      (row) => ({
-        ...row,
-        [field]: 0,
-        notApplicable: false,
-        hasOpening: field === 'opening' ? true : row.hasOpening,
-        hasClosing: field === 'closing' ? true : row.hasClosing,
-        openingStatus:
-          field === 'opening'
-            ? computeOpeningStatusForValue(0, row.previousClosing)
-            : row.openingStatus,
-      }),
-      { [field]: true, notApplicable: true },
-    );
-  };
+  const markZeroExplicit = useCallback(
+    (itemId: string, field: 'opening' | 'closing') => {
+      applyRowMutation(
+        itemId,
+        (row) => ({
+          ...row,
+          [field]: 0,
+          notApplicable: false,
+          hasOpening: field === 'opening' ? true : row.hasOpening,
+          hasClosing: field === 'closing' ? true : row.hasClosing,
+          openingStatus:
+            field === 'opening'
+              ? computeOpeningStatusForValue(0, row.previousClosing)
+              : row.openingStatus,
+        }),
+        { [field]: true, notApplicable: true },
+      );
+    },
+    [applyRowMutation],
+  );
 
-  const toggleNotApplicable = (itemId: string) => {
-    const current = drafts[itemId];
-    if (!current) return;
-    const nextNA = !current.notApplicable;
-    applyRowMutation(
-      itemId,
-      (row) => ({
-        ...row,
-        notApplicable: nextNA,
-        opening: nextNA ? 0 : typeof row.previousClosing === 'number' ? row.previousClosing : row.opening,
-        added: nextNA ? 0 : row.added,
-        closing: nextNA ? 0 : row.closing,
-        hasOpening: false,
-        hasClosing: false,
-        openingStatus: undefined,
-      }),
-      { notApplicable: true, opening: true, closing: true },
-    );
-  };
+  const toggleNotApplicable = useCallback(
+    (itemId: string) => {
+      applyRowMutation(
+        itemId,
+        (row) => {
+          const nextNA = !row.notApplicable;
+          return {
+            ...row,
+            notApplicable: nextNA,
+            opening: nextNA ? 0 : typeof row.previousClosing === 'number' ? row.previousClosing : row.opening,
+            added: nextNA ? 0 : row.added,
+            closing: nextNA ? 0 : row.closing,
+            hasOpening: false,
+            hasClosing: false,
+            openingStatus: undefined,
+          };
+        },
+        { notApplicable: true, opening: true, closing: true },
+      );
+    },
+    [applyRowMutation],
+  );
 
   const handleNotesChange = (nextNotes: string) => {
     notesTouchedRef.current = true;
@@ -997,6 +1051,7 @@ export function StationShiftView({
     setReopening(true);
     setFeedback(null);
     try {
+      const { reopenStationReport } = await import('../services/bossService');
       await reopenStationReport(report.id, user);
       setFeedback({
         type: 'success',
@@ -1066,13 +1121,8 @@ export function StationShiftView({
     const openingStart12h = formatTime12h(scheduleStatus.schedule.openingStart);
 
     return (
-      <div className="min-h-[65vh] py-8 sm:py-12 flex items-center justify-center">
-        <motion.div
-          initial={{ opacity: 0, y: 12 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.25 }}
-          className="w-full max-w-lg bg-white border border-emerald-200 rounded-2xl p-6 sm:p-8 text-center space-y-5 shadow-xs"
-        >
+      <div className="min-h-[65dvh] py-6 sm:py-12 flex items-center justify-center">
+        <div className="w-full max-w-lg bg-white border border-emerald-200 rounded-2xl p-5 sm:p-8 text-center space-y-5 shadow-xs animate-tf-fade-up">
           <div className="w-16 h-16 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-700 flex items-center justify-center mx-auto">
             <CheckCircle2 className="w-9 h-9" />
           </div>
@@ -1100,19 +1150,19 @@ export function StationShiftView({
 
           {showClosingThankYou ? (
             <div className="grid grid-cols-3 gap-2 text-center">
-              <div className="p-3 rounded-xl bg-stone-50 border border-stone-200">
+              <div className="p-2.5 sm:p-3 rounded-xl bg-stone-50 border border-stone-200">
                 <p className="text-[11px] font-medium text-stone-500">Insumos</p>
                 <p className="font-mono tabular-nums text-lg font-bold text-stone-900 mt-0.5">
                   {counts.total - counts.naCount}
                 </p>
               </div>
-              <div className="p-3 rounded-xl bg-red-50/70 border border-red-200">
+              <div className="p-2.5 sm:p-3 rounded-xl bg-red-50/70 border border-red-200">
                 <p className="text-[11px] font-medium text-red-700">En cero</p>
                 <p className="font-mono tabular-nums text-lg font-bold text-red-700 mt-0.5">
                   {counts.zeroClosing}
                 </p>
               </div>
-              <div className="p-3 rounded-xl bg-emerald-50/70 border border-emerald-200">
+              <div className="p-2.5 sm:p-3 rounded-xl bg-emerald-50/70 border border-emerald-200">
                 <p className="text-[11px] font-medium text-emerald-700">Coincidieron</p>
                 <p className="font-mono tabular-nums text-lg font-bold text-emerald-700 mt-0.5">
                   {counts.confirmedMatch}
@@ -1121,19 +1171,19 @@ export function StationShiftView({
             </div>
           ) : (
             <div className="grid grid-cols-3 gap-2 text-center">
-              <div className="p-3 rounded-xl bg-stone-50 border border-stone-200">
+              <div className="p-2.5 sm:p-3 rounded-xl bg-stone-50 border border-stone-200">
                 <p className="text-[11px] font-medium text-stone-500">Insumos</p>
                 <p className="font-mono tabular-nums text-lg font-bold text-stone-900 mt-0.5">
                   {counts.total - counts.naCount}
                 </p>
               </div>
-              <div className="p-3 rounded-xl bg-emerald-50/70 border border-emerald-200">
+              <div className="p-2.5 sm:p-3 rounded-xl bg-emerald-50/70 border border-emerald-200">
                 <p className="text-[11px] font-medium text-emerald-700">Confirmados</p>
                 <p className="font-mono tabular-nums text-lg font-bold text-emerald-700 mt-0.5">
                   {counts.confirmedMatch + counts.manualOpening}
                 </p>
               </div>
-              <div className="p-3 rounded-xl bg-amber-50/70 border border-amber-200">
+              <div className="p-2.5 sm:p-3 rounded-xl bg-amber-50/70 border border-amber-200">
                 <p className="text-[11px] font-medium text-amber-800">Corregidos</p>
                 <p className="font-mono tabular-nums text-lg font-bold text-amber-800 mt-0.5">
                   {counts.adjusted}
@@ -1150,13 +1200,18 @@ export function StationShiftView({
                 : `Apertura registrada${draftTime ? ` (${draftTime})` : ''}. Ya puedes cerrar esta ventana hasta la hora del cierre.`}
             </span>
           </div>
-        </motion.div>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="space-y-4 sm:space-y-5 pb-28 lg:pb-8 min-w-0">
+    <div
+      ref={viewContainerRef}
+      onFocusCapture={handleContainerFocusCapture}
+      onBlurCapture={handleContainerBlurCapture}
+      className="space-y-4 sm:space-y-5 pb-32 lg:pb-8 min-w-0"
+    >
       {/* Header */}
       <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-3.5">
         <div className="min-w-0">
@@ -1335,11 +1390,9 @@ export function StationShiftView({
         </div>
 
         <div className="w-full h-2.5 bg-stone-200/80 rounded-full overflow-hidden">
-          <motion.div
-            initial={false}
-            animate={{ width: `${progressPct}%` }}
-            transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
-            className={`h-full rounded-full ${
+          <div
+            style={{ width: `${progressPct}%` }}
+            className={`h-full rounded-full transition-[width] duration-300 ease-out ${
               isCompleted
                 ? 'bg-emerald-600'
                 : counts.pendingConfirm > 0
@@ -1367,23 +1420,18 @@ export function StationShiftView({
         </div>
       </div>
 
-      <AnimatePresence>
-        {feedback && (
-          <motion.div
-            initial={{ opacity: 0, y: -6 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -6 }}
-            role="status"
-            className={`px-4 py-3.5 text-sm font-medium rounded-2xl border ${
-              feedback.type === 'success'
-                ? 'bg-emerald-50 text-emerald-900 border-emerald-200'
-                : 'bg-red-50 text-red-900 border-red-200'
-            }`}
-          >
-            {feedback.text}
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {feedback && (
+        <div
+          role="status"
+          className={`px-4 py-3.5 text-sm font-medium rounded-2xl border animate-tf-fade-in ${
+            feedback.type === 'success'
+              ? 'bg-emerald-50 text-emerald-900 border-emerald-200'
+              : 'bg-red-50 text-red-900 border-red-200'
+          }`}
+        >
+          {feedback.text}
+        </div>
+      )}
 
       {/* Search & Filter Toolbar */}
       {stationItems.length > 0 && (
@@ -1447,7 +1495,7 @@ export function StationShiftView({
       <div className="bg-white border border-stone-200 rounded-2xl overflow-hidden">
         {stationItems.length === 0 ? (
           <div className="p-10 text-center text-sm text-stone-600">
-            No hay insumos activos en este puesto. El jefe puede agregarlos desde &ldquo;Catálogo de Insumos&rdquo;.
+            No hay insumos activos en este puesto. El jefe puede agregarlos desde &ldquo;Insumos&rdquo;.
           </div>
         ) : filteredItems.length === 0 ? (
           <div className="p-10 text-center space-y-2">
@@ -1460,7 +1508,7 @@ export function StationShiftView({
                 setSearchTerm('');
                 setItemFilter('todos');
               }}
-              className="text-sm font-semibold text-orange-600 hover:text-orange-700 cursor-pointer"
+              className="min-h-[44px] px-3 text-sm font-semibold text-orange-600 hover:text-orange-700 cursor-pointer"
             >
               Ver todos los insumos
             </button>
@@ -1483,291 +1531,25 @@ export function StationShiftView({
                   hasClosing: false,
                   notApplicable: false,
                 };
-
-                const isNA = Boolean(row.notApplicable);
-                const openingState = getOpeningRowState(row);
-                const isPendingConfirm = openingState === 'pending_confirm';
-                const showOpeningNumber =
-                  !isNA && (row.hasOpening || isPendingConfirm);
-                const hasClosingVal = row.hasClosing && !isNA;
-
-                const level = getStockLevel(row.closing, item.minStock);
-                const meta = getStockLevelMeta(level);
-                const suggestBuy = getSuggestedPurchase(
-                  row.closing,
-                  item.minStock,
-                  item.targetStock,
-                );
-                const packsPurchaseHint = getPacksPurchaseSummary(suggestBuy, item);
-                const rowAnomalies = detectEntryAnomalies(row, draftMode);
-                const openingTone = isPendingConfirm
-                  ? 'pending'
-                  : openingState === 'adjusted'
-                    ? 'adjusted'
-                    : row.hasOpening
-                      ? 'confirmed'
-                      : 'default';
-                const closingTone = !hasClosingVal
-                  ? 'default'
-                  : level === 'agotado' || level === 'comprar'
-                    ? 'red'
-                    : level === 'medio'
-                      ? 'amber'
-                      : 'emerald';
-
-                const cardSurface = isNA
-                  ? 'bg-stone-100/80'
-                  : isPendingConfirm
-                    ? 'bg-sky-50/50'
-                    : isWorkerOpeningPhase && row.hasOpening
-                      ? 'bg-emerald-50/25'
-                      : !isWorkerOpeningPhase && hasClosingVal
-                        ? 'bg-white'
-                        : 'bg-white';
-
                 return (
-                  <div key={item.id} className={`p-4 sm:p-5 space-y-4 ${cardSurface}`}>
-                    {/* Item Title + Status */}
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="min-w-0">
-                        <h3 className="text-base font-bold text-stone-900 leading-snug">
-                          {item.name}
-                        </h3>
-                        <p className="text-xs text-stone-500 mt-0.5 font-mono tabular-nums">
-                          {item.unit} · Mín: {item.minStock}
-                          {typeof row.previousClosing === 'number' && (
-                            <>
-                              {' '}·{' '}
-                              <span className="text-sky-800 font-semibold">
-                                Ayer quedó: {formatPreviousClosingForItem(row.previousClosing, item)}
-                              </span>
-                            </>
-                          )}
-                        </p>
-                      </div>
-
-                      <div className="shrink-0 text-right">
-                        {isNA ? (
-                          <span className="inline-flex items-center gap-1 text-xs font-semibold text-stone-500">
-                            <Ban className="w-3.5 h-3.5 shrink-0" />
-                            No aplica
-                          </span>
-                        ) : isPendingConfirm ? (
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-sky-100 text-sky-800 border border-sky-300 text-xs font-bold">
-                            <Clock className="w-3.5 h-3.5 shrink-0" />
-                            Por confirmar
-                          </span>
-                        ) : openingState === 'adjusted' ? (
-                          <span className="inline-flex items-center gap-1 text-xs font-semibold text-orange-700">
-                            <Check className="w-3.5 h-3.5 shrink-0" />
-                            Corregido
-                          </span>
-                        ) : openingState === 'confirmed' || openingState === 'manual' ? (
-                          <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700">
-                            <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-                            Inicio OK
-                          </span>
-                        ) : (
-                          <span className="inline-flex items-center gap-1 text-xs font-semibold text-stone-500">
-                            <Clock className="w-3.5 h-3.5 shrink-0" />
-                            Por contar
-                          </span>
-                        )}
-                      </div>
-                    </div>
-
-                    {rowAnomalies.length > 0 && (
-                      <div className="flex items-start gap-2 px-3 py-2 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900">
-                        <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0 mt-0.5" />
-                        <span>{rowAnomalies[0].message}</span>
-                      </div>
-                    )}
-
-                    {/* PASO 1: Inicio del día y Surtido (+) — ALWAYS VISIBLE */}
-                    <div className="space-y-3">
-                      <div className="flex items-center justify-between text-xs">
-                        <span className="font-bold text-stone-700">
-                          Paso 1 · Inicio y surtido
-                        </span>
-                        {!isNA && (row.hasOpening || isPendingConfirm) && (
-                          <span className="font-mono tabular-nums font-semibold text-stone-600">
-                            Disponible:{' '}
-                            {formatSpanishDecimal(sanitizeStockQuantity(row.opening + row.added), 2)}{' '}
-                            {item.unit}
-                          </span>
-                        )}
-                      </div>
-
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                        <div className="space-y-1.5">
-                          <label
-                            htmlFor={`m-open-${item.id}`}
-                            className="flex flex-wrap items-center justify-between gap-1.5 text-xs font-semibold text-stone-700"
-                          >
-                            <span>Inicio del día ({item.unit})</span>
-                            {typeof row.previousClosing === 'number' && (
-                              <span className="font-mono tabular-nums text-sky-800">
-                                Ayer quedó: {formatPreviousClosingForItem(row.previousClosing, item)}
-                              </span>
-                            )}
-                          </label>
-                          <QuantityCaptureControl
-                            item={item}
-                            field="opening"
-                            fieldLabel="inicio"
-                            value={row.opening}
-                            hasValue={showOpeningNumber}
-                            disabled={isLocked || isNA}
-                            variant="mobile"
-                            tone={openingTone}
-                            inputId={`m-open-${item.id}`}
-                            onCommitValue={(val) => commitFieldValue(item.id, 'opening', val)}
-                            onClearValue={() => clearFieldValue(item.id, 'opening')}
-                          />
-                        </div>
-
-                        <div className="space-y-1.5">
-                          <label
-                            htmlFor={`m-add-${item.id}`}
-                            className="block text-xs font-semibold text-orange-700"
-                          >
-                            Surtido / llegó hoy (+)
-                          </label>
-                          <QuantityCaptureControl
-                            item={item}
-                            field="added"
-                            fieldLabel="surtido"
-                            value={row.added}
-                            hasValue={!isNA}
-                            disabled={isLocked || isNA}
-                            variant="mobile"
-                            tone="orange"
-                            inputId={`m-add-${item.id}`}
-                            onCommitValue={(val) => commitFieldValue(item.id, 'added', val)}
-                          />
-                        </div>
-                      </div>
-
-                      {!isLocked && (
-                        <div className="flex flex-wrap gap-2">
-                          {isPendingConfirm && (
-                            <button
-                              type="button"
-                              onClick={() => confirmSingleOpening(item.id)}
-                              className="flex-1 min-w-[140px] min-h-[44px] inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs sm:text-sm font-bold rounded-xl bg-sky-600 text-white hover:bg-sky-700 active:scale-[0.99] transition-all cursor-pointer"
-                            >
-                              <Check className="w-4 h-4 shrink-0" />
-                              ✓ Está bien
-                            </button>
-                          )}
-                          {isWorkerOpeningPhase && (
-                            <button
-                              type="button"
-                              onClick={() => markZeroExplicit(item.id, 'opening')}
-                              className={`flex-1 min-h-[44px] px-3 py-2 text-xs font-semibold rounded-xl border transition-colors cursor-pointer ${
-                                row.hasOpening && !isNA && row.opening === 0
-                                  ? 'bg-stone-900 text-white border-stone-900'
-                                  : 'bg-white text-stone-700 border-stone-200 hover:bg-stone-100'
-                              }`}
-                            >
-                              0 / Sin existencia
-                            </button>
-                          )}
-                          {isWorkerOpeningPhase && (
-                            <button
-                              type="button"
-                              onClick={() => toggleNotApplicable(item.id)}
-                              className={`min-h-[44px] inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-xl border transition-colors cursor-pointer ${
-                                isNA
-                                  ? 'bg-stone-700 text-white border-stone-700'
-                                  : 'bg-white text-stone-600 border-stone-200 hover:bg-stone-100'
-                              }`}
-                            >
-                              <Ban className="w-3.5 h-3.5 shrink-0" />
-                              {isNA ? 'No aplica' : 'No aplica hoy'}
-                            </button>
-                          )}
-                        </div>
-                      )}
-                    </div>
-
-                    {/* PASO 2: Cierre del día (visible en cierre / jefe / horario libre) */}
-                    {!isWorkerOpeningPhase && (
-                      <div className="pt-3 border-t border-stone-100 space-y-2.5">
-                        <div className="flex items-center justify-between gap-2">
-                          <label
-                            htmlFor={`mobile-close-${item.id}`}
-                            className="text-xs font-bold text-stone-800"
-                          >
-                            Paso 2 · ¿Cuánto quedó hoy al cerrar? ({item.unit})
-                          </label>
-                          {hasClosingVal ? (
-                            <span
-                              className={`inline-flex items-center gap-1 text-xs font-semibold ${meta.textClass}`}
-                            >
-                              {(level === 'agotado' || level === 'comprar') && (
-                                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-                              )}
-                              {packsPurchaseHint
-                                ? packsPurchaseHint.text
-                                : suggestBuy > 0
-                                  ? `Pedir +${suggestBuy}`
-                                  : meta.label}
-                            </span>
-                          ) : !isNA ? (
-                            <span className="text-xs font-semibold text-stone-400">Por contar</span>
-                          ) : null}
-                        </div>
-
-                        <QuantityCaptureControl
-                          item={item}
-                          field="closing"
-                          fieldLabel="cierre"
-                          value={row.closing}
-                          hasValue={hasClosingVal}
-                          disabled={isLocked || isNA}
-                          variant="mobile"
-                          tone={closingTone}
-                          inputId={`mobile-close-${item.id}`}
-                          onCommitValue={(val) => commitFieldValue(item.id, 'closing', val)}
-                          onClearValue={() => clearFieldValue(item.id, 'closing')}
-                        />
-
-                        {!isLocked && (
-                          <div className="grid grid-cols-2 gap-2 pt-0.5">
-                            <button
-                              type="button"
-                              onClick={() => markZeroExplicit(item.id, 'closing')}
-                              className={`min-h-[44px] px-3 py-2 text-xs font-semibold rounded-xl border transition-colors cursor-pointer ${
-                                hasClosingVal && row.closing === 0
-                                  ? 'bg-red-700 text-white border-red-700'
-                                  : 'bg-white text-stone-700 border-stone-200 hover:bg-stone-100'
-                              }`}
-                            >
-                              0 / No queda
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => toggleNotApplicable(item.id)}
-                              className={`min-h-[44px] inline-flex items-center justify-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-xl border transition-colors cursor-pointer ${
-                                isNA
-                                  ? 'bg-stone-700 text-white border-stone-700'
-                                  : 'bg-white text-stone-600 border-stone-200 hover:bg-stone-100'
-                              }`}
-                            >
-                              <Ban className="w-3.5 h-3.5 shrink-0" />
-                              {isNA ? 'Marcado: No aplica' : 'No aplica hoy'}
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
+                  <ShiftMobileItemCard
+                    key={item.id}
+                    item={item}
+                    row={row}
+                    isLocked={isLocked}
+                    isWorkerOpeningPhase={isWorkerOpeningPhase}
+                    draftMode={draftMode}
+                    onCommitField={commitFieldValue}
+                    onClearField={clearFieldValue}
+                    onConfirmSingleOpening={confirmSingleOpening}
+                    onMarkZeroExplicit={markZeroExplicit}
+                    onToggleNotApplicable={toggleNotApplicable}
+                  />
                 );
               })}
             </div>
 
-            {/* Desktop Table (>= lg) — Inicio y surtido SIEMPRE visibles antes del cierre */}
+            {/* Desktop Table (>= lg) */}
             <div className="hidden lg:block overflow-x-auto">
               <table className="w-full text-left border-collapse">
                 <thead>
@@ -1805,253 +1587,20 @@ export function StationShiftView({
                       hasClosing: false,
                       notApplicable: false,
                     };
-
-                    const isNA = Boolean(row.notApplicable);
-                    const openingState = getOpeningRowState(row);
-                    const isPendingConfirm = openingState === 'pending_confirm';
-                    const showOpeningNumber = !isNA && (row.hasOpening || isPendingConfirm);
-                    const hasValue = row.hasClosing && !isNA;
-                    const consumed =
-                      row.hasOpening && hasValue
-                        ? sanitizeStockQuantity(Math.max(0, row.opening + row.added - row.closing))
-                        : null;
-                    const level = getStockLevel(row.closing, item.minStock);
-                    const meta = getStockLevelMeta(level);
-                    const suggestBuy = getSuggestedPurchase(
-                      row.closing,
-                      item.minStock,
-                      item.targetStock,
-                    );
-                    const packsPurchaseHint = getPacksPurchaseSummary(suggestBuy, item);
-                    const rowAnomalies = detectEntryAnomalies(row, draftMode);
-                    const openingTone = isPendingConfirm
-                      ? 'pending'
-                      : openingState === 'adjusted'
-                        ? 'adjusted'
-                        : row.hasOpening
-                          ? 'confirmed'
-                          : 'default';
-                    const closingTone = !hasValue
-                      ? 'default'
-                      : level === 'agotado' || level === 'comprar'
-                        ? 'red'
-                        : level === 'medio'
-                          ? 'amber'
-                          : 'emerald';
-
                     return (
-                      <tr
+                      <ShiftDesktopItemRow
                         key={item.id}
-                        className={`transition-colors ${
-                          isNA
-                            ? 'bg-stone-50/90'
-                            : isPendingConfirm
-                              ? 'bg-sky-50/45 hover:bg-sky-50/70'
-                              : 'hover:bg-stone-50/70'
-                        }`}
-                      >
-                        <td className="py-4 px-5 align-top">
-                          <div className="text-base font-semibold text-stone-900">{item.name}</div>
-                          <div className="text-xs text-stone-500 font-mono tabular-nums mt-0.5 flex flex-wrap items-center gap-x-1.5">
-                            <span>
-                              {item.unit} · Mín: {item.minStock}
-                            </span>
-                            {typeof row.previousClosing === 'number' && (
-                              <span className="text-sky-800 font-semibold">
-                                · Ayer quedó: {formatPreviousClosingForItem(row.previousClosing, item)}
-                              </span>
-                            )}
-                          </div>
-                          {rowAnomalies.length > 0 && (
-                            <div className="inline-flex items-center gap-1 mt-1 text-xs font-medium text-amber-700">
-                              <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-                              <span>{rowAnomalies[0].message}</span>
-                            </div>
-                          )}
-                        </td>
-
-                        {/* Inicio del día + "✓ Está bien" si pendiente */}
-                        <td className="py-4 px-3 align-top">
-                          <div className="flex flex-col items-center gap-1.5">
-                            <QuantityCaptureControl
-                              item={item}
-                              field="opening"
-                              fieldLabel="inicio"
-                              value={row.opening}
-                              hasValue={showOpeningNumber}
-                              disabled={isLocked || isNA}
-                              variant="desktop"
-                              tone={openingTone}
-                              onCommitValue={(val) => commitFieldValue(item.id, 'opening', val)}
-                              onClearValue={() => clearFieldValue(item.id, 'opening')}
-                            />
-
-                            {isPendingConfirm && !isLocked ? (
-                              <button
-                                type="button"
-                                onClick={() => confirmSingleOpening(item.id)}
-                                className="min-h-[34px] inline-flex items-center gap-1 px-2.5 py-1 text-xs font-bold text-white bg-sky-600 rounded-lg hover:bg-sky-700 whitespace-nowrap cursor-pointer"
-                              >
-                                <Check className="w-3.5 h-3.5" />
-                                ✓ Está bien
-                              </button>
-                            ) : !isNA && openingState === 'adjusted' ? (
-                              <span className="text-[11px] font-semibold text-orange-700">
-                                Corregido
-                              </span>
-                            ) : !isNA && openingState === 'confirmed' ? (
-                              <span className="text-[11px] font-semibold text-emerald-700">
-                                Confirmado
-                              </span>
-                            ) : null}
-                          </div>
-                        </td>
-
-                        {/* Surtido (+) */}
-                        <td className="py-4 px-3 align-top">
-                          <QuantityCaptureControl
-                            item={item}
-                            field="added"
-                            fieldLabel="surtido"
-                            value={row.added}
-                            hasValue={!isNA}
-                            disabled={isLocked || isNA}
-                            variant="desktop"
-                            tone="orange"
-                            onCommitValue={(val) => commitFieldValue(item.id, 'added', val)}
-                          />
-                        </td>
-
-                        {isWorkerOpeningPhase ? (
-                          <>
-                            <td className="py-4 px-3 align-top">
-                              <div className="flex items-center justify-center gap-1.5">
-                                <button
-                                  type="button"
-                                  disabled={isLocked}
-                                  onClick={() => markZeroExplicit(item.id, 'opening')}
-                                  className={`min-h-[38px] px-2.5 py-1 text-xs font-semibold rounded-lg border whitespace-nowrap cursor-pointer disabled:opacity-50 ${
-                                    row.hasOpening && !isNA && row.opening === 0
-                                      ? 'bg-stone-900 text-white border-stone-900'
-                                      : 'bg-white text-stone-700 border-stone-200 hover:bg-stone-100'
-                                  }`}
-                                >
-                                  0
-                                </button>
-                                <button
-                                  type="button"
-                                  disabled={isLocked}
-                                  onClick={() => toggleNotApplicable(item.id)}
-                                  className={`min-h-[38px] px-2.5 py-1 text-xs font-semibold rounded-lg border whitespace-nowrap cursor-pointer disabled:opacity-50 ${
-                                    isNA
-                                      ? 'bg-stone-700 text-white border-stone-700'
-                                      : 'bg-white text-stone-600 border-stone-200 hover:bg-stone-100'
-                                  }`}
-                                >
-                                  No aplica
-                                </button>
-                              </div>
-                            </td>
-                            <td className="py-4 px-5 text-right font-mono tabular-nums font-bold align-top">
-                              {isNA ? (
-                                <span className="text-stone-500 font-normal">No aplica</span>
-                              ) : isPendingConfirm ? (
-                                <span className="text-sky-700">Por confirmar</span>
-                              ) : row.hasOpening ? (
-                                <span className="text-stone-900">
-                                  {formatSpanishDecimal(sanitizeStockQuantity(row.opening + row.added), 2)} {item.unit}
-                                </span>
-                              ) : (
-                                <span className="text-stone-400 font-normal">Por contar</span>
-                              )}
-                            </td>
-                          </>
-                        ) : (
-                          <>
-                            <td className="py-4 px-4 align-top">
-                              <QuantityCaptureControl
-                                item={item}
-                                field="closing"
-                                fieldLabel="cierre"
-                                value={row.closing}
-                                hasValue={hasValue}
-                                disabled={isLocked || isNA}
-                                variant="desktop"
-                                tone={closingTone}
-                                onCommitValue={(val) => commitFieldValue(item.id, 'closing', val)}
-                                onClearValue={() => clearFieldValue(item.id, 'closing')}
-                              />
-                            </td>
-
-                            <td className="py-4 px-3 align-top">
-                              <div className="flex items-center justify-center gap-1.5">
-                                <button
-                                  type="button"
-                                  disabled={isLocked}
-                                  onClick={() => markZeroExplicit(item.id, 'closing')}
-                                  className={`min-h-[38px] px-2.5 py-1 text-xs font-semibold rounded-lg border whitespace-nowrap cursor-pointer disabled:opacity-50 ${
-                                    hasValue && row.closing === 0
-                                      ? 'bg-red-700 text-white border-red-700'
-                                      : 'bg-white text-stone-700 border-stone-200 hover:bg-stone-100'
-                                  }`}
-                                >
-                                  0 / No queda
-                                </button>
-                                <button
-                                  type="button"
-                                  disabled={isLocked}
-                                  onClick={() => toggleNotApplicable(item.id)}
-                                  className={`min-h-[38px] px-2.5 py-1 text-xs font-semibold rounded-lg border whitespace-nowrap cursor-pointer disabled:opacity-50 ${
-                                    isNA
-                                      ? 'bg-stone-700 text-white border-stone-700'
-                                      : 'bg-white text-stone-600 border-stone-200 hover:bg-stone-100'
-                                  }`}
-                                >
-                                  No aplica
-                                </button>
-                              </div>
-                            </td>
-
-                            <td className="py-4 px-4 text-right font-mono tabular-nums text-stone-700 align-top">
-                              {consumed !== null ? `${formatSpanishDecimal(consumed, 2)} ${item.unit}` : '—'}
-                            </td>
-
-                            <td className="py-4 px-5 whitespace-nowrap align-top">
-                              {isNA ? (
-                                <span className="text-xs font-semibold text-stone-500">
-                                  No aplica hoy
-                                </span>
-                              ) : isPendingConfirm ? (
-                                <span className="text-xs font-bold text-sky-700">
-                                  Inicio por confirmar
-                                </span>
-                              ) : !hasValue ? (
-                                <span className="text-xs font-medium text-stone-400">
-                                  Por contar
-                                </span>
-                              ) : (
-                                <div className="space-y-0.5">
-                                  <span
-                                    className={`inline-flex items-center gap-1.5 text-sm font-semibold ${meta.textClass}`}
-                                  >
-                                    {(level === 'agotado' || level === 'comprar') && (
-                                      <AlertTriangle className="w-4 h-4 shrink-0" />
-                                    )}
-                                    {meta.label}
-                                  </span>
-                                  {suggestBuy > 0 && (
-                                    <p className="text-xs font-mono tabular-nums text-red-700">
-                                      {packsPurchaseHint
-                                        ? packsPurchaseHint.text
-                                        : `Sugerido pedir: +${suggestBuy} ${item.unit}`}
-                                    </p>
-                                  )}
-                                </div>
-                              )}
-                            </td>
-                          </>
-                        )}
-                      </tr>
+                        item={item}
+                        row={row}
+                        isLocked={isLocked}
+                        isWorkerOpeningPhase={isWorkerOpeningPhase}
+                        draftMode={draftMode}
+                        onCommitField={commitFieldValue}
+                        onClearField={clearFieldValue}
+                        onConfirmSingleOpening={confirmSingleOpening}
+                        onMarkZeroExplicit={markZeroExplicit}
+                        onToggleNotApplicable={toggleNotApplicable}
+                      />
                     );
                   })}
                 </tbody>
@@ -2085,7 +1634,7 @@ export function StationShiftView({
                   ? 'Ej: Llegaron 2 cajas de gaseosa y 3 bolsas de papa...'
                   : 'Ej: Llegó pedido de gaseosas hoy, o falta comprar hielo urgente...'
               }
-              className="w-full px-3.5 py-2.5 text-base sm:text-sm bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 focus:bg-white disabled:opacity-60"
+              className="w-full min-h-[44px] scroll-mb-36 px-3.5 py-2.5 text-base sm:text-sm bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 focus:bg-white disabled:opacity-60"
             />
           </div>
 
@@ -2102,7 +1651,7 @@ export function StationShiftView({
                 <button
                   type="button"
                   onClick={syncDraftsWithServer}
-                  className="min-h-[42px] px-3.5 py-2 text-xs font-semibold text-stone-800 bg-white border border-stone-300 rounded-xl hover:bg-stone-100 cursor-pointer"
+                  className="min-h-[44px] px-3.5 py-2 text-xs font-semibold text-stone-800 bg-white border border-stone-300 rounded-xl hover:bg-stone-100 cursor-pointer"
                 >
                   Aceptar versión del servidor
                 </button>
@@ -2110,7 +1659,7 @@ export function StationShiftView({
                   type="button"
                   disabled={savingMode !== null}
                   onClick={() => executeSave(pendingConflict.mode, { forceOverwrite: true })}
-                  className="min-h-[42px] px-3.5 py-2 text-xs font-semibold text-white bg-red-700 rounded-xl hover:bg-red-800 disabled:opacity-50 cursor-pointer"
+                  className="min-h-[44px] px-3.5 py-2 text-xs font-semibold text-white bg-red-700 rounded-xl hover:bg-red-800 disabled:opacity-50 cursor-pointer"
                 >
                   Sobrescribir con mis conteos
                 </button>
@@ -2138,18 +1687,18 @@ export function StationShiftView({
                   setItemFilter('pendientes');
                   listSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
                 }}
-                className="font-bold text-orange-700 underline hover:text-orange-900 cursor-pointer"
+                className="min-h-[40px] px-2 font-bold text-orange-700 underline hover:text-orange-900 cursor-pointer"
               >
                 Ver pendientes
               </button>
             </div>
           )}
 
-          {/* Save error inline right beside Desktop Action Row */}
+          {/* Save error inline right beside Action Row */}
           {saveError && !isLocked && (
             <div
               role="alert"
-              className="hidden lg:flex items-start justify-between gap-3 p-3.5 rounded-xl bg-red-50 border border-red-300 text-red-950"
+              className="flex items-start justify-between gap-3 p-3.5 rounded-xl bg-red-50 border border-red-300 text-red-950"
             >
               <div className="flex items-start gap-2.5 min-w-0">
                 <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
@@ -2169,9 +1718,32 @@ export function StationShiftView({
                 type="button"
                 onClick={() => setSaveError(null)}
                 aria-label="Cerrar error de guardado"
-                className="p-1 text-red-700 hover:bg-red-100 rounded-lg shrink-0 cursor-pointer"
+                className="min-w-[44px] min-h-[44px] flex items-center justify-center text-red-700 hover:bg-red-100 rounded-xl shrink-0 cursor-pointer"
               >
                 <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+
+          {/* Mobile inline CTA backup (visible when keyboard hides fixed bottom bar) */}
+          {!isLocked && (
+            <div className="lg:hidden pt-1">
+              <button
+                type="button"
+                disabled={savingMode !== null || !primaryBlockStatus.ok}
+                onClick={() => requestSaveWithConfirmation(draftMode)}
+                className="w-full min-h-[48px] inline-flex items-center justify-center gap-2 px-4 py-3 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.99] disabled:opacity-50 disabled:cursor-not-allowed transition-all cursor-pointer"
+              >
+                {isWorkerOpeningPhase ? <Save className="w-4 h-4" /> : <CheckCircle2 className="w-4 h-4" />}
+                {savingMode !== null
+                  ? 'Guardando...'
+                  : counts.pendingConfirm > 0
+                    ? `${counts.pendingConfirm} por confirmar`
+                    : counts.missingCount > 0
+                      ? `Faltan ${counts.missingCount} por contar`
+                      : isWorkerOpeningPhase
+                        ? 'Guardar apertura y surtido'
+                        : 'Enviar cierre del día'}
               </button>
             </div>
           )}
@@ -2229,9 +1801,9 @@ export function StationShiftView({
         </div>
       )}
 
-      {/* Mobile Sticky Bottom CTA Bar (compact <= 15% mobile viewport height) */}
-      {stationItems.length > 0 && !isLocked && (
-        <div className="lg:hidden fixed bottom-0 left-0 right-0 z-30 bg-white/95 backdrop-blur-md border-t border-stone-200 shadow-lg no-print">
+      {/* Mobile Sticky Bottom CTA Bar (auto-hidden when virtual keyboard is open) */}
+      {stationItems.length > 0 && !isLocked && !isTextInputFocused && (
+        <div className="lg:hidden fixed bottom-0 left-0 right-0 z-30 bg-white/95 backdrop-blur-md border-t border-stone-200 shadow-lg no-print pb-[max(0.5rem,env(safe-area-inset-bottom))]">
           {pendingConflict && (
             <div className="px-4 py-2.5 bg-amber-50 border-b border-amber-200 text-amber-950">
               <div className="max-w-lg mx-auto flex flex-wrap items-center justify-between gap-2 text-xs">
@@ -2240,7 +1812,7 @@ export function StationShiftView({
                   <button
                     type="button"
                     onClick={syncDraftsWithServer}
-                    className="min-h-[36px] px-2.5 py-1 font-semibold text-stone-800 bg-white border border-stone-300 rounded-lg cursor-pointer"
+                    className="min-h-[40px] px-2.5 py-1 font-semibold text-stone-800 bg-white border border-stone-300 rounded-lg cursor-pointer"
                   >
                     Cargar servidor
                   </button>
@@ -2248,7 +1820,7 @@ export function StationShiftView({
                     type="button"
                     disabled={savingMode !== null}
                     onClick={() => executeSave(pendingConflict.mode, { forceOverwrite: true })}
-                    className="min-h-[36px] px-2.5 py-1 font-semibold text-white bg-red-700 rounded-lg disabled:opacity-50 cursor-pointer"
+                    className="min-h-[40px] px-2.5 py-1 font-semibold text-white bg-red-700 rounded-lg disabled:opacity-50 cursor-pointer"
                   >
                     Sobrescribir
                   </button>
@@ -2279,7 +1851,7 @@ export function StationShiftView({
                   type="button"
                   onClick={() => setSaveError(null)}
                   aria-label="Cerrar error de guardado"
-                  className="p-1 text-red-700 hover:bg-red-100 rounded-lg shrink-0 cursor-pointer"
+                  className="min-w-[44px] min-h-[44px] flex items-center justify-center text-red-700 hover:bg-red-100 rounded-xl shrink-0 cursor-pointer"
                 >
                   <X className="w-4 h-4" />
                 </button>

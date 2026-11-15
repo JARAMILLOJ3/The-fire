@@ -78,7 +78,7 @@ export function ItemCaptureFields({
               onInputTypeChange(opt.id);
               onClearError?.();
             }}
-            className={`px-1.5 py-1.5 rounded-lg text-center transition-all cursor-pointer ${
+            className={`min-h-[44px] flex flex-col items-center justify-center px-1.5 py-1.5 rounded-lg text-center transition-all cursor-pointer ${
               inputType === opt.id
                 ? 'bg-white text-stone-900 shadow-xs font-bold'
                 : 'text-stone-600 hover:text-stone-900 font-medium'
@@ -154,7 +154,7 @@ export function ItemCaptureFields({
                 onPackSizeInputChange(e.target.value);
                 onClearError?.();
               }}
-              className="w-full min-h-[38px] px-2.5 py-1.5 text-xs sm:text-sm font-mono tabular-nums bg-white border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+              className="w-full min-h-[44px] px-2.5 py-2 text-base sm:text-sm font-mono tabular-nums bg-white border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
             />
             <p className="text-[11px] text-stone-600 mt-1">
               Es un promedio; ajústalo si notas que no coincide
@@ -212,7 +212,7 @@ export function ItemCaptureFields({
                 onClearError?.();
               }}
               placeholder="Ej: 5"
-              className="w-full min-h-[38px] px-2.5 py-1.5 text-xs sm:text-sm font-mono tabular-nums bg-white border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+              className="w-full min-h-[44px] px-2.5 py-2 text-base sm:text-sm font-mono tabular-nums bg-white border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
             />
           </div>
           {Number.isFinite(parsedCapacity) && parsedCapacity > 0 && (

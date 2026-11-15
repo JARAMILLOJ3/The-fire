@@ -36,6 +36,55 @@
   font-variant-numeric: tabular-nums;
 }
 
+@keyframes tfFadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes tfFadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes tfSlideInLeft {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(0);
+  }
+}
+
+.animate-tf-fade-up {
+  animation: tfFadeUp 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.animate-tf-fade-in {
+  animation: tfFadeIn 150ms ease-out both;
+}
+
+.animate-tf-slide-left {
+  animation: tfSlideInLeft 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-tf-fade-up,
+  .animate-tf-fade-in,
+  .animate-tf-slide-left {
+    animation: none !important;
+  }
+}
+
 @media print {
   .no-print {
     display: none !important;

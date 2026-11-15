@@ -1,8 +1,6 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth, GoogleAuthProvider } from 'firebase/auth';
 import {
-  doc,
-  getDocFromServer,
   getFirestore,
   initializeFirestore,
   persistentLocalCache,
@@ -93,15 +91,3 @@ export function handleFirestoreError(
   if (rawCode) wrapped.code = rawCode;
   throw wrapped;
 }
-
-async function testConnection() {
-  try {
-    await getDocFromServer(doc(db, 'test', 'connection'));
-  } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
-      console.error('Por favor verifica la configuración de Firebase.');
-    }
-  }
-}
-
-void testConnection();

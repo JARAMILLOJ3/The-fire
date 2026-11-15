@@ -1,5 +1,4 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AnimatePresence, motion, MotionConfig } from 'motion/react';
 import {
   Calendar,
   Citrus,
@@ -242,54 +241,48 @@ export default function App() {
 
   if (!authReady) {
     return (
-      <MotionConfig reducedMotion="user">
-        <div className="min-h-screen bg-stone-50 flex items-center justify-center p-6">
-          <div className="flex items-center gap-3 text-sm font-medium text-stone-600">
-            <Flame className="w-5 h-5 text-orange-600 animate-pulse" />
-            <span>Iniciando The Fire Inventario...</span>
-          </div>
+      <div className="min-h-dvh bg-stone-50 flex items-center justify-center p-6">
+        <div className="flex items-center gap-3 text-sm font-medium text-stone-600">
+          <Flame className="w-5 h-5 text-orange-600 animate-pulse" />
+          <span>Iniciando The Fire Inventario...</span>
         </div>
-      </MotionConfig>
+      </div>
     );
   }
 
   if (!user) {
     return (
-      <MotionConfig reducedMotion="user">
-        <AuthScreen
-          onSignIn={handleSignIn}
-          loading={authLoading}
-          errorMessage={authError}
-          pendingLink={pendingLink}
-          hasLinkParams={Boolean(linkParams.accessCode)}
-        />
-      </MotionConfig>
+      <AuthScreen
+        onSignIn={handleSignIn}
+        loading={authLoading}
+        errorMessage={authError}
+        pendingLink={pendingLink}
+        hasLinkParams={Boolean(linkParams.accessCode)}
+      />
     );
   }
 
   if (sessionLoading || !workspace) {
     return (
-      <MotionConfig reducedMotion="user">
-        <div className="min-h-screen bg-stone-50 flex flex-col items-center justify-center p-6 gap-4">
-          {sessionError ? (
-            <div className="max-w-md bg-white border border-red-200 rounded-2xl p-6 text-center space-y-4">
-              <p className="text-sm text-red-700">{sessionError}</p>
-              <button
-                type="button"
-                onClick={handleSignOut}
-                className="px-4 py-2 text-sm font-semibold text-white bg-stone-950 rounded-xl cursor-pointer"
-              >
-                Cerrar sesión
-              </button>
-            </div>
-          ) : (
-            <div className="w-full max-w-md space-y-3">
-              <div className="h-5 w-44 bg-stone-200 rounded-lg animate-pulse mx-auto" />
-              <div className="h-3 w-64 bg-stone-200 rounded-lg animate-pulse mx-auto" />
-            </div>
-          )}
-        </div>
-      </MotionConfig>
+      <div className="min-h-dvh bg-stone-50 flex flex-col items-center justify-center p-6 gap-4">
+        {sessionError ? (
+          <div className="max-w-md bg-white border border-red-200 rounded-2xl p-6 text-center space-y-4">
+            <p className="text-sm text-red-700">{sessionError}</p>
+            <button
+              type="button"
+              onClick={handleSignOut}
+              className="min-h-[44px] px-4 py-2 text-sm font-semibold text-white bg-stone-950 rounded-xl cursor-pointer"
+            >
+              Cerrar sesión
+            </button>
+          </div>
+        ) : (
+          <div className="w-full max-w-md space-y-3">
+            <div className="h-5 w-44 bg-stone-200 rounded-lg animate-pulse mx-auto" />
+            <div className="h-3 w-64 bg-stone-200 rounded-lg animate-pulse mx-auto" />
+          </div>
+        )}
+      </div>
     );
   }
 
@@ -313,7 +306,7 @@ export default function App() {
       : user.displayName || user.email;
 
   const sidebarContent = (
-    <div className="flex flex-col h-full bg-stone-950 text-stone-100 border-r border-stone-800/80">
+    <div className="flex flex-col h-full bg-stone-950 text-stone-100 border-r border-stone-800/80 pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]">
       <div className="px-5 py-4 border-b border-stone-800/80">
         <BrandLogo subtitle={workspace.name} size="sm" theme="dark" />
       </div>
@@ -443,7 +436,7 @@ export default function App() {
         <button
           type="button"
           onClick={handleSignOut}
-          className="w-full min-h-[38px] inline-flex items-center justify-center gap-2 px-3 py-2 text-xs font-semibold text-stone-200 bg-stone-900 border border-stone-800 rounded-xl hover:bg-stone-800 transition-colors cursor-pointer"
+          className="w-full min-h-[44px] inline-flex items-center justify-center gap-2 px-3 py-2 text-xs font-semibold text-stone-200 bg-stone-900 border border-stone-800 rounded-xl hover:bg-stone-800 transition-colors cursor-pointer"
         >
           <LogOut className="w-3.5 h-3.5" />
           Cerrar sesión
@@ -453,169 +446,148 @@ export default function App() {
   );
 
   return (
-    <MotionConfig reducedMotion="user">
-      <div className="min-h-screen overflow-x-hidden bg-stone-50 text-stone-900 flex">
-        {/* Desktop Sidebar */}
-        <aside className="hidden lg:block w-64 shrink-0 sticky top-0 h-screen no-print">
-          {sidebarContent}
-        </aside>
+    <div className="min-h-dvh overflow-x-clip bg-stone-50 text-stone-900 flex">
+      {/* Desktop Sidebar */}
+      <aside className="hidden lg:block w-64 shrink-0 sticky top-0 h-dvh no-print">
+        {sidebarContent}
+      </aside>
 
-        {/* Mobile Drawer */}
-        <AnimatePresence>
-          {mobileNavOpen && (
-            <div className="fixed inset-0 z-50 lg:hidden flex no-print">
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                transition={{ duration: 0.2 }}
-                className="fixed inset-0 bg-stone-950/60 backdrop-blur-xs"
-                onClick={() => setMobileNavOpen(false)}
-              />
-              <motion.div
-                initial={{ x: '-100%' }}
-                animate={{ x: 0 }}
-                exit={{ x: '-100%' }}
-                transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }}
-                className="relative w-72 max-w-[85vw] h-full z-10"
-              >
+      {/* Mobile Drawer */}
+      {mobileNavOpen && (
+        <div className="fixed inset-0 z-50 lg:hidden flex no-print">
+          <div
+            className="fixed inset-0 bg-stone-950/60 backdrop-blur-xs animate-tf-fade-in"
+            onClick={() => setMobileNavOpen(false)}
+          />
+          <div className="relative w-72 max-w-[85vw] h-dvh z-10 animate-tf-slide-left">
+            <button
+              type="button"
+              onClick={() => setMobileNavOpen(false)}
+              aria-label="Cerrar menú"
+              className="absolute top-[calc(0.75rem+env(safe-area-inset-top))] right-2.5 z-20 min-w-[44px] min-h-[44px] flex items-center justify-center text-stone-400 hover:text-white rounded-lg cursor-pointer"
+            >
+              <X className="w-5 h-5" />
+            </button>
+            {sidebarContent}
+          </div>
+        </div>
+      )}
+
+      {/* Main Content Area */}
+      <div className="flex-1 min-w-0 flex flex-col">
+        {/* Top Header */}
+        <header className="sticky top-0 z-30 bg-white/95 backdrop-blur-xs border-b border-stone-200 px-3 sm:px-6 lg:px-8 pt-[env(safe-area-inset-top)] min-h-[60px] py-2 sm:py-0 sm:h-16 flex flex-wrap sm:flex-nowrap items-center justify-between gap-x-2 gap-y-2 no-print">
+          <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+            <button
+              type="button"
+              onClick={() => setMobileNavOpen(true)}
+              aria-label="Abrir navegación"
+              className="lg:hidden min-w-[44px] min-h-[44px] -ml-1.5 flex items-center justify-center text-stone-600 hover:text-stone-900 rounded-xl shrink-0 cursor-pointer"
+            >
+              <Menu className="w-5 h-5" />
+            </button>
+            <div className="flex items-center gap-2 text-sm min-w-0">
+              <span className="text-stone-400 hidden sm:inline whitespace-nowrap">
+                {workspace.name}
+              </span>
+              <span className="text-stone-300 hidden sm:inline">/</span>
+              <span className="font-semibold text-stone-900 truncate">
+                {sectionBreadcrumb}
+              </span>
+            </div>
+          </div>
+
+          {canManage ? (
+            <div className="flex items-center justify-between sm:justify-end gap-1.5 sm:gap-2 w-full sm:w-auto min-w-0 shrink-0">
+              {!isOnline && (
+                <span
+                  role="status"
+                  className="inline-flex items-center gap-1 px-2 py-1 text-xs font-semibold text-amber-800 bg-amber-50 border border-amber-200 rounded-lg shrink-0"
+                >
+                  <WifiOff className="w-3.5 h-3.5 shrink-0" />
+                  <span className="hidden sm:inline">Sin señal</span>
+                </span>
+              )}
+              <div className="flex items-center gap-0.5 p-0.5 sm:p-1 bg-stone-100 rounded-xl shrink-0">
                 <button
                   type="button"
-                  onClick={() => setMobileNavOpen(false)}
-                  aria-label="Cerrar menú"
-                  className="absolute top-4 right-3 z-20 p-1.5 text-stone-400 hover:text-white rounded-lg cursor-pointer"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-                {sidebarContent}
-              </motion.div>
-            </div>
-          )}
-        </AnimatePresence>
-
-        {/* Main Content Area */}
-        <div className="flex-1 min-w-0 flex flex-col">
-          {/* Top Header */}
-          <header className="sticky top-0 z-30 bg-white/95 backdrop-blur-xs border-b border-stone-200 px-3.5 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-2 sm:gap-4 no-print">
-            <div className="flex items-center gap-2 sm:gap-3 min-w-0">
-              <button
-                type="button"
-                onClick={() => setMobileNavOpen(true)}
-                aria-label="Abrir navegación"
-                className="lg:hidden p-2 -ml-1 text-stone-600 hover:text-stone-900 rounded-xl shrink-0 cursor-pointer"
-              >
-                <Menu className="w-5 h-5" />
-              </button>
-              <div className="flex items-center gap-2 text-sm min-w-0">
-                <span className="text-stone-400 hidden sm:inline whitespace-nowrap">
-                  {workspace.name}
-                </span>
-                <span className="text-stone-300 hidden sm:inline">/</span>
-                <span className="font-semibold text-stone-900 truncate">
-                  {sectionBreadcrumb}
-                </span>
-              </div>
-            </div>
-
-            {canManage ? (
-              <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-                {!isOnline && (
-                  <span
-                    role="status"
-                    className="inline-flex items-center gap-1 px-2 py-1 text-xs font-semibold text-amber-800 bg-amber-50 border border-amber-200 rounded-lg"
-                  >
-                    <WifiOff className="w-3.5 h-3.5 shrink-0" />
-                    <span className="hidden sm:inline">Sin señal</span>
-                  </span>
-                )}
-                <div className="flex items-center gap-0.5 p-0.5 sm:p-1 bg-stone-100 rounded-xl">
-                  <button
-                    type="button"
-                    onClick={() => handleSelectDate(yesterdayStr)}
-                    className={`min-h-[32px] px-2 sm:px-2.5 py-1 text-xs font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
-                      selectedDate === yesterdayStr
-                        ? 'bg-white text-stone-900 shadow-sm'
-                        : 'text-stone-600 hover:text-stone-900'
-                    }`}
-                  >
-                    Ayer
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleSelectDate(todayStr)}
-                    className={`min-h-[32px] px-2 sm:px-2.5 py-1 text-xs font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
-                      selectedDate === todayStr
-                        ? 'bg-white text-stone-900 shadow-sm'
-                        : 'text-stone-600 hover:text-stone-900'
-                    }`}
-                  >
-                    Hoy
-                  </button>
-                </div>
-
-                <div className="relative flex items-center">
-                  <Calendar className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-stone-500 absolute left-2 sm:left-2.5 pointer-events-none" />
-                  <input
-                    type="date"
-                    aria-label="Seleccionar fecha del reporte"
-                    value={selectedDate}
-                    onChange={(e) => e.target.value && handleSelectDate(e.target.value)}
-                    className="min-h-[36px] pl-7 sm:pl-8 pr-1.5 sm:pr-2.5 py-1 text-xs sm:text-sm font-mono tabular-nums bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 w-[112px] sm:w-auto"
-                  />
-                </div>
-              </div>
-            ) : (
-              <div className="flex items-center gap-2 shrink-0">
-                {!isOnline && (
-                  <span
-                    role="status"
-                    className="inline-flex items-center gap-1 px-2 py-1 text-xs font-semibold text-amber-800 bg-amber-50 border border-amber-200 rounded-lg"
-                  >
-                    <WifiOff className="w-3.5 h-3.5 shrink-0" />
-                    <span className="hidden sm:inline">Sin señal</span>
-                  </span>
-                )}
-                <div
-                  className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-semibold border ${
-                    workerScheduleStatus.phase === 'opening'
-                      ? 'bg-orange-50 text-orange-800 border-orange-200'
-                      : workerScheduleStatus.phase === 'closing'
-                        ? 'bg-stone-950 text-white border-stone-950'
-                        : workerScheduleStatus.phase === 'unrestricted'
-                          ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
-                          : 'bg-stone-100 text-stone-600 border-stone-200'
+                  onClick={() => handleSelectDate(yesterdayStr)}
+                  className={`min-h-[38px] sm:min-h-[34px] px-2.5 py-1 text-xs font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+                    selectedDate === yesterdayStr
+                      ? 'bg-white text-stone-900 shadow-sm'
+                      : 'text-stone-600 hover:text-stone-900'
                   }`}
                 >
-                  <Clock className="w-3.5 h-3.5 shrink-0" />
-                  <span className="whitespace-nowrap">
-                    {workerScheduleStatus.phase === 'opening'
-                      ? 'Horario: Apertura'
-                      : workerScheduleStatus.phase === 'closing'
-                        ? 'Horario: Cierre'
-                        : workerScheduleStatus.phase === 'unrestricted'
-                          ? 'Acceso activo'
-                          : 'Fuera de horario'}
-                  </span>
-                </div>
+                  Ayer
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleSelectDate(todayStr)}
+                  className={`min-h-[38px] sm:min-h-[34px] px-2.5 py-1 text-xs font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+                    selectedDate === todayStr
+                      ? 'bg-white text-stone-900 shadow-sm'
+                      : 'text-stone-600 hover:text-stone-900'
+                  }`}
+                >
+                  Hoy
+                </button>
               </div>
-            )}
-          </header>
 
-          {/* Workspace Viewport */}
-          <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-5 sm:py-8 min-w-0">
-            {dataLoading ? (
-              <ViewSkeleton />
-            ) : (
-              <Suspense fallback={<ViewSkeleton />}>
-                <AnimatePresence mode="wait">
-                  <motion.div
-                    key={activeSection}
-                    initial={{ opacity: 0, y: 8 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: -4 }}
-                    transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
-                    className="min-w-0"
-                  >
+              <div className="relative flex items-center flex-1 sm:flex-initial min-w-[140px]">
+                <Calendar className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-stone-500 absolute left-2.5 pointer-events-none" />
+                <input
+                  type="date"
+                  aria-label="Seleccionar fecha del reporte"
+                  value={selectedDate}
+                  onChange={(e) => e.target.value && handleSelectDate(e.target.value)}
+                  className="w-full sm:w-auto min-h-[42px] sm:min-h-[38px] pl-8 pr-2 sm:pr-2.5 py-1 text-base sm:text-sm font-mono tabular-nums bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                />
+              </div>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 shrink-0 ml-auto">
+              {!isOnline && (
+                <span
+                  role="status"
+                  className="inline-flex items-center gap-1 px-2 py-1 text-xs font-semibold text-amber-800 bg-amber-50 border border-amber-200 rounded-lg"
+                >
+                  <WifiOff className="w-3.5 h-3.5 shrink-0" />
+                  <span className="hidden sm:inline">Sin señal</span>
+                </span>
+              )}
+              <div
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-semibold border ${
+                  workerScheduleStatus.phase === 'opening'
+                    ? 'bg-orange-50 text-orange-800 border-orange-200'
+                    : workerScheduleStatus.phase === 'closing'
+                      ? 'bg-stone-950 text-white border-stone-950'
+                      : workerScheduleStatus.phase === 'unrestricted'
+                        ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                        : 'bg-stone-100 text-stone-600 border-stone-200'
+                }`}
+              >
+                <Clock className="w-3.5 h-3.5 shrink-0" />
+                <span className="whitespace-nowrap">
+                  {workerScheduleStatus.phase === 'opening'
+                    ? 'Horario: Apertura'
+                    : workerScheduleStatus.phase === 'closing'
+                      ? 'Horario: Cierre'
+                      : workerScheduleStatus.phase === 'unrestricted'
+                        ? 'Acceso activo'
+                        : 'Fuera de horario'}
+                </span>
+              </div>
+            </div>
+          )}
+        </header>
+
+        {/* Workspace Viewport */}
+        <main className="flex-1 max-w-6xl w-full mx-auto px-3.5 sm:px-6 lg:px-8 py-5 sm:py-8 min-w-0">
+          {dataLoading ? (
+            <ViewSkeleton />
+          ) : (
+            <Suspense fallback={<ViewSkeleton />}>
+              <div key={activeSection} className="min-w-0 animate-tf-fade-up">
                     {activeSection === 'jefe' && canManage ? (
                       <BossDashboard
                         workspace={workspace}
@@ -712,15 +684,14 @@ export default function App() {
                           <button
                             type="button"
                             onClick={() => navigateTo('puestos')}
-                            className="min-h-[42px] px-4 py-2 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 cursor-pointer"
+                            className="min-h-[44px] px-4 py-2 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 cursor-pointer"
                           >
                             Ir a Puestos de Trabajo
                           </button>
                         )}
                       </div>
                     )}
-                  </motion.div>
-                </AnimatePresence>
+                </div>
               </Suspense>
             )}
           </main>
@@ -743,7 +714,6 @@ export default function App() {
             />
           </Suspense>
         )}
-      </div>
-    </MotionConfig>
+    </div>
   );
 }

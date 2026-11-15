@@ -1,8 +1,7 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
-import { AnimatePresence, motion } from 'motion/react';
 import { AlertTriangle, Clock, RotateCcw, Sun, Moon, X } from 'lucide-react';
 import { DEFAULT_SHIFT_SCHEDULE, WORKER_GRACE_MINUTES } from '../constants';
-import { updateWorkspaceShiftSchedule } from '../services/inventoryService';
+import { updateWorkspaceShiftSchedule } from '../services/bossService';
 import type { ShiftSchedule, Workspace } from '../types';
 import { formatTime12h, normalizeShiftSchedule, validateShiftSchedule } from '../utils/schedule';
 
@@ -84,48 +83,39 @@ export function ShiftScheduleModal({ workspace, open, onClose }: ShiftScheduleMo
     }
   };
 
-  return (
-    <AnimatePresence>
-      {open && (
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          className="fixed inset-0 z-50 bg-stone-950/55 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="shift-schedule-title"
-        >
-          <motion.div
-            initial={{ opacity: 0, scale: 0.96, y: 10 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.96, y: 10 }}
-            transition={{ duration: 0.2 }}
-            className="bg-white border border-stone-200 rounded-2xl w-full max-w-lg overflow-hidden shadow-2xl my-8"
-          >
-            <div className="bg-stone-950 px-6 py-4 text-white flex items-center justify-between gap-3">
-              <div className="flex items-center gap-2.5 min-w-0">
-                <Clock className="w-5 h-5 text-orange-400 shrink-0" />
-                <div className="min-w-0">
-                  <h2 id="shift-schedule-title" className="font-display text-lg font-bold truncate">
-                    Horarios de Apertura y Cierre
-                  </h2>
-                  <p className="text-xs text-stone-400 truncate">
-                    Hora oficial Colombia (Bogotá) · +{WORKER_GRACE_MINUTES} min de tolerancia al cerrar
-                  </p>
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={onClose}
-                aria-label="Cerrar configuración de horarios"
-                className="p-1.5 text-stone-400 hover:text-white rounded-lg shrink-0 cursor-pointer"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
+  if (!open) return null;
 
-            <form onSubmit={handleSubmit} className="p-5 sm:p-6 space-y-5">
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-stone-950/55 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="shift-schedule-title"
+    >
+      <div className="bg-white border border-stone-200 rounded-2xl w-full max-w-lg max-h-[90dvh] flex flex-col overflow-hidden shadow-2xl animate-tf-fade-up">
+        <div className="bg-stone-950 px-4 sm:px-6 py-4 text-white flex items-center justify-between gap-3 shrink-0">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <Clock className="w-5 h-5 text-orange-400 shrink-0" />
+            <div className="min-w-0">
+              <h2 id="shift-schedule-title" className="font-display text-base sm:text-lg font-bold truncate">
+                Horarios de Apertura y Cierre
+              </h2>
+              <p className="text-xs text-stone-400 truncate">
+                Hora oficial Colombia (Bogotá) · +{WORKER_GRACE_MINUTES} min de tolerancia al cerrar
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Cerrar configuración de horarios"
+            className="min-w-[44px] min-h-[44px] -mr-2 flex items-center justify-center text-stone-400 hover:text-white rounded-lg shrink-0 cursor-pointer"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <form onSubmit={handleSubmit} className="flex-1 min-h-0 overflow-y-auto p-4 sm:p-6 space-y-5">
               {(errorMsg || validation.errors.length > 0) && (
                 <div className="p-3 text-xs text-red-700 bg-red-50 border border-red-200 rounded-xl">
                   {errorMsg ?? validation.errors[0]}
@@ -171,7 +161,7 @@ export function ShiftScheduleModal({ workspace, open, onClose }: ShiftScheduleMo
                   <p className="text-xs text-stone-600">
                     Para registrar con cuánto abren el día y anotar si llegaron productos nuevos (cierra justo a la hora &ldquo;Hasta&rdquo;).
                   </p>
-                  <div className="grid grid-cols-2 gap-3">
+                  <div className="grid grid-cols-1 min-[380px]:grid-cols-2 gap-3">
                     <div>
                       <label className="block text-xs font-semibold text-stone-700 mb-1">
                         Desde
@@ -181,7 +171,7 @@ export function ShiftScheduleModal({ workspace, open, onClose }: ShiftScheduleMo
                         required
                         value={openingStart}
                         onChange={(e) => setOpeningStart(e.target.value)}
-                        className="w-full min-h-[42px] px-3 py-2 text-sm font-mono bg-stone-50 border border-stone-200 rounded-xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-orange-500"
+                        className="w-full min-h-[44px] px-3 py-2 text-base sm:text-sm font-mono bg-stone-50 border border-stone-200 rounded-xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-orange-500"
                       />
                     </div>
                     <div>
@@ -193,7 +183,7 @@ export function ShiftScheduleModal({ workspace, open, onClose }: ShiftScheduleMo
                         required
                         value={openingEnd}
                         onChange={(e) => setOpeningEnd(e.target.value)}
-                        className="w-full min-h-[42px] px-3 py-2 text-sm font-mono bg-stone-50 border border-stone-200 rounded-xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-orange-500"
+                        className="w-full min-h-[44px] px-3 py-2 text-base sm:text-sm font-mono bg-stone-50 border border-stone-200 rounded-xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-orange-500"
                       />
                     </div>
                   </div>
@@ -213,7 +203,7 @@ export function ShiftScheduleModal({ workspace, open, onClose }: ShiftScheduleMo
                   <p className="text-xs text-stone-600">
                     Al terminar la jornada para anotar lo que quedó. Si pasa de medianoche (ej. 11:00 p. m. a 2:00 a. m.), se vincula automáticamente a la misma noche de trabajo.
                   </p>
-                  <div className="grid grid-cols-2 gap-3">
+                  <div className="grid grid-cols-1 min-[380px]:grid-cols-2 gap-3">
                     <div>
                       <label className="block text-xs font-semibold text-stone-700 mb-1">
                         Desde
@@ -223,7 +213,7 @@ export function ShiftScheduleModal({ workspace, open, onClose }: ShiftScheduleMo
                         required
                         value={closingStart}
                         onChange={(e) => setClosingStart(e.target.value)}
-                        className="w-full min-h-[42px] px-3 py-2 text-sm font-mono bg-stone-50 border border-stone-200 rounded-xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-orange-500"
+                        className="w-full min-h-[44px] px-3 py-2 text-base sm:text-sm font-mono bg-stone-50 border border-stone-200 rounded-xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-orange-500"
                       />
                     </div>
                     <div>
@@ -235,7 +225,7 @@ export function ShiftScheduleModal({ workspace, open, onClose }: ShiftScheduleMo
                         required
                         value={closingEnd}
                         onChange={(e) => setClosingEnd(e.target.value)}
-                        className="w-full min-h-[42px] px-3 py-2 text-sm font-mono bg-stone-50 border border-stone-200 rounded-xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-orange-500"
+                        className="w-full min-h-[44px] px-3 py-2 text-base sm:text-sm font-mono bg-stone-50 border border-stone-200 rounded-xl focus:bg-white focus:outline-none focus:ring-2 focus:ring-orange-500"
                       />
                     </div>
                   </div>
@@ -246,7 +236,7 @@ export function ShiftScheduleModal({ workspace, open, onClose }: ShiftScheduleMo
                 <button
                   type="button"
                   onClick={handleResetDefault}
-                  className="inline-flex items-center gap-1.5 text-xs font-semibold text-stone-600 hover:text-orange-600 cursor-pointer"
+                  className="min-h-[44px] inline-flex items-center gap-1.5 text-xs font-semibold text-stone-600 hover:text-orange-600 cursor-pointer"
                 >
                   <RotateCcw className="w-3.5 h-3.5" />
                   Restaurar 4–6 PM / 11 PM–2 AM
@@ -256,23 +246,21 @@ export function ShiftScheduleModal({ workspace, open, onClose }: ShiftScheduleMo
                   <button
                     type="button"
                     onClick={onClose}
-                    className="min-h-[42px] px-4 py-2 text-sm font-medium text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 cursor-pointer"
+                    className="min-h-[44px] px-4 py-2 text-sm font-medium text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 cursor-pointer"
                   >
                     Cancelar
                   </button>
                   <button
                     type="submit"
                     disabled={saving || !validation.valid}
-                    className="min-h-[42px] px-4 py-2 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 disabled:opacity-60 cursor-pointer"
+                    className="min-h-[44px] px-4 py-2 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 disabled:opacity-60 cursor-pointer"
                   >
                     {saving ? 'Guardando...' : 'Guardar horarios'}
                   </button>
                 </div>
               </div>
             </form>
-          </motion.div>
-        </motion.div>
-      )}
-    </AnimatePresence>
+      </div>
+    </div>
   );
 }

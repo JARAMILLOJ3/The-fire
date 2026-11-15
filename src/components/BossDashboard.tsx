@@ -1,5 +1,4 @@
-import { useMemo, useState } from 'react';
-import { AnimatePresence, motion } from 'motion/react';
+import { lazy, Suspense, useMemo, useState } from 'react';
 import {
   AlertOctagon,
   AlertTriangle,
@@ -12,7 +11,6 @@ import {
   Copy,
   Download,
   GitCompareArrows,
-  History,
   MessageSquareText,
   Package,
   Printer,
@@ -48,14 +46,20 @@ import {
   getStockLevelMeta,
   hasTargetBelowMin,
 } from '../utils/inventory';
-import { BOGOTA_TIME_ZONE, getBogotaNowParts } from '../utils/date';
+import { getBogotaNowParts } from '../utils/date';
 import type { ResetScope } from '../utils/reset';
 import {
   formatTime12h,
   hasClosingDeadlinePassed,
   normalizeShiftSchedule,
 } from '../utils/schedule';
-import { RestaurantResetModal } from './RestaurantResetModal';
+
+const RestaurantResetModal = lazy(() =>
+  import('./RestaurantResetModal').then((m) => ({ default: m.RestaurantResetModal })),
+);
+const WeeklyHistorySection = lazy(() =>
+  import('./WeeklyHistorySection').then((m) => ({ default: m.WeeklyHistorySection })),
+);
 
 interface BossDashboardProps {
   workspace: Workspace;
@@ -120,19 +124,6 @@ function formatQty(val: number): string {
 function formatSignedDelta(delta: number): string {
   const rounded = Math.round(delta * 100) / 100;
   return rounded > 0 ? `+${rounded}` : String(rounded);
-}
-
-function formatShortDayHeader(dateStr: string): { weekday: string; dayNum: string } {
-  const [y, m, d] = dateStr.split('-').map(Number);
-  if (!y || !m || !d) return { weekday: '', dayNum: dateStr };
-  const dt = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
-  const weekday = new Intl.DateTimeFormat('es-CO', {
-    timeZone: BOGOTA_TIME_ZONE,
-    weekday: 'short',
-  })
-    .format(dt)
-    .replace('.', '');
-  return { weekday, dayNum: String(d) };
 }
 
 export function BossDashboard({
@@ -546,7 +537,7 @@ export function BossDashboard({
             <button
               type="button"
               onClick={() => onOpenStation(overdueStations[0].id)}
-              className="min-h-[38px] px-3.5 py-1.5 text-xs font-semibold text-white bg-red-600 rounded-xl hover:bg-red-700 whitespace-nowrap shrink-0 cursor-pointer"
+              className="min-h-[44px] px-3.5 py-2 text-xs font-semibold text-white bg-red-600 rounded-xl hover:bg-red-700 whitespace-nowrap shrink-0 cursor-pointer"
             >
               Revisar planilla
             </button>
@@ -580,11 +571,7 @@ export function BossDashboard({
 
       {/* Single Clean Contextual Date Banner (only shown when helpful) */}
       {showSwitchToYesterday ? (
-        <motion.div
-          initial={{ opacity: 0, y: 6 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="bg-stone-950 text-white rounded-2xl px-4 sm:px-5 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 no-print"
-        >
+        <div className="bg-stone-950 text-white rounded-2xl px-4 sm:px-5 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 no-print animate-tf-fade-up">
           <div className="flex items-start sm:items-center gap-3 text-sm min-w-0">
             <CalendarClock className="w-5 h-5 text-orange-400 shrink-0 mt-0.5 sm:mt-0" />
             <span>
@@ -594,37 +581,28 @@ export function BossDashboard({
           <button
             type="button"
             onClick={() => onSelectDate(yesterdayStr)}
-            className="min-h-[40px] px-4 py-2 text-xs font-semibold text-stone-950 bg-white rounded-xl hover:bg-stone-100 whitespace-nowrap shrink-0 cursor-pointer"
+            className="min-h-[44px] px-4 py-2 text-xs font-semibold text-stone-950 bg-white rounded-xl hover:bg-stone-100 whitespace-nowrap shrink-0 cursor-pointer"
           >
             Ver cierre de anoche
           </button>
-        </motion.div>
+        </div>
       ) : autoSelectedYesterday && selectedDate === yesterdayStr ? (
-        <motion.div
-          initial={{ opacity: 0, y: 6 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="bg-orange-50 border border-orange-200 rounded-2xl px-4 sm:px-5 py-3 flex flex-wrap items-center justify-between gap-2 text-sm text-orange-950 no-print"
-        >
+        <div className="bg-orange-50 border border-orange-200 rounded-2xl px-4 sm:px-5 py-3 flex flex-wrap items-center justify-between gap-2 text-sm text-orange-950 no-print animate-tf-fade-up">
           <span>
             Mostrando el cierre de anoche ({formatDateHuman(yesterdayStr)}) para revisar tus compras de hoy.
           </span>
           <button
             type="button"
             onClick={() => onSelectDate(todayStr)}
-            className="text-xs font-semibold text-orange-700 underline hover:text-orange-900 cursor-pointer"
+            className="min-h-[44px] inline-flex items-center text-xs font-semibold text-orange-700 underline hover:text-orange-900 cursor-pointer"
           >
             Ir a hoy
           </button>
-        </motion.div>
+        </div>
       ) : null}
 
       {showSetupGuide && (
-        <motion.section
-          initial={{ opacity: 0, y: 8 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }}
-          className="bg-white border border-stone-200 rounded-2xl p-5 sm:p-6 space-y-4 no-print"
-        >
+        <section className="bg-white border border-stone-200 rounded-2xl p-5 sm:p-6 space-y-4 no-print animate-tf-fade-up">
           <div className="space-y-1">
             <p className="text-xs font-semibold text-orange-600">
               {isRestaurantEmpty ? 'Restaurante nuevo · Primeros pasos' : 'Configuración inicial'}
@@ -719,18 +697,15 @@ export function BossDashboard({
               </button>
             </div>
           </div>
-        </motion.section>
+        </section>
       )}
 
       {!isRestaurantEmpty && (
         <>
           {/* Semáforo KPI Summary Strip using gap-px */}
-          <motion.section
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
+          <section
             aria-label="Resumen semáforo del día"
-            className="grid grid-cols-2 lg:grid-cols-4 gap-px bg-stone-200 border border-stone-200 rounded-2xl overflow-hidden"
+            className="grid grid-cols-2 lg:grid-cols-4 gap-px bg-stone-200 border border-stone-200 rounded-2xl overflow-hidden animate-tf-fade-up"
           >
         <div className="bg-white p-4 sm:p-5">
           <div className="flex items-center justify-between gap-2">
@@ -819,7 +794,7 @@ export function BossDashboard({
               : 'Sin compra urgente'}
           </p>
         </div>
-      </motion.section>
+      </section>
 
       {/* Opening Audit: Yesterday's Closing vs Today's Opening Differences */}
       {openingAudit.hasAuditData && (
@@ -960,14 +935,14 @@ export function BossDashboard({
           <button
             type="button"
             onClick={onGoToWorkstations}
-            className="min-h-[36px] text-xs sm:text-sm font-semibold text-orange-700 hover:text-orange-800 whitespace-nowrap cursor-pointer"
+            className="min-h-[44px] inline-flex items-center text-xs sm:text-sm font-semibold text-orange-700 hover:text-orange-800 whitespace-nowrap cursor-pointer"
           >
             + Administrar puestos
           </button>
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3.5 sm:gap-4">
-          {stations.map((station, index) => {
+          {stations.map((station) => {
             const report = reportsByStation[station.id];
             const stationRows = consolidatedRows.filter((r) => r.item.station === station.id);
             const lowCount = stationRows.filter(
@@ -981,13 +956,9 @@ export function BossDashboard({
               report?.status === 'opening_saved' ? formatTimeShort(report?.updatedAt) : null;
 
             return (
-              <motion.div
+              <div
                 key={station.id}
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: 0.25, delay: Math.min(index * 0.04, 0.2) }}
-                whileHover={{ y: -2 }}
-                className="min-w-0 bg-white border border-stone-200 rounded-2xl p-4 sm:p-5 flex flex-col justify-between gap-4 transition-shadow hover:shadow-md"
+                className="min-w-0 bg-white border border-stone-200 rounded-2xl p-4 sm:p-5 flex flex-col justify-between gap-4 hover:-translate-y-0.5 hover:shadow-md transition-all animate-tf-fade-up"
               >
                 <div className="space-y-2 min-w-0">
                   <div className="flex items-start justify-between gap-2">
@@ -1064,13 +1035,13 @@ export function BossDashboard({
                   <button
                     type="button"
                     onClick={() => onOpenStation(station.id)}
-                    className="min-h-[40px] inline-flex items-center gap-1 text-xs font-semibold text-orange-700 hover:text-orange-800 whitespace-nowrap cursor-pointer"
+                    className="min-h-[44px] inline-flex items-center gap-1 text-xs font-semibold text-orange-700 hover:text-orange-800 whitespace-nowrap cursor-pointer"
                   >
                     Ver planilla
                     <ArrowRight className="w-3.5 h-3.5" />
                   </button>
                 </div>
-              </motion.div>
+              </div>
             );
           })}
         </div>
@@ -1083,7 +1054,7 @@ export function BossDashboard({
             <button
               type="button"
               onClick={() => setViewTab('compras')}
-              className={`min-h-[40px] px-3.5 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+              className={`min-h-[44px] sm:min-h-[40px] px-3.5 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
                 viewTab === 'compras'
                   ? 'bg-white text-stone-900 shadow-sm'
                   : 'text-stone-600 hover:text-stone-900'
@@ -1094,7 +1065,7 @@ export function BossDashboard({
             <button
               type="button"
               onClick={() => setViewTab('completo')}
-              className={`min-h-[40px] px-3.5 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+              className={`min-h-[44px] sm:min-h-[40px] px-3.5 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
                 viewTab === 'completo'
                   ? 'bg-white text-stone-900 shadow-sm'
                   : 'text-stone-600 hover:text-stone-900'
@@ -1104,8 +1075,8 @@ export function BossDashboard({
             </button>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2 min-w-0">
-            <div className="relative flex-1 min-w-[160px] sm:flex-initial">
+          <div className="grid grid-cols-1 min-[360px]:grid-cols-2 lg:flex lg:flex-wrap lg:items-center gap-2 min-w-0">
+            <div className="relative min-[360px]:col-span-2 lg:col-auto min-w-0">
               <Search className="w-4 h-4 text-stone-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
               <input
                 type="text"
@@ -1113,7 +1084,7 @@ export function BossDashboard({
                 onChange={(e) => setSearchTerm(e.target.value)}
                 placeholder="Buscar insumo..."
                 aria-label="Buscar insumo"
-                className="w-full sm:w-44 min-h-[42px] pl-9 pr-3 py-1.5 text-sm bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 focus:bg-white"
+                className="w-full lg:w-48 min-h-[44px] pl-9 pr-3 py-2 text-base sm:text-sm bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 focus:bg-white"
               />
             </div>
 
@@ -1121,7 +1092,7 @@ export function BossDashboard({
               aria-label="Filtrar por puesto"
               value={stationFilter}
               onChange={(e) => setStationFilter(e.target.value as 'all' | StationId)}
-              className="flex-1 sm:flex-initial min-h-[42px] px-3 py-1.5 text-sm bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 max-w-full sm:max-w-[190px]"
+              className="w-full lg:w-auto min-w-0 min-h-[44px] px-3 py-2 text-base sm:text-sm bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 lg:max-w-[190px]"
             >
               <option value="all">Todos los puestos</option>
               {stations.map((s) => (
@@ -1135,7 +1106,7 @@ export function BossDashboard({
               aria-label="Filtrar por estado"
               value={stockFilter}
               onChange={(e) => setStockFilter(e.target.value as StockFilter)}
-              className="flex-1 sm:flex-initial min-h-[42px] px-3 py-1.5 text-sm bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+              className="w-full lg:w-auto min-w-0 min-h-[44px] px-3 py-2 text-base sm:text-sm bg-stone-50 border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
             >
               <option value="todos">Todos los estados</option>
               <option value="comprar">Solo para comprar</option>
@@ -1486,143 +1457,20 @@ export function BossDashboard({
         )}
       </section>
 
-      {/* 7-Day Station History */}
+      {/* 7-Day Station History (lazy-loaded) */}
       {stations.length > 0 && (
-        <section className="bg-white border border-stone-200 rounded-2xl overflow-hidden no-print">
-          <div className="px-4 sm:px-5 py-4 border-b border-stone-200 flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <History className="w-4 h-4 text-orange-600 shrink-0" />
-              <div>
-                <h2 className="font-display text-base font-bold text-stone-900">
-                  Historial de los últimos 7 días por puesto
-                </h2>
-                <p className="text-xs text-stone-500">
-                  Toca cualquier día para abrir su reporte completo
-                </p>
-              </div>
-            </div>
-            <div className="flex flex-wrap items-center gap-3 text-[11px] font-medium text-stone-600">
-              <span className="inline-flex items-center gap-1">
-                <span className="w-2 h-2 rounded-full bg-emerald-500" />
-                Cerrado
-              </span>
-              <span className="inline-flex items-center gap-1">
-                <span className="w-2 h-2 rounded-full bg-amber-500" />
-                Solo apertura
-              </span>
-              <span className="inline-flex items-center gap-1">
-                <span className="w-2 h-2 rounded-full bg-red-500" />
-                Sin cierre
-              </span>
-            </div>
-          </div>
-
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse">
-              <thead>
-                <tr className="border-b border-stone-200 bg-stone-50 text-xs font-semibold text-stone-600">
-                  <th className="py-3 px-4 sm:px-5 min-w-[160px]">Puesto</th>
-                  {weeklyHistory.dates.map((date) => {
-                    const { weekday, dayNum } = formatShortDayHeader(date);
-                    const isSelected = date === selectedDate;
-                    return (
-                      <th key={date} className="py-2.5 px-2 text-center min-w-[64px]">
-                        <button
-                          type="button"
-                          onClick={() => onSelectDate(date)}
-                          className={`px-2 py-1 rounded-lg transition-colors cursor-pointer ${
-                            isSelected
-                              ? 'bg-orange-600 text-white'
-                              : 'hover:bg-stone-200/70 text-stone-700'
-                          }`}
-                        >
-                          <div className="text-[10px] uppercase leading-none opacity-80">
-                            {date === todayStr ? 'Hoy' : weekday}
-                          </div>
-                          <div className="font-mono tabular-nums text-xs font-bold mt-0.5">
-                            {dayNum}
-                          </div>
-                        </button>
-                      </th>
-                    );
-                  })}
-                  <th className="py-3 px-4 text-right whitespace-nowrap">Cumplimiento</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-stone-100 text-xs">
-                {weeklyHistory.rows.map((stRow) => (
-                  <tr key={stRow.station.id} className="hover:bg-stone-50/70">
-                    <td className="py-3 px-4 sm:px-5">
-                      <p className="font-semibold text-stone-900 truncate max-w-[180px]">
-                        {stRow.station.name}
-                      </p>
-                      <p className="text-[11px] text-stone-500 truncate max-w-[180px]">
-                        {stRow.station.workerName}
-                      </p>
-                    </td>
-                    {stRow.days.map((cell) => {
-                      const isSelected = cell.date === selectedDate;
-                      const label =
-                        cell.status === 'completed'
-                          ? 'Listo'
-                          : cell.status === 'opening_saved'
-                            ? cell.isLate
-                              ? 'Sin cierre'
-                              : 'Apertura'
-                            : cell.isLate
-                              ? 'Faltó'
-                              : 'Pend.';
-                      const tone =
-                        cell.status === 'completed'
-                          ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
-                          : cell.isLate
-                            ? 'bg-red-50 text-red-700 border-red-200'
-                            : cell.status === 'opening_saved'
-                              ? 'bg-amber-50 text-amber-800 border-amber-200'
-                              : 'bg-stone-100 text-stone-600 border-stone-200';
-                      return (
-                        <td key={cell.date} className="py-2.5 px-1.5 text-center">
-                          <button
-                            type="button"
-                            onClick={() => onSelectDate(cell.date)}
-                            title={
-                              cell.anomalyCount > 0
-                                ? `${cell.anomalyCount} anomalía(s) de consumo`
-                                : formatDateHuman(cell.date)
-                            }
-                            className={`w-full px-2 py-1.5 rounded-lg border font-semibold transition-all cursor-pointer ${tone} ${
-                              isSelected ? 'ring-2 ring-orange-500 ring-offset-1' : ''
-                            }`}
-                          >
-                            <div className="leading-tight">{label}</div>
-                            {cell.anomalyCount > 0 && (
-                              <div className="text-[10px] text-red-700 font-mono leading-tight mt-0.5">
-                                {cell.anomalyCount} anom.
-                              </div>
-                            )}
-                          </button>
-                        </td>
-                      );
-                    })}
-                    <td className="py-3 px-4 text-right font-mono tabular-nums whitespace-nowrap">
-                      <span
-                        className={`font-bold ${
-                          stRow.completedCount >= 6
-                            ? 'text-emerald-700'
-                            : stRow.lateCount > 0
-                              ? 'text-red-700'
-                              : 'text-stone-800'
-                        }`}
-                      >
-                        {stRow.completedCount}/7
-                      </span>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </section>
+        <Suspense
+          fallback={
+            <div className="h-52 bg-white border border-stone-200 rounded-2xl animate-pulse no-print" />
+          }
+        >
+          <WeeklyHistorySection
+            weeklyHistory={weeklyHistory}
+            selectedDate={selectedDate}
+            todayStr={todayStr}
+            onSelectDate={onSelectDate}
+          />
+        </Suspense>
       )}
         </>
       )}
@@ -1653,101 +1501,95 @@ export function BossDashboard({
           />
         </button>
 
-        <AnimatePresence initial={false}>
-          {configOpen && (
-            <motion.div
-              initial={{ height: 0, opacity: 0 }}
-              animate={{ height: 'auto', opacity: 1 }}
-              exit={{ height: 0, opacity: 0 }}
-              transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
-              className="overflow-hidden border-t border-stone-200"
-            >
-              <div className="p-4 sm:p-5 grid grid-cols-1 sm:grid-cols-3 gap-3 bg-stone-50/70">
-                <button
-                  type="button"
-                  onClick={onGoToCatalog}
-                  className="min-h-[64px] bg-white border border-stone-200 rounded-xl p-3.5 text-left hover:border-orange-300 hover:bg-orange-50/40 transition-colors flex items-start gap-3 cursor-pointer"
-                >
-                  <Package className="w-5 h-5 text-orange-600 shrink-0 mt-0.5" />
-                  <div className="min-w-0">
-                    <p className="text-sm font-semibold text-stone-900">Insumos</p>
-                    <p className="text-xs text-stone-600 mt-0.5">
-                      Crear, editar unidades, mínimos y captura
-                    </p>
-                  </div>
-                </button>
+        {configOpen && (
+          <div className="border-t border-stone-200 animate-tf-fade-in">
+            <div className="p-4 sm:p-5 grid grid-cols-1 sm:grid-cols-3 gap-3 bg-stone-50/70">
+              <button
+                type="button"
+                onClick={onGoToCatalog}
+                className="min-h-[64px] bg-white border border-stone-200 rounded-xl p-3.5 text-left hover:border-orange-300 hover:bg-orange-50/40 transition-colors flex items-start gap-3 cursor-pointer"
+              >
+                <Package className="w-5 h-5 text-orange-600 shrink-0 mt-0.5" />
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold text-stone-900">Insumos</p>
+                  <p className="text-xs text-stone-600 mt-0.5">
+                    Crear, editar unidades, mínimos y captura
+                  </p>
+                </div>
+              </button>
 
-                <button
-                  type="button"
-                  onClick={onGoToTeam}
-                  className="min-h-[64px] bg-white border border-stone-200 rounded-xl p-3.5 text-left hover:border-orange-300 hover:bg-orange-50/40 transition-colors flex items-start gap-3 cursor-pointer"
-                >
-                  <Users className="w-5 h-5 text-orange-600 shrink-0 mt-0.5" />
-                  <div className="min-w-0">
-                    <p className="text-sm font-semibold text-stone-900">Equipo y perfil</p>
-                    <p className="text-xs text-stone-600 mt-0.5">
-                      Accesos de trabajadoras y datos del jefe
-                    </p>
-                  </div>
-                </button>
+              <button
+                type="button"
+                onClick={onGoToTeam}
+                className="min-h-[64px] bg-white border border-stone-200 rounded-xl p-3.5 text-left hover:border-orange-300 hover:bg-orange-50/40 transition-colors flex items-start gap-3 cursor-pointer"
+              >
+                <Users className="w-5 h-5 text-orange-600 shrink-0 mt-0.5" />
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold text-stone-900">Equipo y perfil</p>
+                  <p className="text-xs text-stone-600 mt-0.5">
+                    Accesos de trabajadoras y datos del jefe
+                  </p>
+                </div>
+              </button>
 
-                <button
-                  type="button"
-                  onClick={onGoToWorkstations}
-                  className="min-h-[64px] bg-white border border-stone-200 rounded-xl p-3.5 text-left hover:border-orange-300 hover:bg-orange-50/40 transition-colors flex items-start gap-3 cursor-pointer"
-                >
-                  <QrCode className="w-5 h-5 text-orange-600 shrink-0 mt-0.5" />
+              <button
+                type="button"
+                onClick={onGoToWorkstations}
+                className="min-h-[64px] bg-white border border-stone-200 rounded-xl p-3.5 text-left hover:border-orange-300 hover:bg-orange-50/40 transition-colors flex items-start gap-3 cursor-pointer"
+              >
+                <QrCode className="w-5 h-5 text-orange-600 shrink-0 mt-0.5" />
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold text-stone-900">Puestos y códigos QR</p>
+                  <p className="text-xs text-stone-600 mt-0.5">
+                    Enlaces por puesto e impresión de QR
+                  </p>
+                </div>
+              </button>
+            </div>
+
+            {isOwner && (
+              <div className="border-t border-red-200 bg-red-50/60 p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3.5">
+                <div className="flex items-start gap-3 min-w-0">
+                  <div className="p-2 rounded-xl bg-white border border-red-200 text-red-700 shrink-0">
+                    <ShieldAlert className="w-4 h-4" />
+                  </div>
                   <div className="min-w-0">
-                    <p className="text-sm font-semibold text-stone-900">Puestos y códigos QR</p>
-                    <p className="text-xs text-stone-600 mt-0.5">
-                      Enlaces por puesto e impresión de QR
+                    <p className="text-xs font-bold uppercase tracking-wider text-red-700">
+                      Zona de peligro
+                    </p>
+                    <p className="text-sm font-bold text-stone-900 mt-0.5">
+                      Reiniciar datos del restaurante
+                    </p>
+                    <p className="text-xs text-stone-600 mt-0.5 leading-relaxed">
+                      Descarga un respaldo CSV y elimina el historial de reportes o todos los datos para empezar desde cero. Solo disponible para el dueño.
                     </p>
                   </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setResetModalOpen(true)}
+                  className="min-h-[44px] inline-flex items-center justify-center gap-2 px-4 py-2 text-xs sm:text-sm font-semibold text-white bg-red-600 rounded-xl hover:bg-red-700 active:scale-[0.98] transition-all whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <Trash2 className="w-4 h-4" />
+                  Reiniciar datos del restaurante
                 </button>
               </div>
-
-              {isOwner && (
-                <div className="border-t border-red-200 bg-red-50/60 p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3.5">
-                  <div className="flex items-start gap-3 min-w-0">
-                    <div className="p-2 rounded-xl bg-white border border-red-200 text-red-700 shrink-0">
-                      <ShieldAlert className="w-4 h-4" />
-                    </div>
-                    <div className="min-w-0">
-                      <p className="text-xs font-bold uppercase tracking-wider text-red-700">
-                        Zona de peligro
-                      </p>
-                      <p className="text-sm font-bold text-stone-900 mt-0.5">
-                        Reiniciar datos del restaurante
-                      </p>
-                      <p className="text-xs text-stone-600 mt-0.5 leading-relaxed">
-                        Descarga un respaldo CSV y elimina el historial de reportes o todos los datos para empezar desde cero. Solo disponible para el dueño.
-                      </p>
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => setResetModalOpen(true)}
-                    className="min-h-[42px] inline-flex items-center justify-center gap-2 px-4 py-2 text-xs sm:text-sm font-semibold text-white bg-red-600 rounded-xl hover:bg-red-700 active:scale-[0.98] transition-all whitespace-nowrap shrink-0 cursor-pointer"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                    Reiniciar datos del restaurante
-                  </button>
-                </div>
-              )}
-            </motion.div>
-          )}
-        </AnimatePresence>
+            )}
+          </div>
+        )}
       </section>
 
-      {isOwner && (
-        <RestaurantResetModal
-          open={resetModalOpen}
-          workspace={workspace}
-          callerUid={callerUid}
-          todayStr={todayStr}
-          onClose={() => setResetModalOpen(false)}
-          onResetComplete={onResetComplete}
-        />
+      {isOwner && resetModalOpen && (
+        <Suspense fallback={null}>
+          <RestaurantResetModal
+            open={resetModalOpen}
+            workspace={workspace}
+            callerUid={callerUid}
+            todayStr={todayStr}
+            onClose={() => setResetModalOpen(false)}
+            onResetComplete={onResetComplete}
+          />
+        </Suspense>
       )}
     </div>
   );

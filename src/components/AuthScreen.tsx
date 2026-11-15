@@ -1,5 +1,4 @@
 import { useMemo, useState } from 'react';
-import { motion } from 'motion/react';
 import { ClipboardCheck, QrCode, ShoppingCart, Store, UtensilsCrossed } from 'lucide-react';
 import heroPhoto from '../assets/images/restaurant_prep_hero.webp';
 import type { StationLink } from '../types';
@@ -45,18 +44,13 @@ export function AuthScreen({
         : 'Entrar a mi puesto con Google';
 
     return (
-      <div className="min-h-screen overflow-x-hidden bg-stone-50 text-stone-900 flex flex-col">
-        <header className="px-4 sm:px-6 py-4 bg-white border-b border-stone-200 flex items-center justify-between">
+      <div className="min-h-dvh overflow-x-clip bg-stone-50 text-stone-900 flex flex-col">
+        <header className="px-4 sm:px-6 pt-[calc(1rem+env(safe-area-inset-top))] pb-4 bg-white border-b border-stone-200 flex items-center justify-between">
           <BrandLogo />
         </header>
 
-        <main className="flex-1 flex items-center justify-center p-4 sm:p-6">
-          <motion.div
-            initial={{ opacity: 0, y: 14 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }}
-            className="w-full max-w-md bg-white border border-stone-200 rounded-2xl p-6 sm:p-8 space-y-6 shadow-sm"
-          >
+        <main className="flex-1 flex items-center justify-center p-4 sm:p-6 pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
+          <div className="animate-tf-fade-up w-full max-w-md bg-white border border-stone-200 rounded-2xl p-5 sm:p-8 space-y-6 shadow-sm">
             <div className="space-y-2">
               <div className="inline-flex items-center gap-2 text-xs font-semibold text-orange-600">
                 <QrCode className="w-4 h-4 shrink-0" />
@@ -107,15 +101,15 @@ export function AuthScreen({
               <Store className="w-5 h-5 shrink-0" />
               {loading ? 'Ingresando...' : ctaText}
             </button>
-          </motion.div>
+          </div>
         </main>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen overflow-x-hidden bg-stone-50 text-stone-900 flex flex-col">
-      <header className="flex items-center justify-between gap-3 sm:gap-8 px-4 sm:px-6 lg:px-10 py-3.5 sm:py-4 bg-white border-b border-stone-200">
+    <div className="min-h-dvh overflow-x-clip bg-stone-50 text-stone-900 flex flex-col">
+      <header className="flex items-center justify-between gap-3 sm:gap-8 px-4 sm:px-6 lg:px-10 pt-[calc(0.875rem+env(safe-area-inset-top))] pb-3.5 sm:pb-4 bg-white border-b border-stone-200">
         <BrandLogo />
         <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-stone-600">
           <a href="#estaciones" className="hover:text-stone-900 transition-colors whitespace-nowrap shrink-0">
@@ -133,7 +127,7 @@ export function AuthScreen({
             type="button"
             onClick={onSignIn}
             disabled={loading}
-            className="min-h-[40px] px-3.5 sm:px-4 py-2 text-xs sm:text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.98] disabled:opacity-60 transition-all whitespace-nowrap shrink-0 cursor-pointer"
+            className="min-h-[44px] px-3.5 sm:px-4 py-2 text-xs sm:text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.98] disabled:opacity-60 transition-all whitespace-nowrap shrink-0 cursor-pointer"
           >
             {loading ? (
               'Ingresando...'
@@ -149,12 +143,7 @@ export function AuthScreen({
 
       <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 lg:px-10 py-8 lg:py-16 flex flex-col justify-center gap-10 lg:gap-12">
         <section className="grid grid-cols-1 lg:grid-cols-12 gap-8 lg:gap-10 items-stretch">
-          <motion.div
-            initial={{ opacity: 0, y: 12 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.35, ease: [0.22, 1, 0.36, 1] }}
-            className="lg:col-span-6 flex flex-col justify-center gap-5 sm:gap-6 min-w-0"
-          >
+          <div className="animate-tf-fade-up lg:col-span-6 flex flex-col justify-center gap-5 sm:gap-6 min-w-0">
             <p className="text-xs font-semibold text-orange-600 tracking-wide">
               The Fire · Puestos de trabajo · Enlace QR · Alertas de compra
             </p>
@@ -185,14 +174,9 @@ export function AuthScreen({
                 {loading ? 'Conectando...' : 'Entrar al sistema con Google'}
               </button>
             </div>
-          </motion.div>
+          </div>
 
-          <motion.div
-            initial={{ opacity: 0, scale: 0.98 }}
-            animate={{ opacity: 1, scale: 1 }}
-            transition={{ duration: 0.4, delay: 0.08, ease: [0.22, 1, 0.36, 1] }}
-            className="lg:col-span-6 min-w-0"
-          >
+          <div className="animate-tf-fade-in lg:col-span-6 min-w-0">
             <div className="h-full min-h-[260px] lg:min-h-[420px] rounded-2xl overflow-hidden border border-stone-200 bg-stone-950 relative shadow-sm">
               {!imgFailed ? (
                 <img
@@ -223,15 +207,12 @@ export function AuthScreen({
                 </p>
               </div>
             </div>
-          </motion.div>
+          </div>
         </section>
 
-        <motion.section
+        <section
           id="estaciones"
-          initial={{ opacity: 0, y: 14 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.4, delay: 0.14, ease: [0.22, 1, 0.36, 1] }}
-          className="grid grid-cols-1 md:grid-cols-3 gap-px bg-stone-200 border border-stone-200 rounded-2xl overflow-hidden"
+          className="animate-tf-fade-up grid grid-cols-1 md:grid-cols-3 gap-px bg-stone-200 border border-stone-200 rounded-2xl overflow-hidden"
         >
           <div id="flujo" className="bg-white p-6 flex flex-col gap-2">
             <div className="flex items-center gap-2 text-orange-600 font-semibold text-sm">
@@ -260,7 +241,7 @@ export function AuthScreen({
               Detecta automáticamente qué está agotado o pronto a acabarse y copia el pedido por WhatsApp.
             </p>
           </div>
-        </motion.section>
+        </section>
       </main>
     </div>
   );

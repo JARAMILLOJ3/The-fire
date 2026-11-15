@@ -1,5 +1,4 @@
 import { useState } from 'react';
-import { motion } from 'motion/react';
 import { Check, Clock, Copy, MessageSquare, Moon, Sun } from 'lucide-react';
 import type { Workstation } from '../../types';
 import { formatDateHuman } from '../../utils/inventory';
@@ -38,13 +37,8 @@ export function ShiftOutsideHoursView({
   };
 
   return (
-    <div className="py-6 sm:py-10 flex items-center justify-center">
-      <motion.div
-        initial={{ opacity: 0, y: 10 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.25 }}
-        className="w-full max-w-lg bg-white border border-stone-200 rounded-2xl p-6 sm:p-8 text-center space-y-5 shadow-xs"
-      >
+    <div className="py-4 sm:py-10 flex items-center justify-center min-w-0">
+      <div className="w-full max-w-lg bg-white border border-stone-200 rounded-2xl p-5 sm:p-8 text-center space-y-5 shadow-xs animate-tf-fade-up">
         <div className="w-12 h-12 rounded-2xl bg-stone-100 text-stone-700 flex items-center justify-center mx-auto">
           <Clock className="w-6 h-6" />
         </div>
@@ -126,7 +120,7 @@ export function ShiftOutsideHoursView({
         <p className="text-xs font-mono tabular-nums text-stone-500">
           Hora actual en Bogotá: {scheduleStatus.currentTimeLabel}
         </p>
-      </motion.div>
+      </div>
     </div>
   );
 }

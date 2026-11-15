@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { User } from 'firebase/auth';
-import { collection, doc, getDocs, limit, onSnapshot, query, where } from 'firebase/firestore';
+import { collection, doc, getDoc, getDocs, onSnapshot, query, where } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../firebase';
+import { loadWorkerStationFallback } from '../services/workerService';
 import {
-  ensureWorkstationsForExistingWorkspace,
-  loadWorkerStationFallback,
-  syncAuthorizedEmailsAcrossWorkspace,
-} from '../services/inventoryService';
-import { shiftDateStr } from '../utils/date';
+  chunkArray,
+  computeManagerDateWindow,
+  getReportVersionMs,
+  planHistoricalEntryReportsToFetch,
+  planHistoricalReportIdsToFetch,
+} from '../utils/stationDataCache';
 import type {
   DailyReport,
   DailyReportEntry,
@@ -28,7 +30,8 @@ interface WorkerFallbackState {
   entries: Record<string, DailyReportEntry>;
 }
 
-const MANAGER_REPORTS_QUERY_LIMIT = 120;
+const REPORT_FETCH_CHUNK_SIZE = 6;
+const ENTRY_FETCH_CHUNK_SIZE = 6;
 
 export function useStationData(params: {
   authReady: boolean;
@@ -57,9 +60,14 @@ export function useStationData(params: {
   const [stationsLoaded, setStationsLoaded] = useState(false);
   const [items, setItems] = useState<InventoryItem[]>([]);
   const [itemsLoaded, setItemsLoaded] = useState(false);
-  const [allReports, setAllReports] = useState<DailyReport[]>([]);
+
+  const [liveReportsById, setLiveReportsById] = useState<Record<string, DailyReport>>({});
+  const [historicalReportsById, setHistoricalReportsById] = useState<Record<string, DailyReport>>(
+    {},
+  );
   const [reportsLoaded, setReportsLoaded] = useState(false);
   const [reportHasPendingWrites, setReportHasPendingWrites] = useState(false);
+
   const [entriesByReportId, setEntriesByReportId] = useState<
     Record<string, Record<string, DailyReportEntry>>
   >({});
@@ -74,118 +82,99 @@ export function useStationData(params: {
   const migrationAttemptedRef = useRef<string | null>(null);
   const syncingEmailsKeyRef = useRef<string>('');
   const fetchedHistoryVersionRef = useRef<Record<string, number>>({});
+  const historicalReportsRef = useRef<Record<string, DailyReport>>({});
+  const checkedMissingReportsRef = useRef<Set<string>>(new Set());
 
-  // Reset state cleanly on sign-out
   useEffect(() => {
-    if (user) return;
+    historicalReportsRef.current = historicalReportsById;
+  }, [historicalReportsById]);
+
+  // Reset state cleanly on sign-out or workspace change
+  useEffect(() => {
+    if (user && workspace?.id) return;
     setStations([]);
     setStationsLoaded(false);
     setItems([]);
     setItemsLoaded(false);
-    setAllReports([]);
+    setLiveReportsById({});
+    setHistoricalReportsById({});
     setReportsLoaded(false);
     setReportHasPendingWrites(false);
     setEntriesByReportId({});
     setHistoricalEntriesByReportId({});
     fetchedHistoryVersionRef.current = {};
+    historicalReportsRef.current = {};
+    checkedMissingReportsRef.current = new Set();
     setInvites([]);
     setMembers([]);
     setStationLinksByCode({});
     setWorkerFallback(null);
-  }, [user]);
+  }, [user, workspace?.id]);
 
-  // Listen to stations, items, and dailyReports
+  // Effect 1A: Static workspace collections for managers (never torn down on date switch)
   useEffect(() => {
-    if (!authReady || !user || !workspace?.id) return;
+    if (!authReady || !user || !workspace?.id || !canManage || !userEmail) return;
     setStationsLoaded(false);
     setItemsLoaded(false);
-    setReportsLoaded(false);
 
-    if (canManage && userEmail) {
-      const stationsQuery = query(
-        collection(db, 'stations'),
-        where('authorizedEmails', 'array-contains', userEmail),
-      );
-      const unsubStations = onSnapshot(
-        stationsQuery,
-        (snap) => {
-          const list: Workstation[] = [];
-          snap.forEach((d) => {
-            const st = { id: d.id, ...d.data() } as Workstation;
-            if (st.workspaceId === workspace.id && st.active) {
-              list.push(st);
-            }
-          });
-          list.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name));
-          setStations(list);
-          setStationsLoaded(true);
-        },
-        (err) => handleFirestoreError(err, OperationType.LIST, 'stations'),
-      );
+    const stationsQuery = query(
+      collection(db, 'stations'),
+      where('authorizedEmails', 'array-contains', userEmail),
+    );
+    const unsubStations = onSnapshot(
+      stationsQuery,
+      (snap) => {
+        const list: Workstation[] = [];
+        snap.forEach((d) => {
+          const st = { id: d.id, ...d.data() } as Workstation;
+          if (st.workspaceId === workspace.id && st.active) {
+            list.push(st);
+          }
+        });
+        list.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name));
+        setStations(list);
+        setStationsLoaded(true);
+      },
+      (err) => handleFirestoreError(err, OperationType.LIST, 'stations'),
+    );
 
-      const itemsQuery = query(
-        collection(db, 'items'),
-        where('authorizedEmails', 'array-contains', userEmail),
-      );
-      const unsubItems = onSnapshot(
-        itemsQuery,
-        (snap) => {
-          const list: InventoryItem[] = [];
-          snap.forEach((d) => {
-            const raw = d.data() as Omit<InventoryItem, 'id'>;
-            const item: InventoryItem = {
-              ...raw,
-              id: d.id,
-              station: normalizeStationId(raw.station),
-            };
-            if (item.workspaceId === workspace.id) {
-              list.push(item);
-            }
-          });
-          list.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name));
-          setItems(list);
-          setItemsLoaded(true);
-        },
-        (err) => handleFirestoreError(err, OperationType.LIST, 'items'),
-      );
+    const itemsQuery = query(
+      collection(db, 'items'),
+      where('authorizedEmails', 'array-contains', userEmail),
+    );
+    const unsubItems = onSnapshot(
+      itemsQuery,
+      (snap) => {
+        const list: InventoryItem[] = [];
+        snap.forEach((d) => {
+          const raw = d.data() as Omit<InventoryItem, 'id'>;
+          const item: InventoryItem = {
+            ...raw,
+            id: d.id,
+            station: normalizeStationId(raw.station),
+          };
+          if (item.workspaceId === workspace.id) {
+            list.push(item);
+          }
+        });
+        list.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name));
+        setItems(list);
+        setItemsLoaded(true);
+      },
+      (err) => handleFirestoreError(err, OperationType.LIST, 'items'),
+    );
 
-      // Bounded reports query to prevent unbounded historical reads
-      const reportsQuery = query(
-        collection(db, 'dailyReports'),
-        where('authorizedEmails', 'array-contains', userEmail),
-        limit(MANAGER_REPORTS_QUERY_LIMIT),
-      );
-      const unsubReports = onSnapshot(
-        reportsQuery,
-        (snap) => {
-          const list: DailyReport[] = [];
-          snap.forEach((d) => {
-            const raw = d.data() as Omit<DailyReport, 'id'>;
-            const rep: DailyReport = {
-              ...raw,
-              id: d.id,
-              station: normalizeStationId(raw.station),
-            };
-            if (rep.workspaceId === workspace.id) {
-              list.push(rep);
-            }
-          });
-          setAllReports(list);
-          setReportHasPendingWrites(snap.metadata.hasPendingWrites);
-          setReportsLoaded(true);
-        },
-        (err) => handleFirestoreError(err, OperationType.LIST, 'dailyReports'),
-      );
+    return () => {
+      unsubStations();
+      unsubItems();
+    };
+  }, [authReady, user, workspace?.id, canManage, userEmail]);
 
-      return () => {
-        unsubStations();
-        unsubItems();
-        unsubReports();
-      };
-    }
+  // Effect 1B: Worker static station listener (independent of date selection)
+  useEffect(() => {
+    if (!authReady || !user || !workspace?.id || canManage || role === 'jefe') return;
+    setStationsLoaded(false);
 
-    // Worker mode: strict single-station document listeners (no collection list queries)
-    if (role === 'jefe') return;
     const stationDocPath = `stations/${role}`;
     const unsubStation = onSnapshot(
       doc(db, 'stations', role),
@@ -201,6 +190,15 @@ export function useStationData(params: {
       (err) => handleFirestoreError(err, OperationType.GET, stationDocPath),
     );
 
+    return () => {
+      unsubStation();
+    };
+  }, [authReady, user, workspace?.id, canManage, role]);
+
+  // Effect 1C: Worker single-date report listener (date change does NOT reset stations/items)
+  useEffect(() => {
+    if (!authReady || !user || !workspace?.id || canManage || role === 'jefe') return;
+
     const reportId = `${workspace.id}_${effectiveSelectedDate}_${role}`;
     const reportDocPath = `dailyReports/${reportId}`;
     const unsubReport = onSnapshot(
@@ -208,15 +206,14 @@ export function useStationData(params: {
       (snap) => {
         if (snap.exists()) {
           const raw = snap.data() as Omit<DailyReport, 'id'>;
-          setAllReports([
-            {
-              ...raw,
-              id: snap.id,
-              station: normalizeStationId(raw.station),
-            },
-          ]);
+          const rep: DailyReport = {
+            ...raw,
+            id: snap.id,
+            station: normalizeStationId(raw.station),
+          };
+          setLiveReportsById({ [rep.id]: rep });
         } else {
-          setAllReports([]);
+          setLiveReportsById({});
         }
         setReportHasPendingWrites(snap.metadata.hasPendingWrites);
         setReportsLoaded(true);
@@ -225,12 +222,207 @@ export function useStationData(params: {
     );
 
     return () => {
-      unsubStation();
       unsubReport();
     };
-  }, [authReady, user, workspace?.id, canManage, userEmail, role, effectiveSelectedDate]);
+  }, [authReady, user, workspace?.id, canManage, role, effectiveSelectedDate]);
 
-  // Worker mode: real-time document-level listeners on worker's own station items
+  const managerWindow = useMemo(
+    () =>
+      computeManagerDateWindow({
+        todayStr,
+        yesterdayStr,
+        effectiveSelectedDate,
+      }),
+    [todayStr, yesterdayStr, effectiveSelectedDate],
+  );
+
+  const stationIdsKey = useMemo(
+    () => stations.map((s) => s.id).sort().join('|'),
+    [stations],
+  );
+
+  // Effect 2A: Manager live listeners ONLY for active station docs on selectedDate (+ today)
+  useEffect(() => {
+    if (!authReady || !user || !workspace?.id || !canManage || !stationsLoaded) return;
+
+    const activeStationIds = stationIdsKey ? stationIdsKey.split('|') : [];
+    if (activeStationIds.length === 0) {
+      setLiveReportsById({});
+      setReportHasPendingWrites(false);
+      setReportsLoaded(true);
+      return;
+    }
+
+    const targetIds: string[] = [];
+    managerWindow.liveDates.forEach((dateStr) => {
+      activeStationIds.forEach((stId) => {
+        targetIds.push(`${workspace.id}_${dateStr}_${stId}`);
+      });
+    });
+
+    const nextLiveMap: Record<string, DailyReport> = {};
+    const pendingSet = new Set<string>();
+    const resolvedSet = new Set<string>();
+    let flushScheduled = false;
+    let unmounted = false;
+
+    const flush = () => {
+      flushScheduled = false;
+      if (unmounted) return;
+      setLiveReportsById({ ...nextLiveMap });
+      setReportHasPendingWrites(pendingSet.size > 0);
+      if (resolvedSet.size >= targetIds.length) {
+        setReportsLoaded(true);
+      }
+    };
+
+    const scheduleFlush = () => {
+      if (!flushScheduled) {
+        flushScheduled = true;
+        queueMicrotask(flush);
+      }
+    };
+
+    const unsubs = targetIds.map((repId) =>
+      onSnapshot(
+        doc(db, 'dailyReports', repId),
+        (snap) => {
+          resolvedSet.add(repId);
+          if (snap.exists()) {
+            const raw = snap.data() as Omit<DailyReport, 'id'>;
+            const rep: DailyReport = {
+              ...raw,
+              id: snap.id,
+              station: normalizeStationId(raw.station),
+            };
+            if (rep.workspaceId === workspace.id) {
+              nextLiveMap[rep.id] = rep;
+            }
+          } else {
+            delete nextLiveMap[repId];
+          }
+          if (snap.metadata.hasPendingWrites) {
+            pendingSet.add(repId);
+          } else {
+            pendingSet.delete(repId);
+          }
+          scheduleFlush();
+        },
+        (err) => {
+          resolvedSet.add(repId);
+          const code = (err as { code?: string } | null)?.code;
+          if (code === 'permission-denied') {
+            scheduleFlush();
+            return;
+          }
+          handleFirestoreError(err, OperationType.GET, `dailyReports/${repId}`);
+        },
+      ),
+    );
+
+    const fallbackTimer = window.setTimeout(() => {
+      if (!unmounted) setReportsLoaded(true);
+    }, 900);
+
+    return () => {
+      unmounted = true;
+      window.clearTimeout(fallbackTimer);
+      unsubs.forEach((u) => u());
+    };
+  }, [
+    authReady,
+    user,
+    workspace?.id,
+    canManage,
+    stationsLoaded,
+    stationIdsKey,
+    managerWindow.liveDates,
+  ]);
+
+  // Effect 2B: Manager cached historical dailyReports (7-day weekly + 7-day lookback + yesterday)
+  useEffect(() => {
+    if (!authReady || !user || !workspace?.id || !canManage || !stationsLoaded) return;
+    const activeStationIds = stationIdsKey ? stationIdsKey.split('|') : [];
+    if (activeStationIds.length === 0) return;
+
+    const idsToFetch = planHistoricalReportIdsToFetch({
+      workspaceId: workspace.id,
+      stationIds: activeStationIds,
+      historicalDates: managerWindow.historicalDates,
+      yesterdayStr,
+      liveReportsById,
+      cachedReportsById: historicalReportsRef.current,
+      checkedMissingReportIds: checkedMissingReportsRef.current,
+    });
+
+    if (idsToFetch.length === 0) return;
+
+    let cancelled = false;
+    void (async () => {
+      const fetched: Record<string, DailyReport> = {};
+      const chunks = chunkArray(idsToFetch, REPORT_FETCH_CHUNK_SIZE);
+
+      for (const chunk of chunks) {
+        if (cancelled) return;
+        await Promise.all(
+          chunk.map(async (repId) => {
+            try {
+              const snap = await getDoc(doc(db, 'dailyReports', repId));
+              if (snap.exists()) {
+                const raw = snap.data() as Omit<DailyReport, 'id'>;
+                const rep: DailyReport = {
+                  ...raw,
+                  id: snap.id,
+                  station: normalizeStationId(raw.station),
+                };
+                if (rep.workspaceId === workspace.id) {
+                  fetched[rep.id] = rep;
+                }
+              } else {
+                checkedMissingReportsRef.current.add(repId);
+              }
+            } catch {
+              checkedMissingReportsRef.current.add(repId);
+            }
+          }),
+        );
+      }
+
+      if (!cancelled && Object.keys(fetched).length > 0) {
+        setHistoricalReportsById((prev) => ({
+          ...prev,
+          ...fetched,
+        }));
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    authReady,
+    user,
+    workspace?.id,
+    canManage,
+    stationsLoaded,
+    stationIdsKey,
+    managerWindow.historicalDates,
+    yesterdayStr,
+    liveReportsById,
+  ]);
+
+  const allReports = useMemo(() => {
+    if (!canManage) {
+      return Object.values(liveReportsById);
+    }
+    const merged: Record<string, DailyReport> = {
+      ...historicalReportsById,
+      ...liveReportsById,
+    };
+    return Object.values(merged);
+  }, [canManage, historicalReportsById, liveReportsById]);
+
+  // Worker mode: real-time document-level listeners on worker's own station items (micro-batched)
   const workerItemIdsKey = useMemo(() => {
     if (canManage || role === 'jefe' || !stationsLoaded) return '';
     const st = stations.find((s) => s.id === role);
@@ -260,14 +452,34 @@ export function useStationData(params: {
     }
 
     const itemsMap = new Map<string, InventoryItem>();
-    const unsubs: Array<() => void> = [];
-    let resolvedCount = 0;
+    const resolvedIds = new Set<string>();
+    let flushScheduled = false;
+    let unmounted = false;
 
-    itemIds.forEach((itemId) => {
-      const unsub = onSnapshot(
+    const flushItems = () => {
+      flushScheduled = false;
+      if (unmounted) return;
+      const list = Array.from(itemsMap.values()).sort(
+        (a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name),
+      );
+      setItems(list);
+      if (resolvedIds.size >= itemIds.length) {
+        setItemsLoaded(true);
+      }
+    };
+
+    const scheduleFlush = () => {
+      if (!flushScheduled) {
+        flushScheduled = true;
+        queueMicrotask(flushItems);
+      }
+    };
+
+    const unsubs = itemIds.map((itemId) =>
+      onSnapshot(
         doc(db, 'items', itemId),
         (snap) => {
-          resolvedCount += 1;
+          resolvedIds.add(itemId);
           if (snap.exists()) {
             const raw = snap.data() as Omit<InventoryItem, 'id'>;
             if (raw.workspaceId === workspace.id && normalizeStationId(raw.station) === role) {
@@ -282,28 +494,24 @@ export function useStationData(params: {
           } else {
             itemsMap.delete(itemId);
           }
-          const list = Array.from(itemsMap.values()).sort(
-            (a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name),
-          );
-          setItems(list);
-          if (resolvedCount >= itemIds.length) {
-            setItemsLoaded(true);
-          }
+          scheduleFlush();
         },
         (err) => handleFirestoreError(err, OperationType.GET, `items/${itemId}`),
-      );
-      unsubs.push(unsub);
-    });
+      ),
+    );
 
-    const fallbackTimer = window.setTimeout(() => setItemsLoaded(true), 800);
+    const fallbackTimer = window.setTimeout(() => {
+      if (!unmounted) setItemsLoaded(true);
+    }, 800);
 
     return () => {
+      unmounted = true;
       window.clearTimeout(fallbackTimer);
       unsubs.forEach((u) => u());
     };
   }, [authReady, user, workspace?.id, canManage, role, stationsLoaded, workerItemIdsKey]);
 
-  // Auto-migrate legacy workspaces that predate dynamic Workstations (never re-seed reset workspaces)
+  // Auto-migrate legacy workspaces that predate dynamic Workstations (lazy-loaded bossService)
   useEffect(() => {
     if (
       !canManage ||
@@ -317,9 +525,13 @@ export function useStationData(params: {
       return;
     }
     migrationAttemptedRef.current = workspace.id;
-    ensureWorkstationsForExistingWorkspace(workspace, stations, items).catch((err) => {
-      console.error('Error migrating workstations:', err);
-    });
+    void import('../services/bossService')
+      .then(({ ensureWorkstationsForExistingWorkspace }) =>
+        ensureWorkstationsForExistingWorkspace(workspace, stations, items),
+      )
+      .catch((err) => {
+        console.error('Error migrating workstations:', err);
+      });
   }, [canManage, workspace, stationsLoaded, itemsLoaded, stations, items]);
 
   const refreshWorkerFallback = useCallback(async () => {
@@ -420,13 +632,32 @@ export function useStationData(params: {
       };
     }
 
-    // Worker mode: document-level entry listeners via allow get
+    // Worker mode: document-level entry listeners via allow get (micro-batched commits)
     if (role === 'jefe') return;
     const targetReportId = reportIds[0];
     const itemIds = workerStationItemIdsKey ? workerStationItemIdsKey.split('|') : [];
     if (!targetReportId || itemIds.length === 0) return;
 
     const entryMap: Record<string, DailyReportEntry> = {};
+    let flushScheduled = false;
+    let unmounted = false;
+
+    const flushEntries = () => {
+      flushScheduled = false;
+      if (unmounted) return;
+      setEntriesByReportId((prev) => ({
+        ...prev,
+        [targetReportId]: { ...entryMap },
+      }));
+    };
+
+    const scheduleFlush = () => {
+      if (!flushScheduled) {
+        flushScheduled = true;
+        queueMicrotask(flushEntries);
+      }
+    };
+
     const unsubs = itemIds.map((itemId) =>
       onSnapshot(
         doc(db, 'dailyReports', targetReportId, 'entries', itemId),
@@ -436,10 +667,7 @@ export function useStationData(params: {
           } else {
             delete entryMap[itemId];
           }
-          setEntriesByReportId((prev) => ({
-            ...prev,
-            [targetReportId]: { ...entryMap },
-          }));
+          scheduleFlush();
         },
         (err) =>
           handleFirestoreError(
@@ -451,6 +679,7 @@ export function useStationData(params: {
     );
 
     return () => {
+      unmounted = true;
       unsubs.forEach((u) => u());
     };
   }, [
@@ -464,7 +693,7 @@ export function useStationData(params: {
     workerStationItemIdsKey,
   ]);
 
-  // Manager mode: load entries for recent 7-day history + selectedDate 7-day consumption average
+  // Manager mode: load cached entries for 7-day history + selectedDate 7-day consumption average
   useEffect(() => {
     if (!authReady || !user || !workspace?.id || !canManage || !userEmail || !reportsLoaded) {
       return;
@@ -476,20 +705,15 @@ export function useStationData(params: {
       return;
     }
 
-    const weekStart = shiftDateStr(todayStr, -6);
-    const lookbackStart = shiftDateStr(effectiveSelectedDate, -7);
     const selectedDayReportIds = new Set(existingReportIdsKey ? existingReportIdsKey.split('|') : []);
-
-    const reportsToFetch = allReports.filter((rep) => {
-      if (selectedDayReportIds.has(rep.id)) return false;
-      const inWeeklyWindow = rep.date >= weekStart && rep.date <= todayStr;
-      const inBaselineWindow = rep.date >= lookbackStart && rep.date < effectiveSelectedDate;
-      if (!inWeeklyWindow && !inBaselineWindow) return false;
-      const updatedMs =
-        rep.updatedAt && typeof rep.updatedAt.toMillis === 'function'
-          ? rep.updatedAt.toMillis()
-          : 1;
-      return fetchedHistoryVersionRef.current[rep.id] !== updatedMs;
+    const reportsToFetch = planHistoricalEntryReportsToFetch({
+      allReports,
+      selectedDayReportIds,
+      todayStr,
+      effectiveSelectedDate,
+      weekStart: managerWindow.weekStart,
+      lookbackStart: managerWindow.lookbackStart,
+      fetchedVersionById: fetchedHistoryVersionRef.current,
     });
 
     if (reportsToFetch.length === 0) return;
@@ -497,30 +721,32 @@ export function useStationData(params: {
     let cancelled = false;
     void (async () => {
       const updates: Record<string, Record<string, DailyReportEntry>> = {};
-      await Promise.all(
-        reportsToFetch.map(async (rep) => {
-          const updatedMs =
-            rep.updatedAt && typeof rep.updatedAt.toMillis === 'function'
-              ? rep.updatedAt.toMillis()
-              : 1;
-          try {
-            const q = query(
-              collection(db, 'dailyReports', rep.id, 'entries'),
-              where('authorizedEmails', 'array-contains', userEmail),
-            );
-            const snap = await getDocs(q);
-            const map: Record<string, DailyReportEntry> = {};
-            snap.forEach((d) => {
-              const entry = { id: d.id, ...d.data() } as DailyReportEntry;
-              map[entry.itemId] = entry;
-            });
-            updates[rep.id] = map;
-            fetchedHistoryVersionRef.current[rep.id] = updatedMs;
-          } catch (err) {
-            console.warn(`No se pudieron leer entradas históricas de ${rep.id}:`, err);
-          }
-        }),
-      );
+      const chunks = chunkArray(reportsToFetch, ENTRY_FETCH_CHUNK_SIZE);
+
+      for (const chunk of chunks) {
+        if (cancelled) return;
+        await Promise.all(
+          chunk.map(async (rep) => {
+            const updatedMs = getReportVersionMs(rep);
+            try {
+              const q = query(
+                collection(db, 'dailyReports', rep.id, 'entries'),
+                where('authorizedEmails', 'array-contains', userEmail),
+              );
+              const snap = await getDocs(q);
+              const map: Record<string, DailyReportEntry> = {};
+              snap.forEach((d) => {
+                const entry = { id: d.id, ...d.data() } as DailyReportEntry;
+                map[entry.itemId] = entry;
+              });
+              updates[rep.id] = map;
+              fetchedHistoryVersionRef.current[rep.id] = updatedMs;
+            } catch (err) {
+              console.warn(`No se pudieron leer entradas históricas de ${rep.id}:`, err);
+            }
+          }),
+        );
+      }
 
       if (!cancelled && Object.keys(updates).length > 0) {
         setHistoricalEntriesByReportId((prev) => ({
@@ -543,6 +769,8 @@ export function useStationData(params: {
     allReports,
     todayStr,
     effectiveSelectedDate,
+    managerWindow.weekStart,
+    managerWindow.lookbackStart,
     existingReportIdsKey,
   ]);
 
@@ -646,7 +874,7 @@ export function useStationData(params: {
     return Object.values(consolidatedEntriesByItemId);
   }, [consolidatedEntriesByItemId]);
 
-  // Keep authorizedEmails limited strictly to owner + active co-admins ('jefe'), never workers
+  // Keep authorizedEmails limited strictly to owner + active co-admins ('jefe')
   useEffect(() => {
     if (!canManage || !workspace || !stationsLoaded || !itemsLoaded) return;
     const coAdminEmails = members
@@ -667,17 +895,21 @@ export function useStationData(params: {
     if (syncingEmailsKeyRef.current === syncKey) return;
     syncingEmailsKeyRef.current = syncKey;
 
-    syncAuthorizedEmailsAcrossWorkspace({
-      workspace,
-      coAdminEmails,
-      stations,
-      items,
-      reports: allReports,
-      entries: todayAllEntries,
-    }).catch((err) => {
-      console.error('Error syncing co-admin access emails:', err);
-      syncingEmailsKeyRef.current = '';
-    });
+    void import('../services/bossService')
+      .then(({ syncAuthorizedEmailsAcrossWorkspace }) =>
+        syncAuthorizedEmailsAcrossWorkspace({
+          workspace,
+          coAdminEmails,
+          stations,
+          items,
+          reports: allReports,
+          entries: todayAllEntries,
+        }),
+      )
+      .catch((err) => {
+        console.error('Error syncing co-admin access emails:', err);
+        syncingEmailsKeyRef.current = '';
+      });
   }, [canManage, workspace, stationsLoaded, itemsLoaded, members, stations, items, allReports, todayAllEntries]);
 
   const yesterdayHasReports = useMemo(

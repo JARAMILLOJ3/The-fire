@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
-import { AnimatePresence, motion } from 'motion/react';
 import { AlertTriangle, Archive, ArchiveRestore, Pencil, Plus, X } from 'lucide-react';
 import {
   MAX_NAME_LENGTH,
@@ -10,7 +9,7 @@ import {
   createInventoryItem,
   setInventoryItemActive,
   updateInventoryItem,
-} from '../services/inventoryService';
+} from '../services/bossService';
 import type {
   CaptureInputType,
   InventoryItem,
@@ -365,7 +364,7 @@ export function CatalogManager({
           <button
             type="button"
             onClick={() => setStationFilter('all')}
-            className={`min-h-[36px] px-3 py-1.5 text-xs font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+            className={`min-h-[44px] sm:min-h-[38px] px-3 py-1.5 text-xs font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
               stationFilter === 'all'
                 ? 'bg-white text-stone-900 shadow-sm'
                 : 'text-stone-600 hover:text-stone-900'
@@ -379,7 +378,7 @@ export function CatalogManager({
             <button
               type="button"
               onClick={() => setStationFilter(UNASSIGNED_STATION_ID)}
-              className={`min-h-[36px] px-3 py-1.5 text-xs font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+              className={`min-h-[44px] sm:min-h-[38px] px-3 py-1.5 text-xs font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
                 stationFilter === UNASSIGNED_STATION_ID
                   ? 'bg-white text-stone-900 shadow-sm'
                   : 'text-stone-600 hover:text-stone-900'
@@ -395,7 +394,7 @@ export function CatalogManager({
                 key={st.id}
                 type="button"
                 onClick={() => setStationFilter(st.id)}
-                className={`min-h-[36px] px-3 py-1.5 text-xs font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+                className={`min-h-[44px] sm:min-h-[38px] px-3 py-1.5 text-xs font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
                   stationFilter === st.id
                     ? 'bg-white text-stone-900 shadow-sm'
                     : 'text-stone-600 hover:text-stone-900'
@@ -414,7 +413,7 @@ export function CatalogManager({
               setStatusFilter('active');
               setActionFeedback(null);
             }}
-            className={`min-h-[36px] px-3 py-1.5 text-xs font-semibold rounded-lg transition-all whitespace-nowrap cursor-pointer ${
+            className={`min-h-[44px] sm:min-h-[38px] px-3 py-1.5 text-xs font-semibold rounded-lg transition-all whitespace-nowrap cursor-pointer ${
               statusFilter === 'active'
                 ? 'bg-white text-stone-900 shadow-sm'
                 : 'text-stone-600 hover:text-stone-900'
@@ -428,7 +427,7 @@ export function CatalogManager({
               setStatusFilter('archived');
               setActionFeedback(null);
             }}
-            className={`min-h-[36px] px-3 py-1.5 text-xs font-semibold rounded-lg transition-all whitespace-nowrap cursor-pointer ${
+            className={`min-h-[44px] sm:min-h-[38px] px-3 py-1.5 text-xs font-semibold rounded-lg transition-all whitespace-nowrap cursor-pointer ${
               statusFilter === 'archived'
                 ? 'bg-white text-stone-900 shadow-sm'
                 : 'text-stone-600 hover:text-stone-900'
@@ -506,7 +505,7 @@ export function CatalogManager({
                         type="button"
                         onClick={() => openEditForm(item)}
                         aria-label={`Editar ${item.name}`}
-                        className="p-2 text-stone-500 hover:text-stone-900 hover:bg-stone-100 rounded-lg cursor-pointer"
+                        className="min-w-[44px] min-h-[44px] flex items-center justify-center text-stone-500 hover:text-stone-900 hover:bg-stone-100 rounded-lg cursor-pointer"
                       >
                         <Pencil className="w-4 h-4" />
                       </button>
@@ -516,7 +515,7 @@ export function CatalogManager({
                           onClick={() => setConfirmArchive(item)}
                           aria-label={`Archivar ${item.name}`}
                           title="Archivar insumo"
-                          className="p-2 text-stone-500 hover:text-amber-700 hover:bg-amber-50 rounded-lg cursor-pointer"
+                          className="min-w-[44px] min-h-[44px] flex items-center justify-center text-stone-500 hover:text-amber-700 hover:bg-amber-50 rounded-lg cursor-pointer"
                         >
                           <Archive className="w-4 h-4" />
                         </button>
@@ -527,7 +526,7 @@ export function CatalogManager({
                           onClick={() => handleRestore(item)}
                           aria-label={`Reactivar ${item.name}`}
                           title="Reactivar insumo"
-                          className="p-2 text-emerald-700 hover:bg-emerald-50 rounded-lg cursor-pointer"
+                          className="min-w-[44px] min-h-[44px] flex items-center justify-center text-emerald-700 hover:bg-emerald-50 rounded-lg cursor-pointer"
                         >
                           <ArchiveRestore className="w-4 h-4" />
                         </button>
@@ -639,35 +638,24 @@ export function CatalogManager({
       </div>
 
       {/* Add/Edit Modal */}
-      <AnimatePresence>
-        {showForm && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 bg-stone-950/50 backdrop-blur-xs flex items-center justify-center p-4"
-          >
-            <motion.div
-              initial={{ opacity: 0, scale: 0.96, y: 10 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.96, y: 10 }}
-              transition={{ duration: 0.2 }}
-              className="bg-white border border-stone-200 rounded-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto p-5 sm:p-6 space-y-5 shadow-2xl min-w-0"
-            >
-              <div className="flex items-center justify-between">
-                <h2 className="font-display text-lg font-bold text-stone-900">
-                  {editingItem ? 'Editar insumo' : 'Agregar nuevo insumo'}
-                </h2>
-                <button
-                  type="button"
-                  onClick={() => setShowForm(false)}
-                  aria-label="Cerrar ventana"
-                  className="p-1.5 text-stone-400 hover:text-stone-700 rounded-lg cursor-pointer"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
+      {showForm && (
+        <div className="fixed inset-0 z-50 bg-stone-950/50 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4">
+          <div className="bg-white border border-stone-200 rounded-2xl w-full max-w-lg max-h-[90dvh] flex flex-col overflow-hidden shadow-2xl min-w-0 animate-tf-fade-up">
+            <div className="px-4 sm:px-6 pt-4 sm:pt-5 pb-3 border-b border-stone-100 flex items-center justify-between shrink-0">
+              <h2 className="font-display text-lg font-bold text-stone-900">
+                {editingItem ? 'Editar insumo' : 'Agregar nuevo insumo'}
+              </h2>
+              <button
+                type="button"
+                onClick={() => setShowForm(false)}
+                aria-label="Cerrar ventana"
+                className="min-w-[44px] min-h-[44px] -mr-2 flex items-center justify-center text-stone-400 hover:text-stone-700 rounded-lg cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
 
+            <form onSubmit={handleSubmit} className="flex-1 min-h-0 overflow-y-auto p-4 sm:p-6 space-y-4">
               {errorMsg && (
                 <div className="p-3 text-xs text-red-700 bg-red-50 border border-red-200 rounded-xl">
                   {errorMsg}
@@ -684,184 +672,170 @@ export function CatalogManager({
                 </div>
               )}
 
-              <form onSubmit={handleSubmit} className="space-y-4">
-                <div>
-                  <label className="block text-xs font-semibold text-stone-700 mb-1">
-                    Nombre del insumo
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    maxLength={MAX_NAME_LENGTH}
-                    value={name}
-                    onChange={(e) => {
-                      setName(e.target.value);
-                      if (errorMsg) setErrorMsg(null);
-                    }}
-                    placeholder="Ej: Pulpa de maracuyá"
-                    className="w-full min-h-[42px] px-3 py-2 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
-                  />
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-xs font-semibold text-stone-700 mb-1">
-                      Puesto de trabajo
-                    </label>
-                    <select
-                      value={stationId}
-                      onChange={(e) => {
-                        setStationId(e.target.value);
-                        if (errorMsg) setErrorMsg(null);
-                      }}
-                      className="w-full min-h-[42px] px-3 py-2 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 bg-white"
-                    >
-                      <option value={UNASSIGNED_STATION_ID}>
-                        Sin asignar (asignar después en Puestos)
-                      </option>
-                      {stations.map((s) => (
-                        <option key={s.id} value={s.id}>
-                          {s.name}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-
-                  <div className="min-w-0">
-                    <label className="block text-xs font-semibold text-stone-700 mb-1">
-                      Unidad base de inventario <span className="text-red-600">*</span>
-                    </label>
-                    <OptionSelect
-                      value={unit}
-                      options={unitOptions}
-                      maxLength={MAX_UNIT_LENGTH}
-                      required
-                      selectAriaLabel="Unidad base de inventario"
-                      customAriaLabel="Escribe la unidad de inventario"
-                      customPlaceholder="Ej: galón, ml, atado"
-                      onChange={(val) => {
-                        setUnit(val);
-                        if (errorMsg) setErrorMsg(null);
-                      }}
-                    />
-                  </div>
-                </div>
-
-                {/* Capture type selector */}
-                <ItemCaptureFields
-                  inputType={inputType}
-                  onInputTypeChange={setInputType}
-                  unit={unit}
-                  packSizeInput={packSizeInput}
-                  onPackSizeInputChange={setPackSizeInput}
-                  packLabel={packLabel}
-                  onPackLabelChange={setPackLabel}
-                  unitLabel={unitLabel}
-                  onUnitLabelChange={setUnitLabel}
-                  capacityInput={capacityInput}
-                  onCapacityInputChange={setCapacityInput}
-                  onClearError={() => {
+              <div>
+                <label className="block text-xs font-semibold text-stone-700 mb-1">
+                  Nombre del insumo
+                </label>
+                <input
+                  type="text"
+                  required
+                  maxLength={MAX_NAME_LENGTH}
+                  value={name}
+                  onChange={(e) => {
+                    setName(e.target.value);
                     if (errorMsg) setErrorMsg(null);
                   }}
+                  placeholder="Ej: Pulpa de maracuyá"
+                  className="w-full min-h-[44px] px-3 py-2 text-base sm:text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
                 />
+              </div>
 
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-xs font-semibold text-stone-700 mb-1">
-                      Stock mínimo ({unit.trim() || 'und'})
-                    </label>
-                    <input
-                      type="number"
-                      min={0}
-                      step="any"
-                      required
-                      value={minStock}
-                      onChange={(e) => setMinStock(parseFloat(e.target.value) || 0)}
-                      className="w-full min-h-[42px] px-3 py-2 text-sm font-mono tabular-nums border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-xs font-semibold text-stone-700 mb-1">
-                      Stock ideal ({unit.trim() || 'und'})
-                    </label>
-                    <input
-                      type="number"
-                      min={0}
-                      step="any"
-                      required
-                      value={targetStock}
-                      onChange={(e) => setTargetStock(parseFloat(e.target.value) || 0)}
-                      className="w-full min-h-[42px] px-3 py-2 text-sm font-mono tabular-nums border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
-                    />
-                  </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-semibold text-stone-700 mb-1">
+                    Puesto de trabajo
+                  </label>
+                  <select
+                    value={stationId}
+                    onChange={(e) => {
+                      setStationId(e.target.value);
+                      if (errorMsg) setErrorMsg(null);
+                    }}
+                    className="w-full min-h-[44px] px-3 py-2 text-base sm:text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 bg-white"
+                  >
+                    <option value={UNASSIGNED_STATION_ID}>
+                      Sin asignar (asignar después en Puestos)
+                    </option>
+                    {stations.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.name}
+                      </option>
+                    ))}
+                  </select>
                 </div>
 
-                <div className="flex items-center justify-end gap-2 pt-2">
-                  <button
-                    type="button"
-                    onClick={() => setShowForm(false)}
-                    className="min-h-[42px] px-4 py-2 text-sm font-medium text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 cursor-pointer"
-                  >
-                    Cancelar
-                  </button>
-                  <button
-                    type="submit"
-                    disabled={submitting}
-                    className="min-h-[42px] px-4 py-2 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 disabled:opacity-60 cursor-pointer"
-                  >
-                    {submitting ? 'Guardando...' : 'Guardar insumo'}
-                  </button>
+                <div className="min-w-0">
+                  <label className="block text-xs font-semibold text-stone-700 mb-1">
+                    Unidad base de inventario <span className="text-red-600">*</span>
+                  </label>
+                  <OptionSelect
+                    value={unit}
+                    options={unitOptions}
+                    maxLength={MAX_UNIT_LENGTH}
+                    required
+                    selectAriaLabel="Unidad base de inventario"
+                    customAriaLabel="Escribe la unidad de inventario"
+                    customPlaceholder="Ej: galón, ml, atado"
+                    onChange={(val) => {
+                      setUnit(val);
+                      if (errorMsg) setErrorMsg(null);
+                    }}
+                  />
                 </div>
-              </form>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+              </div>
 
-      {/* Archive Confirmation Modal */}
-      <AnimatePresence>
-        {confirmArchive && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 bg-stone-950/50 backdrop-blur-xs flex items-center justify-center p-4"
-          >
-            <motion.div
-              initial={{ opacity: 0, scale: 0.96 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.96 }}
-              className="bg-white border border-stone-200 rounded-2xl w-full max-w-sm p-6 space-y-4 shadow-2xl"
-            >
-              <h3 className="font-display text-lg font-bold text-stone-900">
-                Archivar insumo
-              </h3>
-              <p className="text-sm text-stone-600">
-                ¿Deseas archivar{' '}
-                <span className="font-semibold text-stone-900">{confirmArchive.name}</span>?
-                Dejará de aparecer en la planilla de las trabajadoras, conservará todo su historial y podrás reactivarlo cuando lo necesites.
-              </p>
-              <div className="flex items-center justify-end gap-2 pt-1">
+              {/* Capture type selector */}
+              <ItemCaptureFields
+                inputType={inputType}
+                onInputTypeChange={setInputType}
+                unit={unit}
+                packSizeInput={packSizeInput}
+                onPackSizeInputChange={setPackSizeInput}
+                packLabel={packLabel}
+                onPackLabelChange={setPackLabel}
+                unitLabel={unitLabel}
+                onUnitLabelChange={setUnitLabel}
+                capacityInput={capacityInput}
+                onCapacityInputChange={setCapacityInput}
+                onClearError={() => {
+                  if (errorMsg) setErrorMsg(null);
+                }}
+              />
+
+              <div className="grid grid-cols-1 min-[360px]:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-semibold text-stone-700 mb-1">
+                    Stock mínimo ({unit.trim() || 'und'})
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    step="any"
+                    required
+                    value={minStock}
+                    onChange={(e) => setMinStock(parseFloat(e.target.value) || 0)}
+                    className="w-full min-h-[44px] px-3 py-2 text-base sm:text-sm font-mono tabular-nums border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-stone-700 mb-1">
+                    Stock ideal ({unit.trim() || 'und'})
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    step="any"
+                    required
+                    value={targetStock}
+                    onChange={(e) => setTargetStock(parseFloat(e.target.value) || 0)}
+                    className="w-full min-h-[44px] px-3 py-2 text-base sm:text-sm font-mono tabular-nums border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
+                  />
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-end gap-2 pt-2">
                 <button
                   type="button"
-                  onClick={() => setConfirmArchive(null)}
-                  className="min-h-[40px] px-4 py-2 text-sm font-medium text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 cursor-pointer"
+                  onClick={() => setShowForm(false)}
+                  className="min-h-[44px] px-4 py-2 text-sm font-medium text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 cursor-pointer"
                 >
                   Cancelar
                 </button>
                 <button
-                  type="button"
+                  type="submit"
                   disabled={submitting}
-                  onClick={handleArchive}
-                  className="min-h-[40px] px-4 py-2 text-sm font-semibold text-white bg-amber-600 rounded-xl hover:bg-amber-700 disabled:opacity-60 cursor-pointer"
+                  className="min-h-[44px] px-4 py-2 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 disabled:opacity-60 cursor-pointer"
                 >
-                  {submitting ? 'Archivando...' : 'Archivar'}
+                  {submitting ? 'Guardando...' : 'Guardar insumo'}
                 </button>
               </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Archive Confirmation Modal */}
+      {confirmArchive && (
+        <div className="fixed inset-0 z-50 bg-stone-950/50 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4">
+          <div className="bg-white border border-stone-200 rounded-2xl w-full max-w-sm max-h-[90dvh] overflow-y-auto p-5 sm:p-6 space-y-4 shadow-2xl animate-tf-fade-up">
+            <h3 className="font-display text-lg font-bold text-stone-900">
+              Archivar insumo
+            </h3>
+            <p className="text-sm text-stone-600">
+              ¿Deseas archivar{' '}
+              <span className="font-semibold text-stone-900">{confirmArchive.name}</span>?
+              Dejará de aparecer en la planilla de las trabajadoras, conservará todo su historial y podrás reactivarlo cuando lo necesites.
+            </p>
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setConfirmArchive(null)}
+                className="min-h-[44px] px-4 py-2 text-sm font-medium text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 cursor-pointer"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={handleArchive}
+                className="min-h-[44px] px-4 py-2 text-sm font-semibold text-white bg-amber-600 rounded-xl hover:bg-amber-700 disabled:opacity-60 cursor-pointer"
+              >
+                {submitting ? 'Archivando...' : 'Archivar'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -13,7 +13,7 @@ export default defineConfig(() => {
       },
     },
     optimizeDeps: {
-      include: ['react', 'react-dom', 'react-dom/client', 'motion/react', 'lucide-react'],
+      include: ['react', 'react-dom', 'react-dom/client', 'lucide-react'],
     },
     build: {
       rolldownOptions: {
@@ -30,9 +30,6 @@ export default defineConfig(() => {
             }
             if (id.includes('node_modules/firebase/') || id.includes('node_modules/@firebase/')) {
               return 'firebase-auth-vendor';
-            }
-            if (id.includes('node_modules/motion')) {
-              return 'motion-vendor';
             }
             if (id.includes('node_modules/qrcode')) {
               return 'qrcode-vendor';

@@ -1,5 +1,4 @@
 import { useEffect, useState } from 'react';
-import { AnimatePresence, motion } from 'motion/react';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -14,7 +13,7 @@ import {
   collectWorkspaceResetTasks,
   fetchWorkspaceBackupData,
   runWorkspaceResetTasks,
-} from '../services/inventoryService';
+} from '../services/bossService';
 import type { Workspace } from '../types';
 import {
   countResetTasksByCategory,
@@ -219,54 +218,47 @@ export function RestaurantResetModal({
       ? Math.min(100, Math.round((progress.deletedCount / progress.totalCount) * 100))
       : 100;
 
+  if (!open) return null;
+
   return (
-    <AnimatePresence>
-      {open && (
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          exit={{ opacity: 0 }}
-          className="fixed inset-0 z-50 bg-stone-950/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto"
-        >
-          <motion.div
-            initial={{ opacity: 0, scale: 0.96, y: 10 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.96, y: 10 }}
-            transition={{ duration: 0.2 }}
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="reset-modal-title"
-            className="bg-white border border-red-200 rounded-2xl w-full max-w-lg max-h-[92vh] overflow-y-auto p-5 sm:p-6 space-y-5 shadow-2xl my-6"
-          >
-            {/* Header */}
-            <div className="flex items-start justify-between gap-3">
-              <div className="flex items-start gap-2.5 min-w-0">
-                <div className="p-2 rounded-xl bg-red-50 text-red-700 border border-red-200 shrink-0">
-                  <ShieldAlert className="w-5 h-5" />
-                </div>
-                <div className="min-w-0">
-                  <p className="text-[11px] font-bold uppercase tracking-wider text-red-700">
-                    Zona de peligro · Solo dueño
-                  </p>
-                  <h2
-                    id="reset-modal-title"
-                    className="font-display text-lg font-bold text-stone-900"
-                  >
-                    Reiniciar datos del restaurante
-                  </h2>
-                </div>
-              </div>
-              {!isBusy && (
-                <button
-                  type="button"
-                  onClick={handleFinishClose}
-                  aria-label="Cerrar ventana"
-                  className="p-1.5 text-stone-400 hover:text-stone-700 rounded-lg cursor-pointer"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              )}
+    <div className="fixed inset-0 z-50 bg-stone-950/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="reset-modal-title"
+        className="bg-white border border-red-200 rounded-2xl w-full max-w-lg max-h-[90dvh] flex flex-col overflow-hidden shadow-2xl animate-tf-fade-up"
+      >
+        {/* Header */}
+        <div className="px-4 sm:px-6 pt-4 sm:pt-5 pb-3.5 border-b border-red-100 flex items-start justify-between gap-3 shrink-0">
+          <div className="flex items-start gap-2.5 min-w-0">
+            <div className="p-2 rounded-xl bg-red-50 text-red-700 border border-red-200 shrink-0">
+              <ShieldAlert className="w-5 h-5" />
             </div>
+            <div className="min-w-0">
+              <p className="text-[11px] font-bold uppercase tracking-wider text-red-700">
+                Zona de peligro · Solo dueño
+              </p>
+              <h2
+                id="reset-modal-title"
+                className="font-display text-base sm:text-lg font-bold text-stone-900"
+              >
+                Reiniciar datos del restaurante
+              </h2>
+            </div>
+          </div>
+          {!isBusy && (
+            <button
+              type="button"
+              onClick={handleFinishClose}
+              aria-label="Cerrar ventana"
+              className="min-w-[44px] min-h-[44px] -mr-2 -mt-1 flex items-center justify-center text-stone-400 hover:text-stone-700 rounded-lg cursor-pointer shrink-0"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          )}
+        </div>
+
+        <div className="flex-1 min-h-0 overflow-y-auto p-4 sm:p-6 space-y-5">
 
             {!isOwner ? (
               <div className="p-4 rounded-xl bg-red-50 border border-red-200 text-sm text-red-800">
@@ -299,7 +291,7 @@ export function RestaurantResetModal({
                     type="button"
                     onClick={handleDownloadBackup}
                     disabled={backupLoading}
-                    className="min-h-[40px] w-full inline-flex items-center justify-center gap-2 px-3.5 py-2 text-xs sm:text-sm font-semibold text-stone-900 bg-white border border-stone-300 rounded-xl hover:bg-stone-100 disabled:opacity-60 transition-colors cursor-pointer"
+                    className="min-h-[44px] w-full inline-flex items-center justify-center gap-2 px-3.5 py-2 text-xs sm:text-sm font-semibold text-stone-900 bg-white border border-stone-300 rounded-xl hover:bg-stone-100 disabled:opacity-60 transition-colors cursor-pointer"
                   >
                     {backupLoading ? (
                       <Loader2 className="w-4 h-4 animate-spin" />
@@ -399,18 +391,18 @@ export function RestaurantResetModal({
                     value={confirmText}
                     onChange={(e) => setConfirmText(e.target.value)}
                     placeholder={RESET_CONFIRMATION_WORD}
-                    className="w-full min-h-[42px] px-3 py-2 text-sm font-mono bg-white border border-red-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-red-600"
+                    className="w-full min-h-[44px] px-3 py-2 text-base sm:text-sm font-mono bg-white border border-red-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-red-600"
                   />
                   <p className="text-[11px] text-red-800">
                     Esta acción elimina los datos seleccionados en el servidor y no se puede revertir.
                   </p>
                 </div>
 
-                <div className="flex items-center justify-end gap-2 pt-1">
+                <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
                   <button
                     type="button"
                     onClick={handleFinishClose}
-                    className="min-h-[42px] px-4 py-2 text-sm font-medium text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 cursor-pointer"
+                    className="min-h-[44px] px-4 py-2 text-sm font-medium text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 cursor-pointer"
                   >
                     Cancelar
                   </button>
@@ -418,7 +410,7 @@ export function RestaurantResetModal({
                     type="button"
                     disabled={!confirmationReady}
                     onClick={handleStartReset}
-                    className="min-h-[42px] inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-red-600 rounded-xl hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                    className="min-h-[44px] inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-red-600 rounded-xl hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
                   >
                     <Trash2 className="w-4 h-4" />
                     Reiniciar ahora
@@ -501,14 +493,14 @@ export function RestaurantResetModal({
                   <button
                     type="button"
                     onClick={handleFinishClose}
-                    className="min-h-[42px] px-4 py-2 text-sm font-medium text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 cursor-pointer"
+                    className="min-h-[44px] px-4 py-2 text-sm font-medium text-stone-700 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 cursor-pointer"
                   >
                     Cerrar por ahora
                   </button>
                   <button
                     type="button"
                     onClick={handleRetryPending}
-                    className="min-h-[42px] inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-red-600 rounded-xl hover:bg-red-700 cursor-pointer"
+                    className="min-h-[44px] inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-red-600 rounded-xl hover:bg-red-700 cursor-pointer"
                   >
                     <RotateCcw className="w-4 h-4" />
                     Reintentar pendientes ({pendingTasks.length})
@@ -538,16 +530,15 @@ export function RestaurantResetModal({
                   <button
                     type="button"
                     onClick={handleFinishClose}
-                    className="min-h-[42px] px-5 py-2 text-sm font-semibold text-white bg-stone-950 rounded-xl hover:bg-stone-800 cursor-pointer"
+                    className="min-h-[44px] px-5 py-2 text-sm font-semibold text-white bg-stone-950 rounded-xl hover:bg-stone-800 cursor-pointer"
                   >
                     Volver al panel
                   </button>
                 </div>
               </div>
             )}
-          </motion.div>
-        </motion.div>
-      )}
-    </AnimatePresence>
+        </div>
+      </div>
+    </div>
   );
 }
