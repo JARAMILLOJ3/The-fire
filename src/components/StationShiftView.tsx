@@ -3,13 +3,16 @@ import type { User } from 'firebase/auth';
 import {
   AlertTriangle,
   ArrowLeft,
+  Check,
   CheckCheck,
   CheckCircle2,
   Clock,
+  Copy,
   Eye,
   Lock,
   Moon,
   Pencil,
+  RefreshCw,
   RotateCcw,
   Save,
   Search,
@@ -37,6 +40,7 @@ import type {
   Workstation,
 } from '../types';
 import {
+  buildStationSaveErrorCopyText,
   computeOpeningStatusForValue,
   confirmAllPendingOpeningRows,
   confirmPreloadedOpeningRow,
@@ -51,6 +55,7 @@ import {
   getStockLevel,
   getStockLevelMeta,
   sanitizeStockQuantity,
+  summarizeStationCatalogDiff,
   type EntryAnomaly,
   type StationSaveErrorInfo,
 } from '../utils/inventory';
@@ -64,6 +69,7 @@ import { readWorkerSnapshotCache, writeWorkerSnapshotCache } from '../utils/work
 import { ShiftDesktopItemRow } from './shift/ShiftDesktopItemRow';
 import { ShiftMobileItemCard } from './shift/ShiftMobileItemCard';
 import { ShiftOutsideHoursView } from './shift/ShiftOutsideHoursView';
+import { copyErrorTextToClipboard, ShiftSaveErrorModal } from './shift/ShiftSaveErrorModal';
 import { ShiftSubmitConfirmModal } from './shift/ShiftSubmitConfirmModal';
 import { WorkerNotesModal } from './shift/WorkerNotesModal';
 
@@ -84,6 +90,7 @@ interface StationShiftViewProps {
   reportsLoaded?: boolean;
   isCacheHydrated?: boolean;
   onSaved?: () => void;
+  onCatalogSynced?: (freshItems: InventoryItem[]) => void;
   onBackToDashboard?: () => void;
 }
 
@@ -265,6 +272,7 @@ export function StationShiftView({
   reportsLoaded = true,
   isCacheHydrated = false,
   onSaved,
+  onCatalogSynced,
   onBackToDashboard,
 }: StationShiftViewProps) {
   const stationItems = useMemo(
@@ -293,6 +301,7 @@ export function StationShiftView({
   const [drafts, setDrafts] = useState<Record<string, DraftEntryRow>>({});
   const [notes, setNotes] = useState('');
   const [savingMode, setSavingMode] = useState<'opening' | 'closing' | null>(null);
+  const [savingStatusText, setSavingStatusText] = useState<string | null>(null);
   const [yesterdayStatus, setYesterdayStatus] = useState<YesterdayLoadStatus>('idle');
   const [yesterdayDateStr, setYesterdayDateStr] = useState<string>(() =>
     getPreviousDateStr(selectedDate),
@@ -305,6 +314,9 @@ export function StationShiftView({
   const [itemFilter, setItemFilter] = useState<ItemFilter>('todos');
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [saveError, setSaveError] = useState<StationSaveErrorInfo | null>(null);
+  const [saveErrorModalOpen, setSaveErrorModalOpen] = useState(false);
+  const [copiedInlineError, setCopiedInlineError] = useState(false);
+  const [catalogUpdateNotice, setCatalogUpdateNotice] = useState<string | null>(null);
   const [remoteChangedBy, setRemoteChangedBy] = useState<string | null>(null);
   const [pendingConflict, setPendingConflict] = useState<{
     mode: 'opening' | 'closing';
@@ -350,6 +362,7 @@ export function StationShiftView({
   const latestReportNotesRef = useRef(report?.notes ?? '');
   const latestReportUpdatedAtMsRef = useRef<number | null>(null);
   const yesterdayPreloadKeyRef = useRef<string>('');
+  const prevCatalogItemsRef = useRef<{ scopeKey: string; items: InventoryItem[] } | null>(null);
   const listSectionRef = useRef<HTMLDivElement | null>(null);
   const viewContainerRef = useRef<HTMLDivElement | null>(null);
   const blurCheckTimerRef = useRef<number | null>(null);
@@ -497,6 +510,33 @@ export function StationShiftView({
   useEffect(() => {
     setIsBossEditing(false);
   }, [workspace.id, station.id, selectedDate]);
+
+  // Notify worker immediately when boss updates any item in this open station
+  useEffect(() => {
+    const scopeKey = `${workspace.id}:${station.id}`;
+    const prev = prevCatalogItemsRef.current;
+
+    if (!prev || prev.scopeKey !== scopeKey) {
+      if (stationItems.length > 0) {
+        prevCatalogItemsRef.current = { scopeKey, items: stationItems };
+      } else {
+        prevCatalogItemsRef.current = null;
+      }
+      setCatalogUpdateNotice(null);
+      return;
+    }
+
+    const diff = summarizeStationCatalogDiff(prev.items, stationItems);
+    prevCatalogItemsRef.current = { scopeKey, items: stationItems };
+
+    if (diff.changed && !canManage && !submittedThankYouMode && !isLocked) {
+      const label =
+        diff.changedCount === 1
+          ? `Se actualizó un insumo (${diff.changedNames[0]}). Ya ves los datos más recientes.`
+          : `Se actualizó un insumo (${diff.changedCount} cambios del jefe). Ya ves los datos más recientes.`;
+      setCatalogUpdateNotice(label);
+    }
+  }, [workspace.id, station.id, stationItems, canManage, submittedThankYouMode, isLocked]);
 
   // 2. Merge remote snapshot updates WITHOUT overwriting touched local fields or preloaded previousClosing
   useEffect(() => {
@@ -1118,6 +1158,15 @@ export function StationShiftView({
     setConfirmModalState({ mode, anomalies });
   };
 
+  const handleCopyInlineSaveError = async () => {
+    if (!saveError) return;
+    const ok = await copyErrorTextToClipboard(buildStationSaveErrorCopyText(saveError));
+    if (ok) {
+      setCopiedInlineError(true);
+      window.setTimeout(() => setCopiedInlineError(false), 2500);
+    }
+  };
+
   const executeSave = async (
     mode: 'opening' | 'closing',
     options?: { forceOverwrite?: boolean },
@@ -1128,8 +1177,11 @@ export function StationShiftView({
     setConfirmModalState(null);
     setPendingConflict(null);
     setSavingMode(mode);
+    setSavingStatusText(null);
     setFeedback(null);
     setSaveError(null);
+    setSaveErrorModalOpen(false);
+    setCopiedInlineError(false);
 
     try {
       const saveResult = await saveStationReportBatch({
@@ -1145,6 +1197,10 @@ export function StationShiftView({
         existingEntries: entriesByItemId,
         expectedUpdatedAtMs: baselineUpdatedAtRef.current,
         forceOverwrite: options?.forceOverwrite,
+        onStatusMessage: (msg) => setSavingStatusText(msg),
+        onCatalogSynced: (freshItems) => {
+          onCatalogSynced?.(freshItems);
+        },
       });
 
       clearStoredDraft(storageKey);
@@ -1153,6 +1209,7 @@ export function StationShiftView({
       setRestoredFromLocal(false);
       setRemoteChangedBy(null);
       setSaveError(null);
+      setSaveErrorModalOpen(false);
 
       if (!canManage) {
         setSubmittedOfflineQueued(saveResult.queuedOffline);
@@ -1176,7 +1233,10 @@ export function StationShiftView({
           title: err.title,
           detail: err.detail,
           code: err.code,
+          rawDetail: err.rawDetail,
+          failedDocumentPath: err.failedDocumentPath,
         });
+        setSaveErrorModalOpen(true);
         return;
       }
 
@@ -1185,12 +1245,15 @@ export function StationShiftView({
           setSaveError({
             title: 'Planilla ya enviada y bloqueada',
             detail: err.message,
+            code: 'completed_locked',
           });
+          setSaveErrorModalOpen(true);
         } else {
           setPendingConflict({ mode, message: err.message });
           setSaveError({
             title: 'Otro dispositivo actualizó esta planilla',
             detail: err.message,
+            code: err.reason,
           });
         }
         return;
@@ -1202,8 +1265,10 @@ export function StationShiftView({
         isOnline,
       });
       setSaveError(formatted);
+      setSaveErrorModalOpen(true);
     } finally {
       setSavingMode(null);
+      setSavingStatusText(null);
     }
   };
 
@@ -1616,6 +1681,27 @@ export function StationShiftView({
               ? 'Sin conexión — puedes seguir contando; al enviar se guardará aquí y se subirá solo cuando regrese internet.'
               : 'Sincronizando cambios guardados sin conexión con el servidor...'}
           </span>
+        </div>
+      )}
+
+      {/* Live Catalog Update Notice (Worker screen auto-updated by boss) */}
+      {catalogUpdateNotice && !isBossReadOnly && (
+        <div
+          role="status"
+          className="px-4 py-3 rounded-2xl bg-sky-50 border border-sky-300 text-sky-950 text-xs sm:text-sm flex items-center justify-between gap-2.5 animate-tf-fade-in"
+        >
+          <div className="flex items-center gap-2.5 min-w-0">
+            <RefreshCw className="w-4 h-4 text-sky-700 shrink-0" />
+            <span className="font-semibold">{catalogUpdateNotice}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setCatalogUpdateNotice(null)}
+            aria-label="Cerrar aviso de actualización"
+            className="min-w-[36px] min-h-[36px] flex items-center justify-center rounded-xl text-sky-800 hover:bg-sky-100 shrink-0 cursor-pointer"
+          >
+            <X className="w-4 h-4" />
+          </button>
         </div>
       )}
 
@@ -2314,15 +2400,26 @@ export function StationShiftView({
             </div>
           )}
 
+          {/* Retry-once live catalog sync notice during save */}
+          {savingMode !== null && savingStatusText && (
+            <div
+              role="status"
+              className="flex items-center gap-2.5 px-3.5 py-2.5 rounded-xl bg-amber-50 border border-amber-300 text-xs sm:text-sm font-semibold text-amber-950"
+            >
+              <RefreshCw className="w-4 h-4 text-amber-700 animate-spin shrink-0" />
+              <span>{savingStatusText}</span>
+            </div>
+          )}
+
           {/* Save error inline right beside Action Row */}
           {saveError && !isLocked && (
             <div
               role="alert"
-              className="flex items-start justify-between gap-3 p-3.5 rounded-xl bg-red-50 border border-red-300 text-red-950"
+              className="flex flex-col sm:flex-row sm:items-start justify-between gap-3 p-3.5 rounded-xl bg-red-50 border border-red-300 text-red-950"
             >
               <div className="flex items-start gap-2.5 min-w-0">
                 <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
-                <div className="text-xs space-y-0.5 min-w-0">
+                <div className="text-xs space-y-1 min-w-0">
                   <p className="font-bold">
                     {saveError.title}
                     {saveError.code ? (
@@ -2331,14 +2428,45 @@ export function StationShiftView({
                       </span>
                     ) : null}
                   </p>
-                  <p className="text-red-900 leading-relaxed break-words">{saveError.detail}</p>
+                  <p className="text-red-900 leading-relaxed whitespace-pre-wrap break-words">
+                    {saveError.detail}
+                  </p>
+                  <div className="flex flex-wrap items-center gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setSaveErrorModalOpen(true)}
+                      className="min-h-[36px] inline-flex items-center px-2.5 py-1 text-xs font-semibold text-red-900 bg-white border border-red-200 rounded-lg hover:bg-red-100 cursor-pointer"
+                    >
+                      Ver motivo completo
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleCopyInlineSaveError}
+                      className="min-h-[36px] inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold text-white bg-stone-900 rounded-lg hover:bg-stone-800 cursor-pointer"
+                    >
+                      {copiedInlineError ? (
+                        <>
+                          <Check className="w-3.5 h-3.5 text-emerald-400" />
+                          ¡Error copiado!
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3.5 h-3.5" />
+                          Copiar error
+                        </>
+                      )}
+                    </button>
+                  </div>
                 </div>
               </div>
               <button
                 type="button"
-                onClick={() => setSaveError(null)}
+                onClick={() => {
+                  setSaveError(null);
+                  setSaveErrorModalOpen(false);
+                }}
                 aria-label="Cerrar error de guardado"
-                className="min-w-[44px] min-h-[44px] flex items-center justify-center text-red-700 hover:bg-red-100 rounded-xl shrink-0 cursor-pointer"
+                className="self-end sm:self-start min-w-[44px] min-h-[44px] flex items-center justify-center text-red-700 hover:bg-red-100 rounded-xl shrink-0 cursor-pointer"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -2449,6 +2577,18 @@ export function StationShiftView({
             </div>
           )}
 
+          {savingMode !== null && savingStatusText && (
+            <div
+              role="status"
+              className="px-4 py-2 bg-amber-50 border-b border-amber-200 text-amber-950"
+            >
+              <div className="max-w-lg mx-auto flex items-center gap-2 text-xs font-semibold">
+                <RefreshCw className="w-3.5 h-3.5 text-amber-700 animate-spin shrink-0" />
+                <span>{savingStatusText}</span>
+              </div>
+            </div>
+          )}
+
           {saveError && (
             <div
               role="alert"
@@ -2457,19 +2597,38 @@ export function StationShiftView({
               <div className="max-w-lg mx-auto flex items-start justify-between gap-2">
                 <div className="flex items-start gap-2 min-w-0">
                   <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
-                  <div className="text-xs min-w-0">
+                  <div className="text-xs min-w-0 space-y-1">
                     <p className="font-bold leading-snug">
                       {saveError.title}
                       {saveError.code ? (
                         <span className="ml-1.5 font-mono text-red-700">({saveError.code})</span>
                       ) : null}
                     </p>
-                    <p className="text-red-900 leading-snug mt-0.5 break-words">{saveError.detail}</p>
+                    <p className="text-red-900 leading-snug break-words">{saveError.detail}</p>
+                    <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                      <button
+                        type="button"
+                        onClick={() => setSaveErrorModalOpen(true)}
+                        className="min-h-[34px] px-2.5 py-1 text-[11px] font-semibold text-red-900 bg-white border border-red-200 rounded-lg cursor-pointer"
+                      >
+                        Ver motivo completo
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleCopyInlineSaveError}
+                        className="min-h-[34px] inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-semibold text-white bg-stone-900 rounded-lg cursor-pointer"
+                      >
+                        {copiedInlineError ? '¡Copiado!' : 'Copiar error'}
+                      </button>
+                    </div>
                   </div>
                 </div>
                 <button
                   type="button"
-                  onClick={() => setSaveError(null)}
+                  onClick={() => {
+                    setSaveError(null);
+                    setSaveErrorModalOpen(false);
+                  }}
                   aria-label="Cerrar error de guardado"
                   className="min-w-[44px] min-h-[44px] flex items-center justify-center text-red-700 hover:bg-red-100 rounded-xl shrink-0 cursor-pointer"
                 >
@@ -2483,11 +2642,13 @@ export function StationShiftView({
             <div className="max-w-lg mx-auto flex items-center gap-3">
               <div className="min-w-0 flex-1">
                 <p className="text-xs font-mono tabular-nums font-bold text-stone-900 truncate">
-                  {counts.pendingConfirm > 0
-                    ? `${counts.pendingConfirm} por confirmar`
-                    : counts.missingCount > 0
-                      ? `Faltan ${counts.missingCount} por contar`
-                      : `${counts.total} de ${counts.total} listos`}
+                  {savingMode !== null && savingStatusText
+                    ? savingStatusText
+                    : counts.pendingConfirm > 0
+                      ? `${counts.pendingConfirm} por confirmar`
+                      : counts.missingCount > 0
+                        ? `Faltan ${counts.missingCount} por contar`
+                        : `${counts.total} de ${counts.total} listos`}
                 </p>
                 <p className="text-[11px] text-stone-500 truncate">
                   {isWorkerOpeningPhase ? 'Apertura del día' : 'Cierre del día'}
@@ -2533,6 +2694,13 @@ export function StationShiftView({
         onConfirm={() =>
           confirmModalState && executeSave(confirmModalState.mode)
         }
+      />
+
+      {/* Full Uncut Save Error Modal with Copy button */}
+      <ShiftSaveErrorModal
+        open={saveError !== null && saveErrorModalOpen}
+        error={saveError}
+        onClose={() => setSaveErrorModalOpen(false)}
       />
       </div>
       {workerNotesFloatingUi}

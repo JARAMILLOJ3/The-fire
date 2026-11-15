@@ -4,6 +4,7 @@ import {
   deleteField,
   doc,
   getDoc,
+  getDocFromServer,
   serverTimestamp,
   setDoc,
   updateDoc,
@@ -64,12 +65,14 @@ export class DiagnosticSaveError extends Error {
   readonly detail: string;
   readonly failedDocumentPath: string;
   readonly code?: string;
+  readonly rawDetail?: string;
 
   constructor(params: {
     title: string;
     detail: string;
     failedDocumentPath: string;
     code?: string;
+    rawDetail?: string;
   }) {
     super(`${params.title}: ${params.detail}`);
     this.name = 'DiagnosticSaveError';
@@ -77,6 +80,7 @@ export class DiagnosticSaveError extends Error {
     this.detail = params.detail;
     this.failedDocumentPath = params.failedDocumentPath;
     this.code = params.code;
+    this.rawDetail = params.rawDetail;
   }
 }
 
@@ -155,12 +159,118 @@ export function evaluateReportSaveGuard(params: {
   };
 }
 
+export interface ServerItemsFetchResult {
+  itemsById: Record<string, InventoryItem>;
+  removedOrMovedIds: Set<string>;
+  offlineFallback: boolean;
+}
+
+function isFirebaseOfflineError(err: unknown): boolean {
+  const code =
+    err && typeof err === 'object' && 'code' in err && typeof (err as { code?: unknown }).code === 'string'
+      ? (err as { code: string }).code
+      : '';
+  const msg = err instanceof Error ? err.message.toLowerCase() : String(err ?? '').toLowerCase();
+  return (
+    code === 'unavailable' ||
+    msg.includes('offline') ||
+    msg.includes('unavailable') ||
+    msg.includes('failed to get document because the client is offline')
+  );
+}
+
+function isFirebasePermissionDeniedError(err: unknown): boolean {
+  const code =
+    err && typeof err === 'object' && 'code' in err && typeof (err as { code?: unknown }).code === 'string'
+      ? (err as { code: string }).code
+      : '';
+  const msg = err instanceof Error ? err.message.toLowerCase() : String(err ?? '').toLowerCase();
+  return code === 'permission-denied' || msg.includes('permission-denied') || msg.includes('insufficient permissions');
+}
+
+export async function fetchStationItemsFromServerMap(
+  workspaceId: string,
+  stationId: StationId,
+  itemIds: string[],
+): Promise<ServerItemsFetchResult> {
+  const uniqueIds = Array.from(new Set(itemIds.filter(Boolean)));
+  const itemsById: Record<string, InventoryItem> = {};
+  const removedOrMovedIds = new Set<string>();
+  let offlineFallback = false;
+
+  if (uniqueIds.length === 0) {
+    return { itemsById, removedOrMovedIds, offlineFallback };
+  }
+
+  perfMetrics.recordRead('items_server', uniqueIds.length);
+  await Promise.all(
+    uniqueIds.map(async (itemId) => {
+      const ref = doc(db, 'items', itemId);
+      try {
+        const snap = await getDocFromServer(ref);
+        if (!snap.exists()) {
+          removedOrMovedIds.add(itemId);
+          return;
+        }
+        const raw = snap.data() as Omit<InventoryItem, 'id'>;
+        const normalizedStation = raw.station === 'hamburguesas' ? 'comida_rapida' : raw.station;
+        if (raw.workspaceId !== workspaceId || normalizedStation !== stationId || !raw.active) {
+          removedOrMovedIds.add(itemId);
+          return;
+        }
+        itemsById[snap.id] = {
+          ...raw,
+          id: snap.id,
+          station: normalizedStation,
+        };
+      } catch (err) {
+        if (isFirebasePermissionDeniedError(err)) {
+          // Item may have been reassigned to another station or deleted without legacy ID prefix
+          removedOrMovedIds.add(itemId);
+          return;
+        }
+        if (isFirebaseOfflineError(err)) {
+          offlineFallback = true;
+          try {
+            const cachedSnap = await getDoc(ref);
+            if (cachedSnap.exists()) {
+              const raw = cachedSnap.data() as Omit<InventoryItem, 'id'>;
+              const normalizedStation = raw.station === 'hamburguesas' ? 'comida_rapida' : raw.station;
+              if (raw.workspaceId === workspaceId && normalizedStation === stationId && raw.active) {
+                itemsById[cachedSnap.id] = {
+                  ...raw,
+                  id: cachedSnap.id,
+                  station: normalizedStation,
+                };
+              }
+            }
+          } catch {
+            // Keep existing row data if both server and cache fail offline
+          }
+          return;
+        }
+        handleFirestoreError(err, OperationType.GET, `items/${itemId}`);
+      }
+    }),
+  );
+
+  return { itemsById, removedOrMovedIds, offlineFallback };
+}
+
 export async function fetchStationItemsOnce(
   workspaceId: string,
   stationId: StationId,
   itemIds: string[],
+  options?: { fromServer?: boolean },
 ): Promise<InventoryItem[]> {
   if (itemIds.length === 0) return [];
+  if (options?.fromServer) {
+    const { itemsById } = await fetchStationItemsFromServerMap(workspaceId, stationId, itemIds);
+    const list = Object.values(itemsById);
+    list.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name));
+    return list;
+  }
+
   perfMetrics.recordRead('items', itemIds.length);
   const snaps = await Promise.all(
     itemIds.map((itemId) =>
@@ -536,6 +646,476 @@ export function prepareStationReportEntries(params: {
   return ops;
 }
 
+export interface CatalogSyncRowResult {
+  rows: DraftEntryRow[];
+  updatedItemIds: string[];
+  removedItemIds: string[];
+  serverItems: InventoryItem[];
+}
+
+export function reconcileRowsWithServerCatalog(params: {
+  rows: DraftEntryRow[];
+  serverItemsById: Record<string, InventoryItem>;
+  removedOrMovedIds?: ReadonlySet<string>;
+  existingEntries: Record<string, DailyReportEntry>;
+}): CatalogSyncRowResult {
+  const { rows, serverItemsById, removedOrMovedIds, existingEntries } = params;
+  const updatedItemIds: string[] = [];
+  const removedItemIds: string[] = [];
+  const nextRows: DraftEntryRow[] = [];
+
+  rows.forEach((row) => {
+    if (removedOrMovedIds?.has(row.itemId) && !existingEntries[row.itemId]) {
+      removedItemIds.push(row.itemId);
+      return;
+    }
+    const serverItem = serverItemsById[row.itemId];
+    if (!serverItem) {
+      nextRows.push(row);
+      return;
+    }
+
+    const changed =
+      row.itemName !== serverItem.name ||
+      row.unit !== serverItem.unit ||
+      row.minStock !== serverItem.minStock ||
+      row.targetStock !== serverItem.targetStock;
+    if (changed) {
+      updatedItemIds.push(row.itemId);
+    }
+
+    nextRows.push({
+      ...row,
+      itemName: serverItem.name,
+      unit: serverItem.unit,
+      minStock: serverItem.minStock,
+      targetStock: serverItem.targetStock,
+    });
+  });
+
+  const serverItems = Object.values(serverItemsById).sort(
+    (a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name),
+  );
+
+  return {
+    rows: nextRows,
+    updatedItemIds,
+    removedItemIds,
+    serverItems,
+  };
+}
+
+export interface ServerReportReadResult {
+  exists: boolean;
+  data?: Partial<DailyReport>;
+  updatedAtMs: number | null;
+  offline?: boolean;
+}
+
+export interface BatchChunkReportWrite {
+  kind: 'set' | 'update';
+  payload: Record<string, unknown>;
+}
+
+export interface BatchChunkCommitInput {
+  reportId: string;
+  reportWrite?: BatchChunkReportWrite;
+  entryOps: PreparedEntryOp[];
+}
+
+export interface WorkerSaveIO {
+  syncClock: () => Promise<void>;
+  getServerTimestampValue: () => unknown;
+  fetchServerItems: (
+    workspaceId: string,
+    stationId: StationId,
+    itemIds: string[],
+  ) => Promise<ServerItemsFetchResult>;
+  fetchServerReport: (reportId: string) => Promise<ServerReportReadResult>;
+  fetchServerEntries: (
+    reportId: string,
+    itemIds: string[],
+  ) => Promise<Record<string, DailyReportEntry>>;
+  commitChunks: (chunks: BatchChunkCommitInput[], offline: boolean) => Promise<{ queuedOffline: boolean }>;
+  diagnoseChunkFailure: (params: {
+    batchError: unknown;
+    workspace: Workspace;
+    user: User;
+    canManage: boolean;
+    date: string;
+    station: StationId;
+    reportId: string;
+    reporterName: string;
+    cleanNotes: string;
+    authorizedEmails: string[];
+    serverExists: boolean;
+    firstStepReportStatus: ReportStatus;
+    effectiveStatus: ReportStatus;
+    entryOps: PreparedEntryOp[];
+  }) => Promise<void>;
+}
+
+function extractFirebaseCode(error: unknown): string | undefined {
+  return error &&
+    typeof error === 'object' &&
+    'code' in error &&
+    typeof (error as { code?: unknown }).code === 'string'
+    ? (error as { code: string }).code
+    : undefined;
+}
+
+function extractRawErrorText(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error ?? '');
+}
+
+function createDefaultWorkerSaveIO(): WorkerSaveIO {
+  return {
+    syncClock: async () => {
+      await syncServerClockOffset();
+    },
+    getServerTimestampValue: () => serverTimestamp(),
+    fetchServerItems: (workspaceId, stationId, itemIds) =>
+      fetchStationItemsFromServerMap(workspaceId, stationId, itemIds),
+    fetchServerReport: async (reportId) => {
+      const reportRef = doc(db, 'dailyReports', reportId);
+      try {
+        let serverSnap;
+        try {
+          serverSnap = await getDocFromServer(reportRef);
+        } catch (serverErr) {
+          if (isFirebaseOfflineError(serverErr)) {
+            serverSnap = await getDoc(reportRef);
+          } else {
+            throw serverErr;
+          }
+        }
+        if (!serverSnap.exists()) {
+          return { exists: false, updatedAtMs: null };
+        }
+        const data = serverSnap.data() as Partial<DailyReport>;
+        const updatedAtMs =
+          data.updatedAt && typeof data.updatedAt.toMillis === 'function'
+            ? data.updatedAt.toMillis()
+            : null;
+        return { exists: true, data, updatedAtMs };
+      } catch (err) {
+        if (isFirebaseOfflineError(err)) {
+          return { exists: false, updatedAtMs: null, offline: true };
+        }
+        handleFirestoreError(err, OperationType.GET, `dailyReports/${reportId}`);
+      }
+    },
+    fetchServerEntries: async (reportId, itemIds) => {
+      if (itemIds.length === 0) return {};
+      const map: Record<string, DailyReportEntry> = {};
+      try {
+        const fetched = await Promise.all(
+          itemIds.map((itemId) => getDoc(doc(db, 'dailyReports', reportId, 'entries', itemId))),
+        );
+        fetched.forEach((snap) => {
+          if (snap.exists()) {
+            const entry = { id: snap.id, ...snap.data() } as DailyReportEntry;
+            map[entry.itemId] = entry;
+          }
+        });
+      } catch {
+        // Proceed with existing entries if offline
+      }
+      return map;
+    },
+    commitChunks: async (chunks, offline) => {
+      const batches = chunks.map((chunk) => {
+        const b = writeBatch(db);
+        const reportRef = doc(db, 'dailyReports', chunk.reportId);
+        if (chunk.reportWrite) {
+          if (chunk.reportWrite.kind === 'update') {
+            b.update(reportRef, chunk.reportWrite.payload);
+          } else {
+            b.set(reportRef, chunk.reportWrite.payload);
+          }
+        }
+        chunk.entryOps.forEach((op) => {
+          const ref = doc(db, 'dailyReports', chunk.reportId, 'entries', op.itemId);
+          if (op.kind === 'update') {
+            b.update(ref, op.updateFields);
+          } else {
+            b.set(ref, op.createFields);
+          }
+        });
+        return b;
+      });
+
+      if (offline) {
+        Promise.all(batches.map((b) => b.commit())).catch((error) => {
+          console.error('Error al sincronizar envío offline al reconectar:', error);
+        });
+        return { queuedOffline: true };
+      }
+
+      for (const b of batches) {
+        await b.commit();
+      }
+      return { queuedOffline: false };
+    },
+    diagnoseChunkFailure: async ({
+      batchError,
+      workspace,
+      user,
+      canManage,
+      date,
+      station,
+      reportId,
+      reporterName,
+      cleanNotes,
+      authorizedEmails,
+      serverExists,
+      firstStepReportStatus,
+      effectiveStatus,
+      entryOps,
+    }) => {
+      const reportRef = doc(db, 'dailyReports', reportId);
+      const batchRawText = extractRawErrorText(batchError);
+
+      let liveReportExists = serverExists;
+      try {
+        const liveReportSnap = await getDocFromServer(reportRef);
+        liveReportExists = liveReportSnap.exists();
+      } catch {
+        // Keep prior knowledge if read fails
+      }
+
+      try {
+        if (liveReportExists) {
+          await updateDoc(reportRef, {
+            status: firstStepReportStatus,
+            reportedByUid: user.uid,
+            reportedByName: reporterName,
+            notes: cleanNotes,
+            updatedAt: serverTimestamp(),
+          });
+        } else {
+          await setDoc(reportRef, {
+            workspaceId: workspace.id,
+            ownerUid: workspace.ownerUid,
+            authorizedEmails,
+            date,
+            station,
+            status: firstStepReportStatus,
+            reportedByUid: user.uid,
+            reportedByName: reporterName,
+            notes: cleanNotes,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+      } catch (reportWriteError) {
+        const errCode = extractFirebaseCode(reportWriteError) ?? extractFirebaseCode(batchError);
+        const reasons: string[] = [];
+
+        if (!user.emailVerified) {
+          reasons.push('tu cuenta de Google no tiene email verificado');
+        }
+        if (!canManage) {
+          try {
+            const [memSnap, wsSnap, repSnap] = await Promise.all([
+              getDocFromServer(doc(db, 'teamMembers', user.uid)),
+              getDocFromServer(doc(db, 'workspaces', workspace.id)),
+              getDocFromServer(reportRef),
+            ]);
+            if (!memSnap.exists()) {
+              reasons.push(`no existe teamMembers/${user.uid}`);
+            } else {
+              const m = memSnap.data() as Partial<TeamMember>;
+              if (!m.active) reasons.push('tu acceso en teamMembers está desactivado (active: false)');
+              if (m.workspaceId !== workspace.id) {
+                reasons.push(`teamMembers.workspaceId (${m.workspaceId}) no coincide con ${workspace.id}`);
+              }
+              if (m.station !== station) {
+                reasons.push(`teamMembers.station (${m.station}) no coincide con ${station}`);
+              }
+            }
+            if (wsSnap.exists()) {
+              const ws = wsSnap.data() as Partial<Workspace>;
+              if (ws.ownerUid !== workspace.ownerUid) {
+                reasons.push('el ownerUid del restaurante cambió en el servidor');
+              }
+              if (ws.shiftSchedule?.enabled) {
+                reasons.push(
+                  `horario servidor habilitado (${ws.shiftSchedule.openingStart}–${ws.shiftSchedule.openingEnd} / ${ws.shiftSchedule.closingStart}–${ws.shiftSchedule.closingEnd}), fecha reporte: ${date}`,
+                );
+              }
+            }
+            if (repSnap.exists()) {
+              const r = repSnap.data() as Partial<DailyReport>;
+              if (r.status === 'completed') {
+                reasons.push('el reporte ya está marcado como completed');
+              }
+            }
+          } catch {
+            // Ignore secondary diagnostic read errors
+          }
+        }
+
+        const opLabel = liveReportExists ? 'actualización' : 'creación';
+        const detail =
+          reasons.length > 0
+            ? `Documento rechazado: dailyReports/${reportId} (${opLabel}). Motivo: ${reasons.join('; ')}.`
+            : `Documento rechazado: dailyReports/${reportId} (${opLabel}). Verifica el horario permitido, la fecha operativa (${date}) o que el reporte no esté bloqueado.`;
+        const rawDetail = `${detail}\nFirebase (${errCode ?? 'sin código'}): ${extractRawErrorText(reportWriteError) || batchRawText}`;
+
+        throw new DiagnosticSaveError({
+          title: 'Firebase rechazó el encabezado del reporte',
+          detail,
+          rawDetail,
+          failedDocumentPath: `dailyReports/${reportId}`,
+          code: errCode,
+        });
+      }
+
+      for (const op of entryOps) {
+        const entryRef = doc(db, 'dailyReports', reportId, 'entries', op.itemId);
+        let liveEntryExists = op.kind === 'update';
+        try {
+          const entrySnap = await getDocFromServer(entryRef);
+          liveEntryExists = entrySnap.exists();
+        } catch {
+          // Use expected op kind if pre-read fails
+        }
+
+        try {
+          if (liveEntryExists) {
+            await updateDoc(entryRef, op.updateFields);
+          } else {
+            await setDoc(entryRef, op.createFields);
+          }
+        } catch (entryWriteError) {
+          const errCode = extractFirebaseCode(entryWriteError) ?? extractFirebaseCode(batchError);
+          const reasons: string[] = [];
+          let catalogMismatchDetected = false;
+
+          try {
+            let itemMissingOrDenied = false;
+            const itemPromise = getDocFromServer(doc(db, 'items', op.itemId)).catch((itemErr) => {
+              if (isFirebasePermissionDeniedError(itemErr)) {
+                itemMissingOrDenied = true;
+                return null;
+              }
+              return null;
+            });
+            const [itemSnap, repSnap, wsSnap] = await Promise.all([
+              itemPromise,
+              getDocFromServer(reportRef).catch(() => null),
+              getDocFromServer(doc(db, 'workspaces', workspace.id)).catch(() => null),
+            ]);
+
+            if (itemMissingOrDenied) {
+              catalogMismatchDetected = true;
+              reasons.push(`el insumo items/${op.itemId} ya no pertenece a este puesto o fue desasignado en el catálogo`);
+            } else if (itemSnap && !itemSnap.exists()) {
+              catalogMismatchDetected = true;
+              reasons.push(`el insumo items/${op.itemId} no existe en el servidor`);
+            } else if (itemSnap?.exists()) {
+              const it = itemSnap.data() as Partial<InventoryItem>;
+              if (it.workspaceId !== workspace.id) {
+                catalogMismatchDetected = true;
+                reasons.push(`workspaceId del catálogo (${it.workspaceId}) ≠ ${workspace.id}`);
+              }
+              if (it.station !== station && !(it.station === 'hamburguesas' && station === 'comida_rapida')) {
+                catalogMismatchDetected = true;
+                reasons.push(`puesto en catálogo (${it.station}) ≠ ${station}`);
+              }
+              if (it.name !== op.createFields.itemName) {
+                catalogMismatchDetected = true;
+                reasons.push(`nombre en catálogo ("${it.name}") ≠ "${String(op.createFields.itemName)}"`);
+              }
+              if (it.unit !== op.createFields.unit) {
+                catalogMismatchDetected = true;
+                reasons.push(`unidad en catálogo ("${it.unit}") ≠ "${String(op.createFields.unit)}"`);
+              }
+              if (it.minStock !== op.createFields.minStock) {
+                catalogMismatchDetected = true;
+                reasons.push(`minStock en catálogo (${it.minStock}) ≠ ${String(op.createFields.minStock)}`);
+              }
+              if (it.targetStock !== op.createFields.targetStock) {
+                catalogMismatchDetected = true;
+                reasons.push(`targetStock en catálogo (${it.targetStock}) ≠ ${String(op.createFields.targetStock)}`);
+              }
+            }
+
+            if (repSnap?.exists()) {
+              const rep = repSnap.data() as Partial<DailyReport>;
+              if (rep.status === 'completed') {
+                reasons.push(`dailyReports/${reportId} está en estado completed`);
+              }
+              if (rep.ownerUid && rep.ownerUid !== workspace.ownerUid) {
+                reasons.push(`ownerUid del reporte (${rep.ownerUid}) ≠ ${workspace.ownerUid}`);
+              }
+            } else if (repSnap) {
+              reasons.push(`no existe dailyReports/${reportId}`);
+            }
+
+            if (wsSnap?.exists()) {
+              const ws = wsSnap.data() as Partial<Workspace>;
+              if (ws.ownerUid !== workspace.ownerUid) {
+                reasons.push(`ownerUid del restaurante (${ws.ownerUid}) ≠ ${workspace.ownerUid}`);
+              }
+              if (ws.shiftSchedule?.enabled) {
+                reasons.push(
+                  `ventana configurada en servidor (${ws.shiftSchedule.openingStart}–${ws.shiftSchedule.openingEnd} / ${ws.shiftSchedule.closingStart}–${ws.shiftSchedule.closingEnd}), fecha: ${date}`,
+                );
+              }
+            }
+          } catch {
+            // Ignore secondary diagnostic read errors
+          }
+
+          const entryPath = `dailyReports/${reportId}/entries/${op.itemId}`;
+          const opLabel = liveEntryExists ? 'actualización' : 'creación';
+          const detail =
+            reasons.length > 0
+              ? `Documento rechazado: ${entryPath} ("${op.itemName}", ${opLabel}). Motivo: ${reasons.join('; ')}.`
+              : `Documento rechazado: ${entryPath} ("${op.itemName}", ${opLabel}). Revisa que el insumo coincida con el catálogo o que el horario siga activo.`;
+          const rawEntryText = extractRawErrorText(entryWriteError) || batchRawText;
+          const rawDetail = `${detail}\nFirebase (${errCode ?? 'sin código'}): ${rawEntryText}`;
+
+          throw new DiagnosticSaveError({
+            title: catalogMismatchDetected
+              ? `El catálogo de "${op.itemName}" cambió en el servidor`
+              : `Error al guardar insumo "${op.itemName}"`,
+            detail,
+            rawDetail,
+            failedDocumentPath: entryPath,
+            code: catalogMismatchDetected ? 'catalog-mismatch' : errCode,
+          });
+        }
+      }
+
+      if (effectiveStatus !== firstStepReportStatus) {
+        try {
+          await updateDoc(reportRef, {
+            status: effectiveStatus,
+            reportedByUid: user.uid,
+            reportedByName: reporterName,
+            notes: cleanNotes,
+            updatedAt: serverTimestamp(),
+          });
+        } catch (finalizeError) {
+          const errCode = extractFirebaseCode(finalizeError) ?? extractFirebaseCode(batchError);
+          const rawDetail = `No se pudo marcar el cierre de dailyReports/${reportId}.\nFirebase (${errCode ?? 'sin código'}): ${extractRawErrorText(finalizeError) || batchRawText}`;
+          throw new DiagnosticSaveError({
+            title: 'Error al finalizar el cierre del reporte',
+            detail: `Se guardaron los insumos, pero Firebase rechazó cerrar dailyReports/${reportId}.`,
+            rawDetail,
+            failedDocumentPath: `dailyReports/${reportId}`,
+            code: errCode,
+          });
+        }
+      }
+    },
+  };
+}
+
 export async function saveStationReportBatch(params: {
   workspace: Workspace;
   user: User;
@@ -550,7 +1130,10 @@ export async function saveStationReportBatch(params: {
   expectedUpdatedAtMs?: number | null;
   forceOverwrite?: boolean;
   now?: Date;
-}): Promise<{ queuedOffline: boolean }> {
+  onStatusMessage?: (message: string) => void;
+  onCatalogSynced?: (items: InventoryItem[]) => void;
+  io?: Partial<WorkerSaveIO>;
+}): Promise<{ queuedOffline: boolean; catalogUpdatedDuringSave?: boolean }> {
   const {
     workspace,
     user,
@@ -565,7 +1148,22 @@ export async function saveStationReportBatch(params: {
     expectedUpdatedAtMs,
     forceOverwrite,
     now: providedNow,
+    onStatusMessage,
+    onCatalogSynced,
+    io: customIO,
   } = params;
+
+  const defaultIO = createDefaultWorkerSaveIO();
+  const io: WorkerSaveIO = {
+    syncClock: customIO?.syncClock ?? defaultIO.syncClock,
+    getServerTimestampValue: customIO?.getServerTimestampValue ?? defaultIO.getServerTimestampValue,
+    fetchServerItems: customIO?.fetchServerItems ?? defaultIO.fetchServerItems,
+    fetchServerReport: customIO?.fetchServerReport ?? defaultIO.fetchServerReport,
+    fetchServerEntries: customIO?.fetchServerEntries ?? defaultIO.fetchServerEntries,
+    commitChunks: customIO?.commitChunks ?? defaultIO.commitChunks,
+    diagnoseChunkFailure: customIO?.diagnoseChunkFailure ?? defaultIO.diagnoseChunkFailure,
+  };
+
   const reportId = `${workspace.id}_${date}_${station}`;
   const reporterName = clampString(
     user.displayName || user.email?.split('@')[0] || 'Encargada',
@@ -573,11 +1171,10 @@ export async function saveStationReportBatch(params: {
   );
   const cleanNotes = clampString(notes, MAX_NOTES_LENGTH);
   const authorizedEmails = buildNormalizedAuthorizedEmails(workspace);
-  const reportRef = doc(db, 'dailyReports', reportId);
 
-  let detectedOffline = typeof navigator !== 'undefined' && !navigator.onLine;
+  let detectedOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
   if (!detectedOffline && !providedNow) {
-    await syncServerClockOffset();
+    await io.syncClock();
   }
   const effectiveNow = providedNow ?? getServerNow();
   validateWorkerSubmitPhase({
@@ -588,431 +1185,231 @@ export async function saveStationReportBatch(params: {
     reportPath: `dailyReports/${reportId}`,
   });
 
-  let serverExists = Boolean(existingReport);
-  let serverStatus: ReportStatus | undefined = existingReport?.status;
-  let serverUpdatedAtMs: number | null = existingReport?.updatedAt?.toMillis?.() ?? null;
-  let serverUpdatedByName: string | undefined = existingReport?.reportedByName;
+  let catalogUpdatedDuringSave = false;
+  let activeRows = rows;
+  const mergedExistingEntries: Record<string, DailyReportEntry> = { ...existingEntries };
+  let retriedAfterCatalogMismatch = false;
 
-  if (!detectedOffline) {
-    try {
-      const serverSnap = await getDoc(reportRef);
-      serverExists = serverSnap.exists();
-      if (serverExists) {
-        const data = serverSnap.data() as Partial<DailyReport>;
-        serverStatus = data.status;
-        serverUpdatedAtMs =
-          data.updatedAt && typeof data.updatedAt.toMillis === 'function'
-            ? data.updatedAt.toMillis()
-            : null;
-        serverUpdatedByName = data.reportedByName;
-      } else {
-        serverStatus = undefined;
-        serverUpdatedAtMs = null;
-        serverUpdatedByName = undefined;
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message.toLowerCase() : '';
-      const isOffline = msg.includes('offline') || msg.includes('unavailable');
-      if (isOffline) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    // Step 1: Read the station items being saved directly from the server (never from cache)
+    if (!detectedOffline && activeRows.length > 0) {
+      const serverCatalog = await io.fetchServerItems(
+        workspace.id,
+        station,
+        activeRows.map((r) => r.itemId),
+      );
+      if (serverCatalog.offlineFallback) {
         detectedOffline = true;
       } else {
-        handleFirestoreError(err, OperationType.GET, `dailyReports/${reportId}`);
-      }
-    }
-  }
-
-  const guard = evaluateReportSaveGuard({
-    mode,
-    canManage,
-    expectedUpdatedAtMs,
-    forceOverwrite,
-    serverExists,
-    serverStatus,
-    serverUpdatedAtMs,
-    serverUpdatedByName,
-  });
-
-  if (!guard.ok) {
-    throw new ConcurrencyConflictError(guard.message, guard.reason, {
-      serverUpdatedByName,
-      serverStatus,
-    });
-  }
-
-  const mergedExistingEntries: Record<string, DailyReportEntry> = { ...existingEntries };
-  if (!detectedOffline && serverExists) {
-    const missingIds = rows
-      .map((r) => r.itemId)
-      .filter((id) => !mergedExistingEntries[id]);
-    if (missingIds.length > 0) {
-      try {
-        const fetched = await Promise.all(
-          missingIds.map((itemId) => getDoc(doc(db, 'dailyReports', reportId, 'entries', itemId))),
-        );
-        fetched.forEach((snap) => {
-          if (snap.exists()) {
-            const entry = { id: snap.id, ...snap.data() } as DailyReportEntry;
-            mergedExistingEntries[entry.itemId] = entry;
+        const reconciled = reconcileRowsWithServerCatalog({
+          rows: activeRows,
+          serverItemsById: serverCatalog.itemsById,
+          removedOrMovedIds: serverCatalog.removedOrMovedIds,
+          existingEntries: mergedExistingEntries,
+        });
+        activeRows = reconciled.rows;
+        if (
+          attempt > 0 ||
+          reconciled.updatedItemIds.length > 0 ||
+          reconciled.removedItemIds.length > 0
+        ) {
+          catalogUpdatedDuringSave = true;
+          if (reconciled.serverItems.length > 0) {
+            onCatalogSynced?.(reconciled.serverItems);
           }
-        });
-      } catch {
-        // Proceed with client snapshot if offline
-      }
-    }
-  }
-
-  const preparedOps = prepareStationReportEntries({
-    workspace,
-    userUid: user.uid,
-    reporterName,
-    canManage,
-    date,
-    station,
-    reportId,
-    mode,
-    rows,
-    mergedExistingEntries,
-    authorizedEmails,
-    timestampValue: serverTimestamp(),
-  });
-
-  interface EntryWriteOp {
-    itemId: string;
-    itemName: string;
-    ref: ReturnType<typeof doc>;
-    kind: 'update' | 'set';
-    payload: Record<string, unknown>;
-    updatePayload: Record<string, unknown>;
-    createPayload: Record<string, unknown>;
-  }
-
-  const entryOperations: EntryWriteOp[] = preparedOps.map((op) => ({
-    itemId: op.itemId,
-    itemName: op.itemName,
-    ref: doc(db, 'dailyReports', reportId, 'entries', op.itemId),
-    kind: op.kind,
-    payload: op.kind === 'update' ? op.updateFields : op.createFields,
-    updatePayload: op.updateFields,
-    createPayload: op.createFields,
-  }));
-
-  const MAX_ENTRIES_PER_BATCH = MAX_BATCH_SIZE;
-  const entryChunks: EntryWriteOp[][] = [];
-  if (entryOperations.length === 0) {
-    entryChunks.push([]);
-  } else {
-    for (let i = 0; i < entryOperations.length; i += MAX_ENTRIES_PER_BATCH) {
-      entryChunks.push(entryOperations.slice(i, i + MAX_ENTRIES_PER_BATCH));
-    }
-  }
-
-  const intermediateStatus: ReportStatus =
-    serverExists && serverStatus === 'completed' ? 'completed' : 'opening_saved';
-
-  const batches = entryChunks.map((chunk, chunkIdx) => {
-    const chunkBatch = writeBatch(db);
-    const isFirst = chunkIdx === 0;
-    const isLast = chunkIdx === entryChunks.length - 1;
-    const chunkStatus = isLast ? guard.effectiveStatus : intermediateStatus;
-
-    if (isFirst) {
-      if (serverExists) {
-        chunkBatch.update(reportRef, {
-          status: chunkStatus,
-          reportedByUid: user.uid,
-          reportedByName: reporterName,
-          notes: cleanNotes,
-          updatedAt: serverTimestamp(),
-        });
-      } else {
-        chunkBatch.set(reportRef, {
-          workspaceId: workspace.id,
-          ownerUid: workspace.ownerUid,
-          authorizedEmails,
-          date,
-          station,
-          status: chunkStatus,
-          reportedByUid: user.uid,
-          reportedByName: reporterName,
-          notes: cleanNotes,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-      }
-    } else if (isLast) {
-      chunkBatch.update(reportRef, {
-        status: guard.effectiveStatus,
-        reportedByUid: user.uid,
-        reportedByName: reporterName,
-        notes: cleanNotes,
-        updatedAt: serverTimestamp(),
-      });
-    }
-
-    chunk.forEach((op) => {
-      if (op.kind === 'update') {
-        chunkBatch.update(op.ref, op.payload);
-      } else {
-        chunkBatch.set(op.ref, op.payload);
-      }
-    });
-
-    return chunkBatch;
-  });
-
-  if (detectedOffline) {
-    Promise.all(batches.map((b) => b.commit())).catch((error) => {
-      console.error('Error al sincronizar envío offline al reconectar:', error);
-    });
-    return { queuedOffline: true };
-  }
-
-  const extractFirebaseCode = (error: unknown): string | undefined =>
-    error &&
-    typeof error === 'object' &&
-    'code' in error &&
-    typeof (error as { code?: unknown }).code === 'string'
-      ? (error as { code: string }).code
-      : undefined;
-
-  try {
-    for (const b of batches) {
-      await b.commit();
-    }
-    return { queuedOffline: false };
-  } catch (batchError) {
-    console.warn(
-      `[saveStationReportBatch] Lote rechazado (${extractFirebaseCode(batchError) ?? 'error'}). Iniciando diagnóstico documento por documento...`,
-      batchError,
-    );
-
-    let liveReportExists = serverExists;
-    try {
-      const liveReportSnap = await getDoc(reportRef);
-      liveReportExists = liveReportSnap.exists();
-    } catch {
-      // Keep prior knowledge if read fails
-    }
-
-    const firstStepReportStatus: ReportStatus =
-      entryOperations.length === 0 ? guard.effectiveStatus : intermediateStatus;
-
-    try {
-      if (liveReportExists) {
-        await updateDoc(reportRef, {
-          status: firstStepReportStatus,
-          reportedByUid: user.uid,
-          reportedByName: reporterName,
-          notes: cleanNotes,
-          updatedAt: serverTimestamp(),
-        });
-      } else {
-        await setDoc(reportRef, {
-          workspaceId: workspace.id,
-          ownerUid: workspace.ownerUid,
-          authorizedEmails,
-          date,
-          station,
-          status: firstStepReportStatus,
-          reportedByUid: user.uid,
-          reportedByName: reporterName,
-          notes: cleanNotes,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-      }
-    } catch (reportWriteError) {
-      const errCode = extractFirebaseCode(reportWriteError) ?? extractFirebaseCode(batchError);
-      const reasons: string[] = [];
-
-      if (!user.emailVerified) {
-        reasons.push('tu cuenta de Google no tiene email verificado');
-      }
-      if (!canManage) {
-        try {
-          const [memSnap, wsSnap, repSnap] = await Promise.all([
-            getDoc(doc(db, 'teamMembers', user.uid)),
-            getDoc(doc(db, 'workspaces', workspace.id)),
-            getDoc(reportRef),
-          ]);
-          if (!memSnap.exists()) {
-            reasons.push(`no existe teamMembers/${user.uid}`);
-          } else {
-            const m = memSnap.data() as Partial<TeamMember>;
-            if (!m.active) reasons.push('tu acceso en teamMembers está desactivado (active: false)');
-            if (m.workspaceId !== workspace.id) {
-              reasons.push(`teamMembers.workspaceId (${m.workspaceId}) no coincide con ${workspace.id}`);
-            }
-            if (m.station !== station) {
-              reasons.push(`teamMembers.station (${m.station}) no coincide con ${station}`);
-            }
-          }
-          if (wsSnap.exists()) {
-            const ws = wsSnap.data() as Partial<Workspace>;
-            if (ws.ownerUid !== workspace.ownerUid) {
-              reasons.push('el ownerUid del restaurante cambió en el servidor');
-            }
-            if (ws.shiftSchedule?.enabled) {
-              reasons.push(
-                `horario servidor habilitado (${ws.shiftSchedule.openingStart}–${ws.shiftSchedule.openingEnd} / ${ws.shiftSchedule.closingStart}–${ws.shiftSchedule.closingEnd}), fecha reporte: ${date}`,
-              );
-            }
-          }
-          if (repSnap.exists()) {
-            const r = repSnap.data() as Partial<DailyReport>;
-            if (r.status === 'completed') {
-              reasons.push('el reporte ya está marcado como completed');
-            }
-          }
-        } catch {
-          // Ignore secondary diagnostic read errors
         }
       }
-
-      const opLabel = liveReportExists ? 'actualización' : 'creación';
-      const detail =
-        reasons.length > 0
-          ? `Documento rechazado: dailyReports/${reportId} (${opLabel}). Motivo: ${reasons.join('; ')}.`
-          : `Documento rechazado: dailyReports/${reportId} (${opLabel}). Verifica el horario permitido, la fecha operativa (${date}) o que el reporte no esté bloqueado.`;
-
-      console.error('Firestore Diagnostic Report Error:', {
-        path: `dailyReports/${reportId}`,
-        code: errCode,
-        reasons,
-        reportWriteError,
-      });
-
-      throw new DiagnosticSaveError({
-        title: 'Firebase rechazó el encabezado del reporte',
-        detail,
-        failedDocumentPath: `dailyReports/${reportId}`,
-        code: errCode,
-      });
     }
 
-    for (const op of entryOperations) {
-      let liveEntryExists = op.kind === 'update';
-      try {
-        const entrySnap = await getDoc(op.ref);
-        liveEntryExists = entrySnap.exists();
-      } catch {
-        // Use expected op kind if pre-read fails
-      }
+    let serverExists = Boolean(existingReport);
+    let serverStatus: ReportStatus | undefined = existingReport?.status;
+    let serverUpdatedAtMs: number | null = existingReport?.updatedAt?.toMillis?.() ?? null;
+    let serverUpdatedByName: string | undefined = existingReport?.reportedByName;
+    let serverReportedByUid: string | undefined = existingReport?.reportedByUid;
 
-      try {
-        if (liveEntryExists) {
-          await updateDoc(op.ref, op.updatePayload);
+    if (!detectedOffline) {
+      const serverRep = await io.fetchServerReport(reportId);
+      if (serverRep.offline) {
+        detectedOffline = true;
+      } else {
+        serverExists = serverRep.exists;
+        if (serverRep.exists && serverRep.data) {
+          serverStatus = serverRep.data.status;
+          serverUpdatedAtMs = serverRep.updatedAtMs;
+          serverUpdatedByName = serverRep.data.reportedByName;
+          serverReportedByUid = serverRep.data.reportedByUid;
         } else {
-          await setDoc(op.ref, op.createPayload);
+          serverStatus = undefined;
+          serverUpdatedAtMs = null;
+          serverUpdatedByName = undefined;
+          serverReportedByUid = undefined;
         }
-      } catch (entryWriteError) {
-        const errCode = extractFirebaseCode(entryWriteError) ?? extractFirebaseCode(batchError);
-        const reasons: string[] = [];
-
-        try {
-          const [itemSnap, repSnap, wsSnap] = await Promise.all([
-            getDoc(doc(db, 'items', op.itemId)),
-            getDoc(reportRef),
-            getDoc(doc(db, 'workspaces', workspace.id)),
-          ]);
-
-          if (!itemSnap.exists()) {
-            reasons.push(`el insumo items/${op.itemId} no existe en el servidor`);
-          } else {
-            const it = itemSnap.data() as Partial<InventoryItem>;
-            if (it.workspaceId !== workspace.id) {
-              reasons.push(`workspaceId del catálogo (${it.workspaceId}) ≠ ${workspace.id}`);
-            }
-            if (it.station !== station && !(it.station === 'hamburguesas' && station === 'comida_rapida')) {
-              reasons.push(`puesto en catálogo (${it.station}) ≠ ${station}`);
-            }
-            if (it.name !== op.createPayload.itemName) {
-              reasons.push(`nombre en catálogo ("${it.name}") ≠ "${String(op.createPayload.itemName)}"`);
-            }
-            if (it.unit !== op.createPayload.unit) {
-              reasons.push(`unidad en catálogo ("${it.unit}") ≠ "${String(op.createPayload.unit)}"`);
-            }
-            if (it.minStock !== op.createPayload.minStock) {
-              reasons.push(`minStock en catálogo (${it.minStock}) ≠ ${String(op.createPayload.minStock)}`);
-            }
-            if (it.targetStock !== op.createPayload.targetStock) {
-              reasons.push(`targetStock en catálogo (${it.targetStock}) ≠ ${String(op.createPayload.targetStock)}`);
-            }
-          }
-
-          if (repSnap.exists()) {
-            const rep = repSnap.data() as Partial<DailyReport>;
-            if (rep.status === 'completed') {
-              reasons.push(`dailyReports/${reportId} está en estado completed`);
-            }
-            if (rep.ownerUid && rep.ownerUid !== workspace.ownerUid) {
-              reasons.push(`ownerUid del reporte (${rep.ownerUid}) ≠ ${workspace.ownerUid}`);
-            }
-          } else {
-            reasons.push(`no existe dailyReports/${reportId}`);
-          }
-
-          if (wsSnap.exists()) {
-            const ws = wsSnap.data() as Partial<Workspace>;
-            if (ws.ownerUid !== workspace.ownerUid) {
-              reasons.push(`ownerUid del restaurante (${ws.ownerUid}) ≠ ${workspace.ownerUid}`);
-            }
-            if (ws.shiftSchedule?.enabled) {
-              reasons.push(
-                `ventana configurada en servidor (${ws.shiftSchedule.openingStart}–${ws.shiftSchedule.openingEnd} / ${ws.shiftSchedule.closingStart}–${ws.shiftSchedule.closingEnd}), fecha: ${date}`,
-              );
-            }
-          }
-        } catch {
-          // Ignore secondary diagnostic read errors
-        }
-
-        const entryPath = `dailyReports/${reportId}/entries/${op.itemId}`;
-        const opLabel = liveEntryExists ? 'actualización' : 'creación';
-        const detail =
-          reasons.length > 0
-            ? `Documento rechazado: ${entryPath} ("${op.itemName}", ${opLabel}). Motivo: ${reasons.join('; ')}.`
-            : `Documento rechazado: ${entryPath} ("${op.itemName}", ${opLabel}). Revisa que el insumo coincida con el catálogo o que el horario siga activo.`;
-
-        console.error('Firestore Diagnostic Entry Error:', {
-          path: entryPath,
-          itemName: op.itemName,
-          code: errCode,
-          reasons,
-          entryWriteError,
-        });
-
-        throw new DiagnosticSaveError({
-          title: `Error al guardar insumo "${op.itemName}"`,
-          detail,
-          failedDocumentPath: entryPath,
-          code: errCode,
-        });
       }
     }
 
-    if (guard.effectiveStatus !== firstStepReportStatus) {
+    // If our own diagnostic pass in attempt 0 touched the report header before failing on a catalog mismatch,
+    // allow attempt 1 (same user retry) to continue instead of tripping our own concurrent_create/update guard.
+    const selfDiagnosticHeaderTouched =
+      retriedAfterCatalogMismatch && serverExists && serverReportedByUid === user.uid;
+
+    const guard = evaluateReportSaveGuard({
+      mode,
+      canManage,
+      expectedUpdatedAtMs,
+      forceOverwrite: Boolean(forceOverwrite || selfDiagnosticHeaderTouched),
+      serverExists,
+      serverStatus,
+      serverUpdatedAtMs,
+      serverUpdatedByName,
+    });
+
+    if (!guard.ok) {
+      throw new ConcurrencyConflictError(guard.message, guard.reason, {
+        serverUpdatedByName,
+        serverStatus,
+      });
+    }
+
+    if (!detectedOffline && serverExists) {
+      const missingIds = activeRows
+        .map((r) => r.itemId)
+        .filter((id) => !mergedExistingEntries[id]);
+      if (missingIds.length > 0) {
+        const fetchedEntries = await io.fetchServerEntries(reportId, missingIds);
+        Object.assign(mergedExistingEntries, fetchedEntries);
+      }
+    }
+
+    const preparedOps = prepareStationReportEntries({
+      workspace,
+      userUid: user.uid,
+      reporterName,
+      canManage,
+      date,
+      station,
+      reportId,
+      mode,
+      rows: activeRows,
+      mergedExistingEntries,
+      authorizedEmails,
+      timestampValue: io.getServerTimestampValue(),
+    });
+
+    const entryChunks: PreparedEntryOp[][] = [];
+    if (preparedOps.length === 0) {
+      entryChunks.push([]);
+    } else {
+      for (let i = 0; i < preparedOps.length; i += MAX_BATCH_SIZE) {
+        entryChunks.push(preparedOps.slice(i, i + MAX_BATCH_SIZE));
+      }
+    }
+
+    const intermediateStatus: ReportStatus =
+      serverExists && serverStatus === 'completed' ? 'completed' : 'opening_saved';
+
+    const chunkInputs: BatchChunkCommitInput[] = entryChunks.map((chunk, chunkIdx) => {
+      const isFirst = chunkIdx === 0;
+      const isLast = chunkIdx === entryChunks.length - 1;
+      const chunkStatus = isLast ? guard.effectiveStatus : intermediateStatus;
+
+      let reportWrite: BatchChunkReportWrite | undefined;
+      if (isFirst) {
+        reportWrite = serverExists
+          ? {
+              kind: 'update',
+              payload: {
+                status: chunkStatus,
+                reportedByUid: user.uid,
+                reportedByName: reporterName,
+                notes: cleanNotes,
+                updatedAt: io.getServerTimestampValue(),
+              },
+            }
+          : {
+              kind: 'set',
+              payload: {
+                workspaceId: workspace.id,
+                ownerUid: workspace.ownerUid,
+                authorizedEmails,
+                date,
+                station,
+                status: chunkStatus,
+                reportedByUid: user.uid,
+                reportedByName: reporterName,
+                notes: cleanNotes,
+                createdAt: io.getServerTimestampValue(),
+                updatedAt: io.getServerTimestampValue(),
+              },
+            };
+      } else if (isLast) {
+        reportWrite = {
+          kind: 'update',
+          payload: {
+            status: guard.effectiveStatus,
+            reportedByUid: user.uid,
+            reportedByName: reporterName,
+            notes: cleanNotes,
+            updatedAt: io.getServerTimestampValue(),
+          },
+        };
+      }
+
+      return {
+        reportId,
+        reportWrite,
+        entryOps: chunk,
+      };
+    });
+
+    try {
+      const commitRes = await io.commitChunks(chunkInputs, detectedOffline);
+      return {
+        queuedOffline: commitRes.queuedOffline,
+        catalogUpdatedDuringSave,
+      };
+    } catch (batchError) {
+      const firstStepReportStatus: ReportStatus =
+        preparedOps.length === 0 ? guard.effectiveStatus : intermediateStatus;
+
       try {
-        await updateDoc(reportRef, {
-          status: guard.effectiveStatus,
-          reportedByUid: user.uid,
-          reportedByName: reporterName,
-          notes: cleanNotes,
-          updatedAt: serverTimestamp(),
+        await io.diagnoseChunkFailure({
+          batchError,
+          workspace,
+          user,
+          canManage,
+          date,
+          station,
+          reportId,
+          reporterName,
+          cleanNotes,
+          authorizedEmails,
+          serverExists,
+          firstStepReportStatus,
+          effectiveStatus: guard.effectiveStatus,
+          entryOps: preparedOps,
         });
-      } catch (finalizeError) {
-        const errCode = extractFirebaseCode(finalizeError) ?? extractFirebaseCode(batchError);
-        throw new DiagnosticSaveError({
-          title: 'Error al finalizar el cierre del reporte',
-          detail: `Se guardaron los insumos, pero Firebase rechazó cerrar dailyReports/${reportId}.`,
-          failedDocumentPath: `dailyReports/${reportId}`,
-          code: errCode,
-        });
+        return {
+          queuedOffline: false,
+          catalogUpdatedDuringSave,
+        };
+      } catch (diagnosedError) {
+        const isCatalogMismatch =
+          diagnosedError instanceof DiagnosticSaveError && diagnosedError.code === 'catalog-mismatch';
+
+        // Step 2: If save failed due to catalog mismatch, refresh items & retry ONCE automatically
+        if (attempt === 0 && !detectedOffline && isCatalogMismatch) {
+          retriedAfterCatalogMismatch = true;
+          catalogUpdatedDuringSave = true;
+          onStatusMessage?.('El jefe actualizó los insumos, actualizando…');
+          continue;
+        }
+
+        throw diagnosedError;
       }
     }
-
-    return { queuedOffline: false };
   }
+
+  return { queuedOffline: false, catalogUpdatedDuringSave };
 }
 
 export async function createWorkerNote(params: {

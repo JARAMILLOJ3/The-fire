@@ -1540,4 +1540,57 @@ describe('inventory.ts (sanitización, sin_dato, anomalías y compras)', () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it('detects live catalog updates for open worker screens and formats full uncut copyable save errors', async () => {
+    const {
+      buildStationSaveErrorCopyText,
+      formatStationSaveError,
+      summarizeStationCatalogDiff,
+    } = await import('../inventory');
+    const { DiagnosticSaveError } = await import('../../services/workerService');
+
+    const baseItems: InventoryItem[] = [
+      makeItem({ id: 'asados_1', name: 'Queso', unit: 'kg', minStock: 2, targetStock: 6 }),
+      makeItem({ id: 'asados_2', name: 'Sal', unit: 'kg', minStock: 1, targetStock: 3 }),
+    ];
+
+    // Identical reload triggers no notice
+    expect(summarizeStationCatalogDiff(baseItems, [...baseItems])).toEqual({
+      changed: false,
+      changedCount: 0,
+      changedNames: [],
+    });
+
+    // Editing unit, minStock, and targetStock notifies affected item name
+    const editedItems: InventoryItem[] = [
+      makeItem({ id: 'asados_1', name: 'Queso', unit: 'loncha', minStock: 30, targetStock: 90 }),
+      baseItems[1],
+    ];
+    expect(summarizeStationCatalogDiff(baseItems, editedItems)).toEqual({
+      changed: true,
+      changedCount: 1,
+      changedNames: ['Queso'],
+    });
+
+    // Preserves full rawDetail, failedDocumentPath, and code for copying
+    const diagErr = new DiagnosticSaveError({
+      title: 'El catálogo de "Queso" cambió en el servidor',
+      detail: 'Documento rechazado: dailyReports/r1/entries/asados_1 ("Queso", creación).',
+      rawDetail: 'Detalle técnico largo sin recortar: permission-denied en entryMatchesItem',
+      failedDocumentPath: 'dailyReports/r1/entries/asados_1',
+      code: 'catalog-mismatch',
+    });
+
+    const formatted = formatStationSaveError(diagErr, { isOnline: true, schedulePhase: 'opening' });
+    expect(formatted.code).toBe('catalog-mismatch');
+    expect(formatted.failedDocumentPath).toBe('dailyReports/r1/entries/asados_1');
+    expect(formatted.rawDetail).toContain('Detalle técnico largo sin recortar');
+
+    const copyText = buildStationSaveErrorCopyText(formatted);
+    expect(copyText).toContain('Error: Un insumo no coincide con el catálogo actual del jefe');
+    expect(copyText).toContain('Código: catalog-mismatch');
+    expect(copyText).toContain('Documento: dailyReports/r1/entries/asados_1');
+    expect(copyText).toContain('Detalle técnico largo sin recortar');
+  });
 });
+

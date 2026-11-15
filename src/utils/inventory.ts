@@ -1445,6 +1445,8 @@ export interface StationSaveErrorInfo {
   title: string;
   detail: string;
   code?: string;
+  rawDetail?: string;
+  failedDocumentPath?: string;
 }
 
 export function formatStationSaveError(
@@ -1463,7 +1465,24 @@ export function formatStationSaveError(
       ? (error as { code: string }).code
       : undefined;
 
-  let rawMessage = error instanceof Error ? error.message : String(error ?? '');
+  const failedDocumentPath =
+    error &&
+    typeof error === 'object' &&
+    'failedDocumentPath' in error &&
+    typeof (error as { failedDocumentPath?: unknown }).failedDocumentPath === 'string'
+      ? (error as { failedDocumentPath: string }).failedDocumentPath
+      : undefined;
+
+  const explicitRawDetail =
+    error &&
+    typeof error === 'object' &&
+    'rawDetail' in error &&
+    typeof (error as { rawDetail?: unknown }).rawDetail === 'string'
+      ? (error as { rawDetail: string }).rawDetail
+      : undefined;
+
+  const originalMessage = error instanceof Error ? error.message : String(error ?? '');
+  let rawMessage = originalMessage;
 
   if (rawMessage.startsWith('{') && rawMessage.includes('"error"')) {
     try {
@@ -1476,7 +1495,9 @@ export function formatStationSaveError(
     }
   }
 
+  const fullRawDetail = (explicitRawDetail ?? rawMessage ?? originalMessage).trim() || undefined;
   const lower = rawMessage.toLowerCase();
+
   if (
     code === 'phase-mismatch' ||
     lower.includes('ya empezó el cierre') ||
@@ -1487,6 +1508,8 @@ export function formatStationSaveError(
       title: 'Cambio de horario detectado',
       detail: rawMessage,
       code: 'phase-mismatch',
+      rawDetail: fullRawDetail,
+      failedDocumentPath,
     };
   }
 
@@ -1495,6 +1518,25 @@ export function formatStationSaveError(
       title: 'Falta contar al menos un insumo',
       detail: rawMessage,
       code: 'no-opening-items',
+      rawDetail: fullRawDetail,
+      failedDocumentPath,
+    };
+  }
+
+  if (code === 'catalog-mismatch') {
+    const cleanDetail =
+      error &&
+      typeof error === 'object' &&
+      'detail' in error &&
+      typeof (error as { detail?: unknown }).detail === 'string'
+        ? (error as { detail: string }).detail
+        : rawMessage;
+    return {
+      title: 'Un insumo no coincide con el catálogo actual del jefe',
+      detail: cleanDetail,
+      code: 'catalog-mismatch',
+      rawDetail: fullRawDetail,
+      failedDocumentPath,
     };
   }
 
@@ -1522,6 +1564,8 @@ export function formatStationSaveError(
       detail:
         'Revisa tu señal de internet e intenta enviar de nuevo. Tu borrador sigue guardado en este dispositivo.',
       code: code ?? 'unavailable',
+      rawDetail: fullRawDetail,
+      failedDocumentPath,
     };
   }
 
@@ -1531,6 +1575,8 @@ export function formatStationSaveError(
       detail:
         'Cierra este aviso e inicia sesión otra vez con tu cuenta de Google para poder enviar el inventario. Tu borrador no se perdió.',
       code,
+      rawDetail: fullRawDetail,
+      failedDocumentPath,
     };
   }
 
@@ -1541,6 +1587,8 @@ export function formatStationSaveError(
         detail:
           'El horario del turno ya terminó (hora de Colombia). Pídele al jefe revisar o guardar el registro. Tu borrador sigue guardado aquí.',
         code,
+        rawDetail: fullRawDetail,
+        failedDocumentPath,
       };
     }
 
@@ -1550,6 +1598,8 @@ export function formatStationSaveError(
         detail:
           'Puede que los minutos de tolerancia se hayan cumplido justo al enviar, o que el cierre ya estuviera guardado. Pídele al jefe revisar la planilla.',
         code,
+        rawDetail: fullRawDetail,
+        failedDocumentPath,
       };
     }
 
@@ -1558,6 +1608,8 @@ export function formatStationSaveError(
       detail:
         'Firebase rechazó el envío (puede ser cierre ya bloqueado, algún insumo desactualizado respecto al catálogo del jefe o acceso del puesto revocado). Recarga la página o avísale al jefe; tu borrador sigue guardado aquí.',
       code,
+      rawDetail: fullRawDetail,
+      failedDocumentPath,
     };
   }
 
@@ -1566,7 +1618,24 @@ export function formatStationSaveError(
     detail:
       'Ocurrió un error al enviar al servidor. Tu borrador sigue guardado en este dispositivo; intenta de nuevo en unos segundos.',
     code,
+    rawDetail: fullRawDetail,
+    failedDocumentPath,
   };
+}
+
+export function buildStationSaveErrorCopyText(info: StationSaveErrorInfo): string {
+  const lines: string[] = [`Error: ${info.title}`];
+  if (info.code) {
+    lines.push(`Código: ${info.code}`);
+  }
+  if (info.failedDocumentPath) {
+    lines.push(`Documento: ${info.failedDocumentPath}`);
+  }
+  lines.push(`Motivo completo: ${info.detail}`);
+  if (info.rawDetail && info.rawDetail.trim() && info.rawDetail.trim() !== info.detail.trim()) {
+    lines.push(`Detalle técnico:\n${info.rawDetail.trim()}`);
+  }
+  return lines.join('\n');
 }
 
 export function getPacksThresholdReviewSignature(item: InventoryItem): string {
@@ -1641,6 +1710,58 @@ export function confirmPacksThresholdSignature(
     }
   }
   return next;
+}
+
+export interface CatalogChangeSummary {
+  changed: boolean;
+  changedCount: number;
+  changedNames: string[];
+}
+
+function getItemCatalogFingerprint(item: InventoryItem): string {
+  return [
+    item.id,
+    item.station,
+    item.name,
+    item.unit,
+    String(item.minStock),
+    String(item.targetStock),
+    item.active ? '1' : '0',
+    item.inputType ?? 'count',
+    String(item.packSize ?? ''),
+    item.packLabel ?? '',
+    item.unitLabel ?? '',
+    String(item.capacity ?? ''),
+    item.allowClosedContainers ? '1' : '0',
+  ].join('|');
+}
+
+export function summarizeStationCatalogDiff(
+  prevItems: InventoryItem[],
+  nextItems: InventoryItem[],
+): CatalogChangeSummary {
+  const prevById = new Map(prevItems.map((it) => [it.id, it]));
+  const nextById = new Map(nextItems.map((it) => [it.id, it]));
+  const changedNames: string[] = [];
+
+  nextItems.forEach((nextItem) => {
+    const prevItem = prevById.get(nextItem.id);
+    if (!prevItem || getItemCatalogFingerprint(prevItem) !== getItemCatalogFingerprint(nextItem)) {
+      changedNames.push(nextItem.name);
+    }
+  });
+
+  prevItems.forEach((prevItem) => {
+    if (!nextById.has(prevItem.id)) {
+      changedNames.push(prevItem.name);
+    }
+  });
+
+  return {
+    changed: changedNames.length > 0,
+    changedCount: changedNames.length,
+    changedNames,
+  };
 }
 
 

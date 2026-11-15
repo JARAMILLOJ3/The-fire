@@ -195,6 +195,7 @@ export default function App() {
     retryPacksMigration,
     dismissMigratedPacksNotice,
     refreshWorkerFallback,
+    applyServerStationItems,
   } = useStationData({
     authReady,
     user,
@@ -794,6 +795,9 @@ export default function App() {
                         reportsLoaded={reportsLoaded}
                         isCacheHydrated={!canManage && hasCachedWorkerHint()}
                         onSaved={handleStationSaved}
+                        onCatalogSynced={(freshItems) =>
+                          applyServerStationItems(currentStation.id, freshItems)
+                        }
                         onBackToDashboard={canManage ? () => navigateTo('jefe') : undefined}
                       />
                     ) : (

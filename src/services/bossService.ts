@@ -585,9 +585,19 @@ export async function migratePacksItemUnits(
       onProgress: options?.onProgress,
       commitBatch: async (chunk) => {
         const batch = writeBatch(db);
+        const touchedStationIds = new Set<string>();
         chunk.forEach((rec) => {
           batch.update(doc(db, 'items', rec.id), {
             unit: clampString(rec.newUnit, MAX_UNIT_LENGTH),
+            updatedAt: serverTimestamp(),
+          });
+          const item = itemById.get(rec.id);
+          if (item?.station && item.station !== UNASSIGNED_STATION_ID) {
+            touchedStationIds.add(item.station);
+          }
+        });
+        touchedStationIds.forEach((stId) => {
+          batch.update(doc(db, 'stations', stId), {
             updatedAt: serverTimestamp(),
           });
         });

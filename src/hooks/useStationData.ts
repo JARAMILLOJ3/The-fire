@@ -28,6 +28,7 @@ import type {
   InventoryItem,
   Invite,
   PacksUnitMigrationRecord,
+  StationId,
   StationLink,
   TeamMember,
   TeamStationId,
@@ -204,11 +205,6 @@ export function useStationData(params: {
     if (cached.items.length > 0 || cached.station) {
       setItems(cached.items);
       setItemsLoaded(true);
-      const cachedItemIdsKey = cached.station?.assignedItemIds?.filter(Boolean).join('|') ??
-        cached.items.map((i) => i.id).join('|');
-      if (cached.stationUpdatedAtMs !== null) {
-        syncedWorkerItemsKeyRef.current = `${targetWorkspaceId}:${targetRole}:${cachedItemIdsKey}:${cached.stationUpdatedAtMs}`;
-      }
     }
     if (cached.dateStr === effectiveSelectedDate) {
       if (cached.todayReport) {
@@ -573,8 +569,7 @@ export function useStationData(params: {
     return legacyIds.join('|');
   }, [isWorkerTarget, targetRole, stationsLoaded, workerStationObj]);
 
-  // Effect 1D (Worker): Conditional parallel Promise.all item sync triggered by stations/{role} updates.
-  // Eliminates N persistent item onSnapshot listeners AND removes the 800ms fallback delay.
+  // Effect 1D (Worker): Server-first parallel Promise.all item sync triggered by stations/{role} updates & focus.
   useEffect(() => {
     if (
       !authReady ||
@@ -594,27 +589,58 @@ export function useStationData(params: {
     }
 
     const syncKey = `${targetWorkspaceId}:${targetRole}:${workerItemIdsKey}:${workerStationUpdatedAtMs ?? 'init'}`;
-    if (syncedWorkerItemsKeyRef.current === syncKey && itemsRef.current.length > 0) {
-      setItemsLoaded(true);
-      return;
-    }
-
     let cancelled = false;
-    void fetchStationItemsOnce(targetWorkspaceId, targetRole, itemIds)
-      .then((fetched) => {
-        if (cancelled) return;
-        syncedWorkerItemsKeyRef.current = syncKey;
-        setItems(fetched);
+    let lastServerFetchMs = 0;
+
+    const runSync = (force: boolean) => {
+      if (!force && syncedWorkerItemsKeyRef.current === syncKey && itemsRef.current.length > 0) {
         setItemsLoaded(true);
-      })
-      .catch(() => {
-        if (!cancelled) {
+        return;
+      }
+      const nowMs = Date.now();
+      if (force && nowMs - lastServerFetchMs < 12000) {
+        return;
+      }
+      lastServerFetchMs = nowMs;
+
+      void fetchStationItemsOnce(targetWorkspaceId, targetRole, itemIds, { fromServer: true })
+        .then((fetched) => {
+          if (cancelled) return;
+          syncedWorkerItemsKeyRef.current = syncKey;
+          setItems(fetched);
           setItemsLoaded(true);
-        }
-      });
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setItemsLoaded(true);
+          }
+        });
+    };
+
+    runSync(false);
+
+    const handleVisibilityOrFocus = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      runSync(true);
+    };
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('focus', handleVisibilityOrFocus);
+      window.addEventListener('online', handleVisibilityOrFocus);
+    }
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+    }
 
     return () => {
       cancelled = true;
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('focus', handleVisibilityOrFocus);
+        window.removeEventListener('online', handleVisibilityOrFocus);
+      }
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
+      }
     };
   }, [
     authReady,
@@ -626,6 +652,21 @@ export function useStationData(params: {
     workerItemIdsKey,
     workerStationUpdatedAtMs,
   ]);
+
+  const applyServerStationItems = useCallback(
+    (stationId: StationId, freshStationItems: InventoryItem[]) => {
+      setItems((prev) => {
+        const nextForStation = freshStationItems.filter(
+          (it) => it.active && it.station === stationId,
+        );
+        const otherStations = prev.filter((it) => it.station !== stationId);
+        const merged = [...otherStations, ...nextForStation];
+        merged.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name));
+        return merged;
+      });
+    },
+    [],
+  );
 
   // Auto-migrate legacy workspaces that predate dynamic Workstations (manager-only, lazy-loaded bossService)
   useEffect(() => {
@@ -1299,5 +1340,6 @@ export function useStationData(params: {
     retryPacksMigration,
     dismissMigratedPacksNotice,
     refreshWorkerFallback,
+    applyServerStationItems,
   };
 }
