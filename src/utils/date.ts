@@ -81,3 +81,25 @@ export function getOperationalDateStr(now: Date = new Date()): string {
   }
   return bogota.dateStr;
 }
+
+const bogotaTimeWithSecondsFormatter = new Intl.DateTimeFormat('en-CA', {
+  timeZone: BOGOTA_TIME_ZONE,
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hourCycle: 'h23',
+});
+
+export function formatBogotaTimeExact(now: Date = new Date()): string {
+  const parts = bogotaTimeWithSecondsFormatter.formatToParts(now);
+  const map: Record<string, string> = {};
+  for (const part of parts) {
+    if (part.type !== 'literal') {
+      map[part.type] = part.value;
+    }
+  }
+  const hour = String((Number(map.hour) || 0) % 24).padStart(2, '0');
+  const minute = String(Number(map.minute) || 0).padStart(2, '0');
+  const second = String(Number(map.second) || 0).padStart(2, '0');
+  return `${hour}:${minute}:${second}`;
+}

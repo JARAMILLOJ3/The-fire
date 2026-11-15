@@ -132,6 +132,10 @@ service cloud.firestore {
       return dateVal == bogotaOpDateStr() || dateVal == bogotaPrevOpDateStr();
     }
 
+    function isCurrentOperationalDate(dateVal) {
+      return dateVal == bogotaOpDateStr();
+    }
+
     function isWorkspaceWithinSchedule(wsData) {
       return !('shiftSchedule' in wsData)
         ? (
@@ -439,6 +443,35 @@ service cloud.firestore {
         && isStationId(data.station)
         && isValidId(data.inviteId)
         && data.active is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidWorkerNote(data) {
+      return data.keys().hasAll([
+          'workspaceId', 'ownerUid', 'authorizedEmails', 'station',
+          'authorUid', 'authorName', 'date', 'timeLabel', 'text',
+          'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'workspaceId', 'ownerUid', 'authorizedEmails', 'station',
+          'authorUid', 'authorName', 'date', 'timeLabel', 'text',
+          'itemId', 'itemName', 'itemUnit', 'quantity',
+          'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.workspaceId)
+        && isValidId(data.ownerUid)
+        && isValidEmailList(data.authorizedEmails)
+        && isStationId(data.station)
+        && isValidId(data.authorUid)
+        && data.authorName is string && data.authorName.size() >= 1 && data.authorName.size() <= 80
+        && isValidDateStr(data.date)
+        && data.timeLabel is string && data.timeLabel.size() >= 1 && data.timeLabel.size() <= 16
+        && data.text is string && data.text.size() >= 1 && data.text.size() <= 200 && data.text.trim().size() >= 1
+        && (!('itemId' in data) || isValidId(data.itemId))
+        && (!('itemName' in data) || (data.itemName is string && data.itemName.size() >= 1 && data.itemName.size() <= 80))
+        && (!('itemUnit' in data) || (data.itemUnit is string && data.itemUnit.size() >= 1 && data.itemUnit.size() <= 24))
+        && (!('quantity' in data) || (data.quantity is number && data.quantity >= 0 && data.quantity <= 100000))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -952,6 +985,80 @@ service cloud.firestore {
 
       allow delete: if isValidId(memberId)
         && isWorkspaceOwnerDoc(existing());
+    }
+
+    match /workerNotes/{noteId} {
+      allow get: if isValidId(noteId) && isVerifiedUser() && (
+        (resource == null && isAdmin())
+        || (
+          resource != null && (
+            isAdmin()
+            || existing().ownerUid == request.auth.uid
+            || request.auth.token.email in existing().authorizedEmails
+            || canManageWorkspace(existing().workspaceId)
+            || isActiveStationWorker(existing().workspaceId, existing().station)
+          )
+        )
+      );
+
+      allow list: if isVerifiedUser() && (
+        resource.data.ownerUid == request.auth.uid
+        || request.auth.token.email in resource.data.authorizedEmails
+        || resource.data.authorUid == request.auth.uid
+      );
+
+      allow create: if isValidId(noteId)
+        && isVerifiedUser()
+        && isValidWorkerNote(incoming())
+        && incoming().authorUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && isCurrentOperationalDate(incoming().date)
+        && isActiveStationWorker(incoming().workspaceId, incoming().station)
+        && exists(/databases/$(database)/documents/workspaces/$(incoming().workspaceId))
+        && incoming().ownerUid == get(/databases/$(database)/documents/workspaces/$(incoming().workspaceId)).data.ownerUid
+        && incoming().authorizedEmails == get(/databases/$(database)/documents/workspaces/$(incoming().workspaceId)).data.authorizedEmails;
+
+      allow update: if isValidId(noteId)
+        && isVerifiedUser()
+        && isValidWorkerNote(incoming())
+        && incoming().workspaceId == existing().workspaceId
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().station == existing().station
+        && incoming().authorUid == existing().authorUid
+        && incoming().authorName == existing().authorName
+        && incoming().date == existing().date
+        && incoming().timeLabel == existing().timeLabel
+        && incoming().createdAt == existing().createdAt
+        && (
+          (
+            isActiveStationWorker(existing().workspaceId, existing().station)
+            && existing().authorUid == request.auth.uid
+            && isCurrentOperationalDate(existing().date)
+            && incoming().authorizedEmails == existing().authorizedEmails
+            && incoming().updatedAt == request.time
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'text', 'itemId', 'itemName', 'itemUnit', 'quantity', 'updatedAt'
+            ])
+          )
+          || (
+            canManageWorkspace(existing().workspaceId)
+            && incoming().updatedAt == request.time
+            && incoming().diff(existing()).affectedKeys().hasOnly(['authorizedEmails', 'updatedAt'])
+          )
+        );
+
+      allow delete: if isValidId(noteId)
+        && isVerifiedUser()
+        && (
+          isWorkspaceOwnerDoc(existing())
+          || canManageWorkspace(existing().workspaceId)
+          || (
+            isActiveStationWorker(existing().workspaceId, existing().station)
+            && existing().authorUid == request.auth.uid
+            && isCurrentOperationalDate(existing().date)
+          )
+        );
     }
   }
 }

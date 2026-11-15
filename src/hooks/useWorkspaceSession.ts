@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   getRedirectResult,
   onAuthStateChanged,
@@ -11,10 +11,18 @@ import { doc, onSnapshot } from 'firebase/firestore';
 import { auth, db, googleProvider, handleFirestoreError, OperationType } from '../firebase';
 import {
   fetchStationLinkPreview,
+  preloadStationLinkPreview,
   resolveUserWorkspace,
   SessionAccessError,
 } from '../services/sessionService';
 import type { StationId, StationLink, TeamMember, TeamStationId, Workspace } from '../types';
+import { perfMetrics } from '../utils/perfMetrics';
+import {
+  clearWorkerSnapshotCache,
+  isSnapshotCompatibleWithLink,
+  readCachedStationLinkPreview,
+  readWorkerSnapshotCache,
+} from '../utils/workerCache';
 
 export function normalizeStationId(raw: string): StationId {
   if (raw === 'hamburguesas') return 'comida_rapida';
@@ -48,9 +56,15 @@ function formatGoogleAuthError(error: unknown): string {
   }
 }
 
+export interface OptimisticStationContext {
+  workspaceId: string;
+  stationId: StationId;
+}
+
 export interface WorkspaceSessionState {
   linkParams: { stationId: string | null; accessCode: string | null };
   pendingLink: StationLink | null;
+  optimisticStationContext: OptimisticStationContext | null;
   user: User | null;
   authReady: boolean;
   authLoading: boolean;
@@ -78,7 +92,9 @@ export function useWorkspaceSession(): WorkspaceSessionState {
     };
   });
 
-  const [pendingLink, setPendingLink] = useState<StationLink | null>(null);
+  const [pendingLink, setPendingLink] = useState<StationLink | null>(() =>
+    readCachedStationLinkPreview(linkParams.accessCode),
+  );
   const [user, setUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [authLoading, setAuthLoading] = useState(false);
@@ -91,13 +107,31 @@ export function useWorkspaceSession(): WorkspaceSessionState {
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [initialActiveSection, setInitialActiveSection] = useState<string | null>(null);
 
+  const hydratedFromCacheUidRef = useRef<string | null>(null);
   const canManage = isOwner || role === 'jefe';
+
+  // Start fetching QR link preview immediately on mount, in parallel with Firebase Auth init
+  useEffect(() => {
+    if (!linkParams.accessCode) return;
+    preloadStationLinkPreview(linkParams.accessCode);
+    let cancelled = false;
+    fetchStationLinkPreview(linkParams.accessCode).then((preview) => {
+      if (!cancelled && preview) {
+        setPendingLink(preview);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [linkParams.accessCode]);
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (nextUser) => {
+      perfMetrics.mark('authReady');
       setUser(nextUser);
       setAuthReady(true);
       if (!nextUser) {
+        hydratedFromCacheUidRef.current = null;
         setWorkspace(null);
         setRole('jefe');
         setIsOwner(false);
@@ -114,28 +148,39 @@ export function useWorkspaceSession(): WorkspaceSessionState {
     return () => unsub();
   }, []);
 
-  useEffect(() => {
-    if (!authReady || user || !linkParams.accessCode) return;
-    let cancelled = false;
-    fetchStationLinkPreview(linkParams.accessCode).then((preview) => {
-      if (!cancelled && preview) {
-        setPendingLink(preview);
-      }
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [authReady, user, linkParams.accessCode]);
+  const userUid = user?.uid ?? null;
 
   useEffect(() => {
-    if (!authReady || !user) return;
+    if (!authReady || !user || !userUid) return;
     let cancelled = false;
-    setSessionLoading(true);
-    setSessionError(null);
+
+    const cachedSnapshot = readWorkerSnapshotCache(userUid);
+    const cachedPreview = pendingLink ?? readCachedStationLinkPreview(linkParams.accessCode);
+    const canHydrateOptimistically = isSnapshotCompatibleWithLink(
+      cachedSnapshot,
+      linkParams,
+      cachedPreview,
+    );
+
+    if (canHydrateOptimistically && cachedSnapshot) {
+      hydratedFromCacheUidRef.current = userUid;
+      const cachedRole = normalizeTeamRole(cachedSnapshot.role);
+      setWorkspace(cachedSnapshot.workspace);
+      setRole(cachedRole);
+      setIsOwner(false);
+      setInitialActiveSection(normalizeStationId(cachedRole));
+      setSessionError(null);
+      setSessionLoading(false);
+    } else {
+      hydratedFromCacheUidRef.current = null;
+      setSessionLoading(true);
+      setSessionError(null);
+    }
 
     resolveUserWorkspace(user, linkParams)
       .then((resolved) => {
         if (cancelled) return;
+        perfMetrics.mark('sessionResolved');
         const normalizedRole = normalizeTeamRole(resolved.role);
         setWorkspace(resolved.workspace);
         setRole(normalizedRole);
@@ -150,13 +195,18 @@ export function useWorkspaceSession(): WorkspaceSessionState {
             resolved.isOwner || normalizedRole === 'jefe' ? 'jefe' : normalizedRole,
           );
         }
+        if (resolved.isOwner || normalizedRole === 'jefe') {
+          clearWorkerSnapshotCache(userUid);
+        }
       })
       .catch((err) => {
         if (cancelled) return;
         console.error(err);
         if (err instanceof SessionAccessError) {
+          clearWorkerSnapshotCache(userUid);
+          setWorkspace(null);
           setSessionError(err.message);
-        } else {
+        } else if (hydratedFromCacheUidRef.current !== userUid) {
           setSessionError(
             'No se pudo inicializar el espacio del restaurante. Verifica tu sesión e intenta nuevamente.',
           );
@@ -169,14 +219,18 @@ export function useWorkspaceSession(): WorkspaceSessionState {
     return () => {
       cancelled = true;
     };
-  }, [authReady, user, linkParams]);
+    // Depend on primitive userUid + linkParams instead of full user object identity
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authReady, userUid, linkParams]);
 
   // Live listener on active workspace
+  const workspaceId = workspace?.id ?? null;
   useEffect(() => {
-    if (!authReady || !user || !workspace?.id) return;
-    const wsPath = `workspaces/${workspace.id}`;
+    if (!authReady || !userUid || !workspaceId) return;
+    const wsPath = `workspaces/${workspaceId}`;
+    const stopMetric = perfMetrics.onListenerStart('workspaces');
     const unsub = onSnapshot(
-      doc(db, 'workspaces', workspace.id),
+      doc(db, 'workspaces', workspaceId),
       (snap) => {
         if (snap.exists()) {
           setWorkspace({ id: snap.id, ...snap.data() } as Workspace);
@@ -184,22 +238,28 @@ export function useWorkspaceSession(): WorkspaceSessionState {
       },
       (err) => handleFirestoreError(err, OperationType.GET, wsPath),
     );
-    return () => unsub();
-  }, [authReady, user, workspace?.id]);
+    return () => {
+      stopMetric();
+      unsub();
+    };
+  }, [authReady, userUid, workspaceId]);
 
   // Live check on worker's own teamMembers/{uid} for instant revocation / reassignment
   useEffect(() => {
-    if (!authReady || !user || !workspace?.id || canManage || role === 'jefe') return;
+    if (!authReady || !userUid || !workspaceId || canManage || role === 'jefe') return;
 
+    const stopMetric = perfMetrics.onListenerStart('teamMembers');
     const unsubSelfMember = onSnapshot(
-      doc(db, 'teamMembers', user.uid),
+      doc(db, 'teamMembers', userUid),
       (snap) => {
         if (!snap.exists()) {
+          clearWorkerSnapshotCache(userUid);
           setSessionError('Tu acceso fue removido por el jefe.');
           return;
         }
         const m = snap.data() as TeamMember;
         if (!m.active) {
+          clearWorkerSnapshotCache(userUid);
           setSessionError('Tu acceso a este restaurante fue desactivado por el jefe.');
           return;
         }
@@ -214,8 +274,21 @@ export function useWorkspaceSession(): WorkspaceSessionState {
       },
     );
 
-    return () => unsubSelfMember();
-  }, [authReady, user, workspace?.id, canManage, role]);
+    return () => {
+      stopMetric();
+      unsubSelfMember();
+    };
+  }, [authReady, userUid, workspaceId, canManage, role]);
+
+  const optimisticStationContext = useMemo<OptimisticStationContext | null>(() => {
+    if (!authReady || !userUid || !pendingLink?.workspaceId || !pendingLink?.stationId) {
+      return null;
+    }
+    return {
+      workspaceId: pendingLink.workspaceId,
+      stationId: normalizeStationId(pendingLink.stationId),
+    };
+  }, [authReady, userUid, pendingLink?.workspaceId, pendingLink?.stationId]);
 
   const handleSignIn = useCallback(async () => {
     setAuthLoading(true);
@@ -250,12 +323,14 @@ export function useWorkspaceSession(): WorkspaceSessionState {
   }, []);
 
   const handleSignOut = useCallback(async () => {
+    clearWorkerSnapshotCache(userUid);
     await signOut(auth);
-  }, []);
+  }, [userUid]);
 
   return {
     linkParams,
     pendingLink,
+    optimisticStationContext,
     user,
     authReady,
     authLoading,

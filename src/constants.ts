@@ -12,6 +12,13 @@ export const MAX_PACK_LABEL_LENGTH = 20;
 export const MAX_PACK_SIZE = 10000;
 export const LEVEL_STEPS = 8;
 export const MAX_NOTES_LENGTH = 500;
+export const MAX_WORKER_NOTE_LENGTH = 200;
+export const MAX_TIME_LABEL_LENGTH = 16;
+export const WORKER_NOTE_SHORTCUTS = [
+  'Salida del jefe',
+  'Cortesía',
+  'Dañado',
+] as const;
 export const MAX_EMAIL_LENGTH = 120;
 export const MAX_STOCK_VALUE = 100000;
 export const ID_PATTERN = /^[a-zA-Z0-9_\-]+$/;

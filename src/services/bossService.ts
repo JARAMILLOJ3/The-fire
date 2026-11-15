@@ -1,6 +1,7 @@
 import type { User } from 'firebase/auth';
 import {
   collection,
+  deleteDoc,
   deleteField,
   doc,
   getDoc,
@@ -813,6 +814,7 @@ export async function syncAuthorizedEmailsAcrossWorkspace(params: {
   items: InventoryItem[];
   reports: DailyReport[];
   entries: DailyReportEntry[];
+  workerNotes?: Array<{ id: string }>;
 }): Promise<void> {
   const nextEmails = Array.from(
     new Set([
@@ -853,6 +855,12 @@ export async function syncAuthorizedEmailsAcrossWorkspace(params: {
   });
   params.entries.forEach((entry) => {
     batch.update(doc(db, 'dailyReports', entry.reportId, 'entries', entry.itemId), {
+      authorizedEmails: nextEmails,
+      updatedAt: serverTimestamp(),
+    });
+  });
+  params.workerNotes?.forEach((note) => {
+    batch.update(doc(db, 'workerNotes', note.id), {
       authorizedEmails: nextEmails,
       updatedAt: serverTimestamp(),
     });
@@ -1120,9 +1128,10 @@ export async function collectWorkspaceResetTasks(
   assertWorkspaceOwner(workspace, callerUid);
   const { sortResetTasks } = await import('../utils/reset');
 
-  const reportsSnap = await getDocs(
-    query(collection(db, 'dailyReports'), where('ownerUid', '==', workspace.ownerUid)),
-  );
+  const [reportsSnap, notesSnap] = await Promise.all([
+    getDocs(query(collection(db, 'dailyReports'), where('ownerUid', '==', workspace.ownerUid))),
+    getDocs(query(collection(db, 'workerNotes'), where('ownerUid', '==', workspace.ownerUid))),
+  ]);
 
   const reports: DailyReport[] = [];
   reportsSnap.forEach((d) => {
@@ -1147,6 +1156,17 @@ export async function collectWorkspaceResetTasks(
       path: `dailyReports/${rep.id}`,
       label: `${rep.date} (${rep.station})`,
     });
+  });
+
+  notesSnap.forEach((d) => {
+    const note = d.data() as { workspaceId?: string; date?: string; station?: string };
+    if (note.workspaceId === workspace.id) {
+      tasks.push({
+        category: 'reports',
+        path: `workerNotes/${d.id}`,
+        label: `Nota ${note.date ?? ''} (${note.station ?? ''})`,
+      });
+    }
   });
 
   if (scope === 'all') {
@@ -1254,4 +1274,12 @@ export async function runWorkspaceResetTasks(params: {
   }
 
   return result;
+}
+
+export async function deleteWorkerNoteByBoss(noteId: string): Promise<void> {
+  try {
+    await deleteDoc(doc(db, 'workerNotes', noteId));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, `workerNotes/${noteId}`);
+  }
 }

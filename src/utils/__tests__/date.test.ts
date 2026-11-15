@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  formatBogotaTimeExact,
   getBogotaNowParts,
   getOperationalDateStr,
   getPreviousDateStr,
@@ -19,13 +20,26 @@ describe('date.ts (America/Bogota UTC-5)', () => {
     expect(parts.totalMinutes).toBe(23 * 60 + 30);
   });
 
-  it('assigns times before 06:00 AM Bogota to the previous operational day', () => {
+  it('assigns post-midnight times (00:00–05:59 AM Bogota) to the previous operational day and rolls over at 06:00 AM', () => {
+    // 2026-11-13 23:59:59 Bogota === 2026-11-14 04:59:59 UTC -> still 2026-11-13
+    expect(getOperationalDateStr(new Date('2026-11-14T04:59:59Z'))).toBe('2026-11-13');
+    // 2026-11-14 00:01:00 Bogota === 2026-11-14 05:01:00 UTC -> post-midnight closing/notes stay on 2026-11-13
+    expect(getOperationalDateStr(new Date('2026-11-14T05:01:00Z'))).toBe('2026-11-13');
     // 2026-11-14 01:45 Bogota === 2026-11-14 06:45 UTC
     expect(getOperationalDateStr(new Date('2026-11-14T06:45:00Z'))).toBe('2026-11-13');
-    // 2026-11-14 05:59 Bogota === 2026-11-14 10:59 UTC
-    expect(getOperationalDateStr(new Date('2026-11-14T10:59:00Z'))).toBe('2026-11-13');
-    // 2026-11-14 06:00 Bogota === 2026-11-14 11:00 UTC
+    // 2026-11-14 05:59:59 Bogota === 2026-11-14 10:59:59 UTC
+    expect(getOperationalDateStr(new Date('2026-11-14T10:59:59Z'))).toBe('2026-11-13');
+    // 2026-11-14 06:00:00 Bogota === 2026-11-14 11:00:00 UTC -> rolls to 2026-11-14
     expect(getOperationalDateStr(new Date('2026-11-14T11:00:00Z'))).toBe('2026-11-14');
+    // Month boundary after midnight: 2026-12-01 01:15 Bogota === 2026-12-01 06:15 UTC -> 2026-11-30
+    expect(getOperationalDateStr(new Date('2026-12-01T06:15:00Z'))).toBe('2026-11-30');
+  });
+
+  it('formats exact Bogota 24h time HH:mm:ss for worker notes', () => {
+    // 2026-11-14 05:07:09 UTC === 2026-11-14 00:07:09 Bogota
+    expect(formatBogotaTimeExact(new Date('2026-11-14T05:07:09Z'))).toBe('00:07:09');
+    // 2026-11-14 04:30:45 UTC === 2026-11-13 23:30:45 Bogota
+    expect(formatBogotaTimeExact(new Date('2026-11-14T04:30:45Z'))).toBe('23:30:45');
   });
 
   it('shifts dates cleanly across month, leap-year, and year boundaries', () => {

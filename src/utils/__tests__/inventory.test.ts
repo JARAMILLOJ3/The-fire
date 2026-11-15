@@ -1327,4 +1327,78 @@ describe('inventory.ts (sanitización, sin_dato, anomalías y compras)', () => {
     expect(csv).toContain('"≈ 1,5 L"');
     expect(csv).toContain('"Comprar: 4 L (aprox.)"');
   });
+
+  it('includes valid operational-day workerNotes in daily CSV with formula escaping and without altering inventory numbers', () => {
+    const station = makeStation({ id: 'mesera', name: 'Mesera' });
+    const item = makeItem({ id: 'mesera_1', station: 'mesera', name: 'Gaseosa', unit: 'und' });
+    const report: DailyReport = {
+      id: 'ws_1_2026-11-13_mesera',
+      workspaceId: 'ws_1',
+      ownerUid: 'owner_1',
+      authorizedEmails: ['boss@example.com'],
+      date: '2026-11-13',
+      station: 'mesera',
+      status: 'completed',
+      reportedByUid: 'worker_1',
+      reportedByName: 'Ana',
+      notes: '',
+    };
+    const rows = buildConsolidatedRows(
+      [item],
+      {
+        mesera_1: makeEntry({
+          itemId: 'mesera_1',
+          opening: 20,
+          added: 0,
+          closing: 15,
+          hasOpening: true,
+          hasClosing: true,
+        }),
+      },
+      { mesera: report },
+    );
+
+    const csv = buildDailyCsvContent('2026-11-13', rows, [station], [
+      {
+        id: 'nota_1',
+        workspaceId: 'ws_1',
+        ownerUid: 'owner_1',
+        authorizedEmails: ['boss@example.com'],
+        station: 'mesera',
+        authorUid: 'worker_1',
+        authorName: 'Ana',
+        date: '2026-11-13',
+        timeLabel: '23:14:09',
+        text: '=Salida del jefe',
+        itemId: 'mesera_1',
+        itemName: 'Gaseosa',
+        itemUnit: 'und',
+        quantity: 2,
+      },
+      {
+        id: 'nota_old',
+        workspaceId: 'ws_1',
+        ownerUid: 'owner_1',
+        authorizedEmails: ['boss@example.com'],
+        station: 'mesera',
+        authorUid: 'worker_1',
+        authorName: 'Ana',
+        date: '2026-11-12',
+        timeLabel: '18:00:00',
+        text: 'Nota de otro día',
+      },
+    ]);
+
+    const lines = csv.split('\n');
+    expect(lines).toHaveLength(3); // Header + 1 item row + 1 matching-date note row
+    expect(lines[0]).toContain('"Notas"');
+    // Stock and consumption on item row are unchanged by the note
+    expect(lines[1]).toContain('"20","0","15","5"');
+    // Note row leaves Inicio/Surtido/Cierre/Consumo blank and escapes formula prefix in Notas
+    expect(lines[2]).toContain('"Nota: Gaseosa"');
+    expect(lines[2]).toContain('"Nota · 23:14:09 · Ana"');
+    expect(lines[2]).toContain(`"'=Salida del jefe (Cant: 2 und)"`);
+    expect(lines[2]).toContain('"","","",""');
+    expect(csv).not.toContain('Nota de otro día');
+  });
 });

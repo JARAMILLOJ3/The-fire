@@ -921,4 +921,237 @@ describe('Firestore Security Rules (Emulator Suite)', () => {
     batch.delete(doc(bossDb, 'teamMembers', WORKER_UID));
     await assertSucceeds(batch.commit());
   });
+
+  it('workerNotes: enforces own station, own author, current operational day, 200-char limit, author immutability, any-hour access, and boss read/delete', async () => {
+    const opDate = getBogotaDateForNow();
+    const prevDateObj = new Date(Date.now() - 11 * 60 * 60 * 1000 - 24 * 60 * 60 * 1000);
+    const prevOpDate = `${prevDateObj.getUTCFullYear()}-${String(prevDateObj.getUTCMonth() + 1).padStart(2, '0')}-${String(prevDateObj.getUTCDate()).padStart(2, '0')}`;
+
+    const otherMeseraUid = 'worker_mesera_2_uid';
+    const otherMeseraEmail = 'mesera2@thefire.co';
+
+    await testEnv.withSecurityRulesDisabled(async (ctx) => {
+      const db = ctx.firestore();
+      const nowTs = Timestamp.now();
+
+      // Enable an expired schedule window (00:00-00:01) to prove workerNotes works at ANY hour
+      await updateDoc(doc(db, 'workspaces', WS_ID), {
+        shiftSchedule: {
+          enabled: true,
+          openingStart: '00:00',
+          openingEnd: '00:01',
+          closingStart: '00:02',
+          closingEnd: '00:03',
+        },
+      });
+
+      // Second worker assigned to the same station ('mesera')
+      await setDoc(doc(db, 'teamMembers', otherMeseraUid), {
+        workspaceId: WS_ID,
+        ownerUid: OWNER_UID,
+        uid: otherMeseraUid,
+        email: otherMeseraEmail,
+        displayName: 'Lucia',
+        station: 'mesera',
+        inviteId: 'tf_validcode12345678',
+        active: true,
+        createdAt: nowTs,
+        updatedAt: nowTs,
+      });
+
+      // Seed a note from a previous operational day owned by WORKER_UID
+      await setDoc(doc(db, 'workerNotes', 'nota_ayer'), {
+        workspaceId: WS_ID,
+        ownerUid: OWNER_UID,
+        authorizedEmails: [OWNER_EMAIL],
+        station: 'mesera',
+        authorUid: WORKER_UID,
+        authorName: 'Ana',
+        date: prevOpDate,
+        timeLabel: '23:10:00',
+        text: 'Nota de ayer',
+        createdAt: nowTs,
+        updatedAt: nowTs,
+      });
+
+      // Seed a note from today owned by otherMeseraUid (nota ajena)
+      await setDoc(doc(db, 'workerNotes', 'nota_lucia_hoy'), {
+        workspaceId: WS_ID,
+        ownerUid: OWNER_UID,
+        authorizedEmails: [OWNER_EMAIL],
+        station: 'mesera',
+        authorUid: otherMeseraUid,
+        authorName: 'Lucia',
+        date: opDate,
+        timeLabel: '20:15:00',
+        text: 'Nota de Lucia',
+        createdAt: nowTs,
+        updatedAt: nowTs,
+      });
+    });
+
+    const workerDb = testEnv
+      .authenticatedContext(WORKER_UID, { email: WORKER_EMAIL, email_verified: true })
+      .firestore();
+    const otherWorkerDb = testEnv
+      .authenticatedContext(otherMeseraUid, { email: otherMeseraEmail, email_verified: true })
+      .firestore();
+    const bossDb = testEnv
+      .authenticatedContext(OWNER_UID, { email: OWNER_EMAIL, email_verified: true })
+      .firestore();
+
+    // 1. Active worker CAN create own note for her station on current operational day even outside schedule
+    await assertSucceeds(
+      setDoc(doc(workerDb, 'workerNotes', 'nota_ana_hoy'), {
+        workspaceId: WS_ID,
+        ownerUid: OWNER_UID,
+        authorizedEmails: [OWNER_EMAIL],
+        station: 'mesera',
+        authorUid: WORKER_UID,
+        authorName: 'Ana',
+        date: opDate,
+        timeLabel: '19:45:12',
+        text: 'Salida del jefe: 2 gaseosas',
+        itemId: 'mesera_1',
+        itemName: 'Coca-Cola 400ml',
+        itemUnit: 'und',
+        quantity: 2,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }),
+    );
+
+    // 2. Otro puesto rejected
+    await assertFails(
+      setDoc(doc(workerDb, 'workerNotes', 'nota_otro_puesto'), {
+        workspaceId: WS_ID,
+        ownerUid: OWNER_UID,
+        authorizedEmails: [OWNER_EMAIL],
+        station: 'asados',
+        authorUid: WORKER_UID,
+        authorName: 'Ana',
+        date: opDate,
+        timeLabel: '19:45:12',
+        text: 'Intento en asados',
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }),
+    );
+
+    // 3. Texto demasiado largo (>200) or blank rejected
+    await assertFails(
+      setDoc(doc(workerDb, 'workerNotes', 'nota_larga'), {
+        workspaceId: WS_ID,
+        ownerUid: OWNER_UID,
+        authorizedEmails: [OWNER_EMAIL],
+        station: 'mesera',
+        authorUid: WORKER_UID,
+        authorName: 'Ana',
+        date: opDate,
+        timeLabel: '19:45:12',
+        text: 'x'.repeat(201),
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }),
+    );
+    await assertFails(
+      setDoc(doc(workerDb, 'workerNotes', 'nota_vacia'), {
+        workspaceId: WS_ID,
+        ownerUid: OWNER_UID,
+        authorizedEmails: [OWNER_EMAIL],
+        station: 'mesera',
+        authorUid: WORKER_UID,
+        authorName: 'Ana',
+        date: opDate,
+        timeLabel: '19:45:12',
+        text: '   ',
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }),
+    );
+
+    // 4. Nota de un día anterior: create/update/delete all rejected for worker
+    await assertFails(
+      setDoc(doc(workerDb, 'workerNotes', 'nota_ayer_nueva'), {
+        workspaceId: WS_ID,
+        ownerUid: OWNER_UID,
+        authorizedEmails: [OWNER_EMAIL],
+        station: 'mesera',
+        authorUid: WORKER_UID,
+        authorName: 'Ana',
+        date: prevOpDate,
+        timeLabel: '19:45:12',
+        text: 'Backdated',
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }),
+    );
+    await assertFails(
+      updateDoc(doc(workerDb, 'workerNotes', 'nota_ayer'), {
+        text: 'Editando ayer',
+        updatedAt: serverTimestamp(),
+      }),
+    );
+    await assertFails(deleteDoc(doc(workerDb, 'workerNotes', 'nota_ayer')));
+
+    // 5. Nota ajena (same station, different worker): update/delete rejected
+    await assertFails(
+      updateDoc(doc(workerDb, 'workerNotes', 'nota_lucia_hoy'), {
+        text: 'Modificando nota ajena',
+        updatedAt: serverTimestamp(),
+      }),
+    );
+    await assertFails(deleteDoc(doc(workerDb, 'workerNotes', 'nota_lucia_hoy')));
+    await assertFails(
+      updateDoc(doc(otherWorkerDb, 'workerNotes', 'nota_ana_hoy'), {
+        text: 'Lucia editando a Ana',
+        updatedAt: serverTimestamp(),
+      }),
+    );
+
+    // 6. Intento de cambiar la autora (authorUid / authorName), puesto, o fecha de creación rejected
+    await assertFails(
+      updateDoc(doc(workerDb, 'workerNotes', 'nota_ana_hoy'), {
+        authorUid: otherMeseraUid,
+        updatedAt: serverTimestamp(),
+      }),
+    );
+    await assertFails(
+      updateDoc(doc(workerDb, 'workerNotes', 'nota_ana_hoy'), {
+        authorName: 'Otra persona',
+        updatedAt: serverTimestamp(),
+      }),
+    );
+    await assertFails(
+      updateDoc(doc(workerDb, 'workerNotes', 'nota_ana_hoy'), {
+        station: 'asados',
+        updatedAt: serverTimestamp(),
+      }),
+    );
+    await assertFails(
+      updateDoc(doc(workerDb, 'workerNotes', 'nota_ana_hoy'), {
+        createdAt: Timestamp.fromMillis(1000000),
+        updatedAt: serverTimestamp(),
+      }),
+    );
+
+    // 7. Worker CAN edit and delete her own current-day note
+    await assertSucceeds(
+      updateDoc(doc(workerDb, 'workerNotes', 'nota_ana_hoy'), {
+        text: 'Cortesía: 1 gaseosa',
+        quantity: 1,
+        updatedAt: serverTimestamp(),
+      }),
+    );
+    await assertSucceeds(deleteDoc(doc(workerDb, 'workerNotes', 'nota_ana_hoy')));
+
+    // 8. Boss CAN list/get notes and delete any workspace note (including previous day's)
+    await assertSucceeds(
+      getDocs(
+        query(collection(bossDb, 'workerNotes'), where('authorizedEmails', 'array-contains', OWNER_EMAIL)),
+      ),
+    );
+    await assertSucceeds(getDoc(doc(bossDb, 'workerNotes', 'nota_lucia_hoy')));
+    await assertSucceeds(deleteDoc(doc(bossDb, 'workerNotes', 'nota_ayer')));
+  });
 });

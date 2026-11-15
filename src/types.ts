@@ -181,3 +181,22 @@ export interface ConsolidatedItemRow {
   stockLevel: StockLevel;
   suggestedBuy: number;
 }
+
+export interface WorkerNote {
+  id: string;
+  workspaceId: string;
+  ownerUid: string;
+  authorizedEmails: string[];
+  station: StationId;
+  authorUid: string;
+  authorName: string;
+  date: string;
+  timeLabel: string;
+  text: string;
+  itemId?: string;
+  itemName?: string;
+  itemUnit?: string;
+  quantity?: number;
+  createdAt?: Timestamp;
+  updatedAt?: Timestamp;
+}

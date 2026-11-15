@@ -103,4 +103,29 @@ describe('firestore.rules structural security audit', () => {
     expect(stationsBlock).toContain('canManageWorkspace(');
     expect(stationsBlock).not.toContain('isActiveStationWorker(');
   });
+
+  it('secures workerNotes for active workers (own notes, own station, current operational day, <= 200 chars, any hour) and bosses (read/delete)', () => {
+    expect(rulesText).toContain('function isCurrentOperationalDate(dateVal)');
+    expect(rulesText).toContain('function isValidWorkerNote(data)');
+    expect(rulesText).toContain('data.text is string && data.text.size() >= 1 && data.text.size() <= 200 && data.text.trim().size() >= 1');
+
+    const notesBlockMatch = rulesText.match(/match \/workerNotes\/\{noteId\} \{[\s\S]*?\n    \}/);
+    expect(notesBlockMatch).not.toBeNull();
+    const notesBlock = notesBlockMatch![0];
+
+    expect(notesBlock).toContain('isActiveStationWorker(incoming().workspaceId, incoming().station)');
+    expect(notesBlock).toContain('isCurrentOperationalDate(incoming().date)');
+    expect(notesBlock).toContain('isCurrentOperationalDate(existing().date)');
+    expect(notesBlock).toContain('incoming().authorUid == request.auth.uid');
+    expect(notesBlock).toContain('existing().authorUid == request.auth.uid');
+    expect(notesBlock).toContain('incoming().station == existing().station');
+    expect(notesBlock).toContain('incoming().authorUid == existing().authorUid');
+    expect(notesBlock).toContain('incoming().authorName == existing().authorName');
+    expect(notesBlock).toContain('incoming().date == existing().date');
+    expect(notesBlock).toContain('incoming().createdAt == existing().createdAt');
+    // Workers can write notes at any hour without schedule-window blocking
+    expect(notesBlock).not.toContain('isWorkerWithinSchedule(');
+    // Boss can read and delete
+    expect(notesBlock).toContain('canManageWorkspace(existing().workspaceId)');
+  });
 });

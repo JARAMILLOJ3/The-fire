@@ -21,6 +21,7 @@ import type {
   ShiftSchedule,
   StationId,
   StockLevel,
+  WorkerNote,
   Workstation,
 } from '../types';
 import {
@@ -1078,6 +1079,7 @@ export function buildDailyCsvContent(
   dateStr: string,
   rows: ConsolidatedItemRow[],
   stations: Workstation[],
+  workerNotes: WorkerNote[] = [],
 ): string {
   const stationNameMap = new Map(stations.map((s) => [s.id, s.name]));
   const headers = [
@@ -1092,6 +1094,7 @@ export function buildDailyCsvContent(
     'Minimo',
     'Estado',
     'SugeridoComprar',
+    'Notas',
   ].map(escapeCsvCell);
 
   const csvRows = rows.map((r) => {
@@ -1132,7 +1135,37 @@ export function buildDailyCsvContent(
       escapeCsvCell(formatCsvQty(r.item.minStock)),
       escapeCsvCell(statusLabel),
       escapeCsvCell(suggestedCell),
+      escapeCsvCell(''),
     ];
+  });
+
+  const sortedNotes = [...workerNotes]
+    .filter((n) => n.date === dateStr)
+    .sort((a, b) => a.station.localeCompare(b.station) || a.timeLabel.localeCompare(b.timeLabel));
+
+  sortedNotes.forEach((note) => {
+    const stationLabel = stationNameMap.get(note.station) ?? note.station;
+    const itemCol = note.itemName ? `Nota: ${note.itemName}` : 'Nota del puesto';
+    const hasQty = typeof note.quantity === 'number' && Number.isFinite(note.quantity);
+    const qtySuffix = hasQty
+      ? ` (Cant: ${note.quantity}${note.itemUnit ? ` ${note.itemUnit}` : ''})`
+      : '';
+    const metaLabel = `Nota · ${note.timeLabel} · ${note.authorName}`;
+
+    csvRows.push([
+      escapeCsvCell(note.date),
+      escapeCsvCell(stationLabel),
+      escapeCsvCell(itemCol),
+      escapeCsvCell(note.itemUnit ?? ''),
+      escapeCsvCell(''),
+      escapeCsvCell(''),
+      escapeCsvCell(''),
+      escapeCsvCell(''),
+      escapeCsvCell(''),
+      escapeCsvCell(metaLabel),
+      escapeCsvCell(''),
+      escapeCsvCell(`${note.text}${qtySuffix}`),
+    ]);
   });
 
   return [headers.join(','), ...csvRows.map((row) => row.join(','))].join('\n');
@@ -1142,8 +1175,9 @@ export function downloadDailyCsvReport(
   dateStr: string,
   rows: ConsolidatedItemRow[],
   stations: Workstation[],
+  workerNotes: WorkerNote[] = [],
 ): void {
-  const content = buildDailyCsvContent(dateStr, rows, stations);
+  const content = buildDailyCsvContent(dateStr, rows, stations, workerNotes);
   const blob = new Blob(['\uFEFF' + content], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');

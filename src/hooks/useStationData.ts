@@ -2,8 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { User } from 'firebase/auth';
 import { collection, doc, getDoc, getDocs, onSnapshot, query, where } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../firebase';
-import { loadWorkerStationFallback } from '../services/workerService';
+import {
+  fetchReportEntriesOnce,
+  fetchStationItemsOnce,
+  loadWorkerStationFallback,
+} from '../services/workerService';
 import { getPacksItemsNeedingUnitMigration } from '../utils/inventory';
+import { perfMetrics } from '../utils/perfMetrics';
 import {
   chunkArray,
   computeManagerDateWindow,
@@ -11,6 +16,12 @@ import {
   planHistoricalEntryReportsToFetch,
   planHistoricalReportIdsToFetch,
 } from '../utils/stationDataCache';
+import {
+  getTimestampMs,
+  readWorkerSnapshotCache,
+  writeWorkerSnapshotCache,
+} from '../utils/workerCache';
+import { sortWorkerNotesNewestFirst } from '../utils/workerNotes';
 import type {
   DailyReport,
   DailyReportEntry,
@@ -20,10 +31,11 @@ import type {
   StationLink,
   TeamMember,
   TeamStationId,
+  WorkerNote,
   Workspace,
   Workstation,
 } from '../types';
-import { normalizeStationId } from './useWorkspaceSession';
+import { normalizeStationId, type OptimisticStationContext } from './useWorkspaceSession';
 
 interface WorkerFallbackState {
   station: Workstation | null;
@@ -41,6 +53,7 @@ export function useStationData(params: {
   workspace: Workspace | null;
   canManage: boolean;
   role: TeamStationId;
+  optimisticStationContext?: OptimisticStationContext | null;
   effectiveSelectedDate: string;
   todayStr: string;
   yesterdayStr: string;
@@ -51,12 +64,23 @@ export function useStationData(params: {
     workspace,
     canManage,
     role,
+    optimisticStationContext = null,
     effectiveSelectedDate,
     todayStr,
     yesterdayStr,
   } = params;
 
+  const userUid = user?.uid ?? null;
   const userEmail = (user?.email ?? '').trim().toLowerCase();
+
+  // In worker mode, allow station/report listeners to start in parallel with resolveUserWorkspace
+  // as soon as optimisticStationContext (from QR link) is known.
+  const targetWorkspaceId = workspace?.id ?? optimisticStationContext?.workspaceId ?? null;
+  const targetRole: TeamStationId = workspace
+    ? role
+    : optimisticStationContext?.stationId ?? 'jefe';
+  const targetCanManage = workspace ? canManage : false;
+  const isWorkerTarget = !targetCanManage && targetRole !== 'jefe';
 
   const [stations, setStations] = useState<Workstation[]>([]);
   const [stationsLoaded, setStationsLoaded] = useState(false);
@@ -79,6 +103,7 @@ export function useStationData(params: {
   const [invites, setInvites] = useState<Invite[]>([]);
   const [members, setMembers] = useState<TeamMember[]>([]);
   const [stationLinksByCode, setStationLinksByCode] = useState<Record<string, StationLink>>({});
+  const [workerNotes, setWorkerNotes] = useState<WorkerNote[]>([]);
   const [workerFallback, setWorkerFallback] = useState<WorkerFallbackState | null>(null);
   const [migratedPacksNotice, setMigratedPacksNotice] = useState<PacksUnitMigrationRecord[]>([]);
 
@@ -90,13 +115,27 @@ export function useStationData(params: {
   const historicalReportsRef = useRef<Record<string, DailyReport>>({});
   const checkedMissingReportsRef = useRef<Set<string>>(new Set());
 
+  const workerHydratedKeyRef = useRef<string>('');
+  const syncedWorkerItemsKeyRef = useRef<string>('');
+  const syncedWorkerEntriesKeyRef = useRef<string>('');
+  const itemsRef = useRef<InventoryItem[]>([]);
+  const entriesByReportIdRef = useRef<Record<string, Record<string, DailyReportEntry>>>({});
+
   useEffect(() => {
     historicalReportsRef.current = historicalReportsById;
   }, [historicalReportsById]);
 
-  // Reset state cleanly on sign-out or workspace change
   useEffect(() => {
-    if (user && workspace?.id) return;
+    itemsRef.current = items;
+  }, [items]);
+
+  useEffect(() => {
+    entriesByReportIdRef.current = entriesByReportId;
+  }, [entriesByReportId]);
+
+  // Reset state cleanly on sign-out or missing target workspace
+  useEffect(() => {
+    if (userUid && targetWorkspaceId) return;
     setStations([]);
     setStationsLoaded(false);
     setItems([]);
@@ -110,21 +149,72 @@ export function useStationData(params: {
     fetchedHistoryVersionRef.current = {};
     historicalReportsRef.current = {};
     checkedMissingReportsRef.current = new Set();
+    workerHydratedKeyRef.current = '';
+    syncedWorkerItemsKeyRef.current = '';
+    syncedWorkerEntriesKeyRef.current = '';
     setInvites([]);
     setMembers([]);
     setStationLinksByCode({});
+    setWorkerNotes([]);
     setWorkerFallback(null);
     setMigratedPacksNotice([]);
     packsUnitMigratedIdsRef.current = new Set();
     packsUnitMigrationWorkspaceRef.current = null;
-  }, [user, workspace?.id]);
+  }, [userUid, targetWorkspaceId]);
 
-  // Effect 1A: Static workspace collections for managers (never torn down on date switch)
+  // Effect 0: Instant worker local cache hydration (0ms sheet paint while live listeners sync)
   useEffect(() => {
-    if (!authReady || !user || !workspace?.id || !canManage || !userEmail) return;
+    if (!authReady || !userUid || !targetWorkspaceId || !isWorkerTarget) return;
+    const hydrateKey = `${userUid}:${targetWorkspaceId}:${targetRole}:${effectiveSelectedDate}`;
+    if (workerHydratedKeyRef.current === hydrateKey) return;
+
+    const cached = readWorkerSnapshotCache(userUid);
+    if (!cached || cached.workspace.id !== targetWorkspaceId || cached.role !== targetRole) {
+      return;
+    }
+
+    workerHydratedKeyRef.current = hydrateKey;
+
+    if (cached.station) {
+      setStations([cached.station]);
+      setStationsLoaded(true);
+    }
+    if (cached.items.length > 0 || cached.station) {
+      setItems(cached.items);
+      setItemsLoaded(true);
+      const cachedItemIdsKey = cached.station?.assignedItemIds?.filter(Boolean).join('|') ??
+        cached.items.map((i) => i.id).join('|');
+      if (cached.stationUpdatedAtMs !== null) {
+        syncedWorkerItemsKeyRef.current = `${targetWorkspaceId}:${targetRole}:${cachedItemIdsKey}:${cached.stationUpdatedAtMs}`;
+      }
+    }
+    if (cached.dateStr === effectiveSelectedDate) {
+      if (cached.todayReport) {
+        setLiveReportsById({ [cached.todayReport.id]: cached.todayReport });
+        setEntriesByReportId({ [cached.todayReport.id]: cached.todayEntries });
+        const repUpdatedMs = cached.todayReportUpdatedAtMs;
+        const cachedItemIdsKey = cached.items.map((i) => i.id).join('|');
+        if (repUpdatedMs !== null) {
+          syncedWorkerEntriesKeyRef.current = `${cached.todayReport.id}:${repUpdatedMs}:${cachedItemIdsKey}`;
+        }
+      } else {
+        setLiveReportsById({});
+        setEntriesByReportId({});
+      }
+      setReportsLoaded(true);
+    }
+    if (cached.workerNotes.length > 0) {
+      setWorkerNotes(cached.workerNotes);
+    }
+  }, [authReady, userUid, targetWorkspaceId, isWorkerTarget, targetRole, effectiveSelectedDate]);
+
+  // Effect 1A: Static workspace collections for managers ONLY (never run for workers)
+  useEffect(() => {
+    if (!authReady || !userUid || !workspace?.id || !canManage || !userEmail) return;
     setStationsLoaded(false);
     setItemsLoaded(false);
 
+    const stopStationsMetric = perfMetrics.onListenerStart('stations_list');
     const stationsQuery = query(
       collection(db, 'stations'),
       where('authorizedEmails', 'array-contains', userEmail),
@@ -146,6 +236,7 @@ export function useStationData(params: {
       (err) => handleFirestoreError(err, OperationType.LIST, 'stations'),
     );
 
+    const stopItemsMetric = perfMetrics.onListenerStart('items_list');
     const itemsQuery = query(
       collection(db, 'items'),
       where('authorizedEmails', 'array-contains', userEmail),
@@ -173,23 +264,25 @@ export function useStationData(params: {
     );
 
     return () => {
+      stopStationsMetric();
+      stopItemsMetric();
       unsubStations();
       unsubItems();
     };
-  }, [authReady, user, workspace?.id, canManage, userEmail]);
+  }, [authReady, userUid, workspace?.id, canManage, userEmail]);
 
-  // Effect 1B: Worker static station listener (independent of date selection)
+  // Effect 1B: Worker static station listener (single doc, never torn down on date switch)
   useEffect(() => {
-    if (!authReady || !user || !workspace?.id || canManage || role === 'jefe') return;
-    setStationsLoaded(false);
+    if (!authReady || !userUid || !targetWorkspaceId || !isWorkerTarget) return;
 
-    const stationDocPath = `stations/${role}`;
+    const stationDocPath = `stations/${targetRole}`;
+    const stopMetric = perfMetrics.onListenerStart('stations');
     const unsubStation = onSnapshot(
-      doc(db, 'stations', role),
+      doc(db, 'stations', targetRole),
       (snap) => {
         if (snap.exists()) {
           const st = { id: snap.id, ...snap.data() } as Workstation;
-          setStations(st.workspaceId === workspace.id && st.active ? [st] : []);
+          setStations(st.workspaceId === targetWorkspaceId && st.active ? [st] : []);
         } else {
           setStations([]);
         }
@@ -199,16 +292,18 @@ export function useStationData(params: {
     );
 
     return () => {
+      stopMetric();
       unsubStation();
     };
-  }, [authReady, user, workspace?.id, canManage, role]);
+  }, [authReady, userUid, targetWorkspaceId, isWorkerTarget, targetRole]);
 
-  // Effect 1C: Worker single-date report listener (date change does NOT reset stations/items)
+  // Effect 1C: Worker single-date report listener
   useEffect(() => {
-    if (!authReady || !user || !workspace?.id || canManage || role === 'jefe') return;
+    if (!authReady || !userUid || !targetWorkspaceId || !isWorkerTarget) return;
 
-    const reportId = `${workspace.id}_${effectiveSelectedDate}_${role}`;
+    const reportId = `${targetWorkspaceId}_${effectiveSelectedDate}_${targetRole}`;
     const reportDocPath = `dailyReports/${reportId}`;
+    const stopMetric = perfMetrics.onListenerStart('dailyReports');
     const unsubReport = onSnapshot(
       doc(db, 'dailyReports', reportId),
       (snap) => {
@@ -230,9 +325,10 @@ export function useStationData(params: {
     );
 
     return () => {
+      stopMetric();
       unsubReport();
     };
-  }, [authReady, user, workspace?.id, canManage, role, effectiveSelectedDate]);
+  }, [authReady, userUid, targetWorkspaceId, isWorkerTarget, targetRole, effectiveSelectedDate]);
 
   const managerWindow = useMemo(
     () =>
@@ -251,7 +347,7 @@ export function useStationData(params: {
 
   // Effect 2A: Manager live listeners ONLY for active station docs on selectedDate (+ today)
   useEffect(() => {
-    if (!authReady || !user || !workspace?.id || !canManage || !stationsLoaded) return;
+    if (!authReady || !userUid || !workspace?.id || !canManage || !stationsLoaded) return;
 
     const activeStationIds = stationIdsKey ? stationIdsKey.split('|') : [];
     if (activeStationIds.length === 0) {
@@ -339,7 +435,7 @@ export function useStationData(params: {
     };
   }, [
     authReady,
-    user,
+    userUid,
     workspace?.id,
     canManage,
     stationsLoaded,
@@ -349,7 +445,7 @@ export function useStationData(params: {
 
   // Effect 2B: Manager cached historical dailyReports (7-day weekly + 7-day lookback + yesterday)
   useEffect(() => {
-    if (!authReady || !user || !workspace?.id || !canManage || !stationsLoaded) return;
+    if (!authReady || !userUid || !workspace?.id || !canManage || !stationsLoaded) return;
     const activeStationIds = stationIdsKey ? stationIdsKey.split('|') : [];
     if (activeStationIds.length === 0) return;
 
@@ -409,7 +505,7 @@ export function useStationData(params: {
     };
   }, [
     authReady,
-    user,
+    userUid,
     workspace?.id,
     canManage,
     stationsLoaded,
@@ -430,96 +526,81 @@ export function useStationData(params: {
     return Object.values(merged);
   }, [canManage, historicalReportsById, liveReportsById]);
 
-  // Worker mode: real-time document-level listeners on worker's own station items (micro-batched)
+  const workerStationObj = useMemo(
+    () => (isWorkerTarget ? stations.find((s) => s.id === targetRole) ?? null : null),
+    [isWorkerTarget, stations, targetRole],
+  );
+  const workerStationUpdatedAtMs = getTimestampMs(workerStationObj?.updatedAt);
+
+  // Worker mode: item IDs from active station (replaces N per-item onSnapshot listeners!)
   const workerItemIdsKey = useMemo(() => {
-    if (canManage || role === 'jefe' || !stationsLoaded) return '';
-    const st = stations.find((s) => s.id === role);
-    if (!st) return '';
-    if (Array.isArray(st.assignedItemIds)) {
-      return st.assignedItemIds.filter(Boolean).join('|');
+    if (!isWorkerTarget || !stationsLoaded || !workerStationObj) return '';
+    if (Array.isArray(workerStationObj.assignedItemIds)) {
+      return workerStationObj.assignedItemIds.filter(Boolean).join('|');
     }
-    const nextSlot = Math.min(200, Math.max(1, st.nextItemSlot));
+    const nextSlot = Math.min(200, Math.max(1, workerStationObj.nextItemSlot));
     const legacyIds: string[] = [];
     for (let slot = 1; slot < nextSlot; slot++) {
-      legacyIds.push(`${role}_${slot}`);
+      legacyIds.push(`${targetRole}_${slot}`);
     }
     return legacyIds.join('|');
-  }, [canManage, role, stationsLoaded, stations]);
+  }, [isWorkerTarget, targetRole, stationsLoaded, workerStationObj]);
 
+  // Effect 1D (Worker): Conditional parallel Promise.all item sync triggered by stations/{role} updates.
+  // Eliminates N persistent item onSnapshot listeners AND removes the 800ms fallback delay.
   useEffect(() => {
-    if (!authReady || !user || !workspace?.id || canManage || role === 'jefe' || !stationsLoaded) {
+    if (
+      !authReady ||
+      !userUid ||
+      !targetWorkspaceId ||
+      !isWorkerTarget ||
+      !stationsLoaded
+    ) {
       return;
     }
 
     const itemIds = workerItemIdsKey ? workerItemIdsKey.split('|').filter(Boolean) : [];
-
     if (itemIds.length === 0) {
       setItems([]);
       setItemsLoaded(true);
       return;
     }
 
-    const itemsMap = new Map<string, InventoryItem>();
-    const resolvedIds = new Set<string>();
-    let flushScheduled = false;
-    let unmounted = false;
+    const syncKey = `${targetWorkspaceId}:${targetRole}:${workerItemIdsKey}:${workerStationUpdatedAtMs ?? 'init'}`;
+    if (syncedWorkerItemsKeyRef.current === syncKey && itemsRef.current.length > 0) {
+      setItemsLoaded(true);
+      return;
+    }
 
-    const flushItems = () => {
-      flushScheduled = false;
-      if (unmounted) return;
-      const list = Array.from(itemsMap.values()).sort(
-        (a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name),
-      );
-      setItems(list);
-      if (resolvedIds.size >= itemIds.length) {
+    let cancelled = false;
+    void fetchStationItemsOnce(targetWorkspaceId, targetRole, itemIds)
+      .then((fetched) => {
+        if (cancelled) return;
+        syncedWorkerItemsKeyRef.current = syncKey;
+        setItems(fetched);
         setItemsLoaded(true);
-      }
-    };
-
-    const scheduleFlush = () => {
-      if (!flushScheduled) {
-        flushScheduled = true;
-        queueMicrotask(flushItems);
-      }
-    };
-
-    const unsubs = itemIds.map((itemId) =>
-      onSnapshot(
-        doc(db, 'items', itemId),
-        (snap) => {
-          resolvedIds.add(itemId);
-          if (snap.exists()) {
-            const raw = snap.data() as Omit<InventoryItem, 'id'>;
-            if (raw.workspaceId === workspace.id && normalizeStationId(raw.station) === role) {
-              itemsMap.set(itemId, {
-                ...raw,
-                id: snap.id,
-                station: normalizeStationId(raw.station),
-              });
-            } else {
-              itemsMap.delete(itemId);
-            }
-          } else {
-            itemsMap.delete(itemId);
-          }
-          scheduleFlush();
-        },
-        (err) => handleFirestoreError(err, OperationType.GET, `items/${itemId}`),
-      ),
-    );
-
-    const fallbackTimer = window.setTimeout(() => {
-      if (!unmounted) setItemsLoaded(true);
-    }, 800);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setItemsLoaded(true);
+        }
+      });
 
     return () => {
-      unmounted = true;
-      window.clearTimeout(fallbackTimer);
-      unsubs.forEach((u) => u());
+      cancelled = true;
     };
-  }, [authReady, user, workspace?.id, canManage, role, stationsLoaded, workerItemIdsKey]);
+  }, [
+    authReady,
+    userUid,
+    targetWorkspaceId,
+    isWorkerTarget,
+    targetRole,
+    stationsLoaded,
+    workerItemIdsKey,
+    workerStationUpdatedAtMs,
+  ]);
 
-  // Auto-migrate legacy workspaces that predate dynamic Workstations (lazy-loaded bossService)
+  // Auto-migrate legacy workspaces that predate dynamic Workstations (manager-only, lazy-loaded bossService)
   useEffect(() => {
     if (
       !canManage ||
@@ -542,7 +623,7 @@ export function useStationData(params: {
       });
   }, [canManage, workspace, stationsLoaded, itemsLoaded, stations, items]);
 
-  // Auto-migrate packs items whose stored unit differs from unitLabel without touching numeric quantities
+  // Auto-migrate packs items whose stored unit differs from unitLabel (manager-only)
   useEffect(() => {
     if (!canManage || !workspace?.id || !itemsLoaded) return;
     if (packsUnitMigrationWorkspaceRef.current !== workspace.id) {
@@ -578,30 +659,46 @@ export function useStationData(params: {
   }, []);
 
   const refreshWorkerFallback = useCallback(async () => {
-    if (!workspace?.id || canManage || role === 'jefe') return;
+    if (!targetWorkspaceId || !isWorkerTarget) return;
     try {
       const fb = await loadWorkerStationFallback({
-        workspaceId: workspace.id,
-        stationId: role,
+        workspaceId: targetWorkspaceId,
+        stationId: targetRole,
         dateStr: effectiveSelectedDate,
       });
       setWorkerFallback(fb);
+      if (fb.station) {
+        setStations([fb.station]);
+        setStationsLoaded(true);
+      }
+      if (fb.items.length > 0) {
+        setItems(fb.items);
+        setItemsLoaded(true);
+      }
+      if (fb.report) {
+        const rep = fb.report;
+        setLiveReportsById({ [rep.id]: rep });
+        setEntriesByReportId((prev) => ({
+          ...prev,
+          [rep.id]: fb.entries,
+        }));
+      }
     } catch (err) {
       console.error('Error loading station fallback:', err);
     }
-  }, [workspace?.id, canManage, role, effectiveSelectedDate]);
+  }, [targetWorkspaceId, isWorkerTarget, targetRole, effectiveSelectedDate]);
 
   const effectiveStations = useMemo(() => {
     if (stations.length > 0) return stations;
-    if (!canManage && workerFallback?.station) return [workerFallback.station];
+    if (isWorkerTarget && workerFallback?.station) return [workerFallback.station];
     return stations;
-  }, [stations, canManage, workerFallback?.station]);
+  }, [stations, isWorkerTarget, workerFallback?.station]);
 
   const effectiveItems = useMemo(() => {
     if (items.length > 0) return items;
-    if (!canManage && workerFallback?.items.length) return workerFallback.items;
+    if (isWorkerTarget && workerFallback?.items.length) return workerFallback.items;
     return items;
-  }, [items, canManage, workerFallback?.items]);
+  }, [items, isWorkerTarget, workerFallback?.items]);
 
   const reportsForSelectedDate = useMemo(() => {
     const map: Record<string, DailyReport | undefined> = {};
@@ -611,15 +708,14 @@ export function useStationData(params: {
       }
     });
     if (
-      !canManage &&
-      role !== 'jefe' &&
-      !map[role] &&
+      isWorkerTarget &&
+      !map[targetRole] &&
       workerFallback?.report?.date === effectiveSelectedDate
     ) {
-      map[role] = workerFallback.report;
+      map[targetRole] = workerFallback.report;
     }
     return map;
-  }, [allReports, effectiveSelectedDate, canManage, role, workerFallback?.report]);
+  }, [allReports, effectiveSelectedDate, isWorkerTarget, targetRole, workerFallback?.report]);
 
   const existingReportIdsKey = useMemo(() => {
     return Object.values(reportsForSelectedDate)
@@ -630,23 +726,32 @@ export function useStationData(params: {
   }, [reportsForSelectedDate]);
 
   const workerStationItemIdsKey = useMemo(() => {
-    if (canManage || role === 'jefe') return '';
+    if (!isWorkerTarget) return '';
     return effectiveItems
-      .filter((it) => it.station === role)
+      .filter((it) => it.station === targetRole)
       .map((it) => it.id)
       .join('|');
-  }, [canManage, role, effectiveItems]);
+  }, [isWorkerTarget, targetRole, effectiveItems]);
 
-  // Listen to entries subcollections for existing reports on effectiveSelectedDate
+  const workerSelectedReport = isWorkerTarget
+    ? reportsForSelectedDate[targetRole]
+    : undefined;
+  const workerSelectedReportUpdatedAtMs = getTimestampMs(workerSelectedReport?.updatedAt);
+
+  // Effect 3: Load entries for selectedDate
+  // - Manager mode: real-time collection queries per report (requires authorizedEmails)
+  // - Worker mode: conditional parallel fetch triggered by dailyReports/{today} listener (replaces N entry listeners)
   useEffect(() => {
-    if (!authReady || !user || !workspace?.id) return;
-    const reportIds = existingReportIdsKey ? existingReportIdsKey.split('|') : [];
-    if (reportIds.length === 0) {
-      setEntriesByReportId({});
-      return;
-    }
+    if (!authReady || !userUid || !targetWorkspaceId) return;
 
     if (canManage && userEmail) {
+      const reportIds = existingReportIdsKey ? existingReportIdsKey.split('|') : [];
+      if (reportIds.length === 0) {
+        setEntriesByReportId({});
+        return;
+      }
+
+      const stopEntriesMetric = perfMetrics.onListenerStart('entries_list');
       const unsubs = reportIds.map((repId) => {
         const entriesPath = `dailyReports/${repId}/entries`;
         const q = query(
@@ -671,74 +776,69 @@ export function useStationData(params: {
       });
 
       return () => {
+        stopEntriesMetric();
         unsubs.forEach((u) => u());
       };
     }
 
-    // Worker mode: document-level entry listeners via allow get (micro-batched commits)
-    if (role === 'jefe') return;
-    const targetReportId = reportIds[0];
+    if (!isWorkerTarget) return;
+
+    if (!workerSelectedReport) {
+      setEntriesByReportId({});
+      return;
+    }
+
+    const targetReportId = workerSelectedReport.id;
     const itemIds = workerStationItemIdsKey ? workerStationItemIdsKey.split('|') : [];
-    if (!targetReportId || itemIds.length === 0) return;
+    if (itemIds.length === 0) return;
 
-    const entryMap: Record<string, DailyReportEntry> = {};
-    let flushScheduled = false;
-    let unmounted = false;
+    // Wait for server timestamp resolution when local pending write just flushed
+    if (reportHasPendingWrites && workerSelectedReportUpdatedAtMs === null) {
+      return;
+    }
 
-    const flushEntries = () => {
-      flushScheduled = false;
-      if (unmounted) return;
-      setEntriesByReportId((prev) => ({
-        ...prev,
-        [targetReportId]: { ...entryMap },
-      }));
-    };
+    const syncKey = `${targetReportId}:${workerSelectedReportUpdatedAtMs ?? 'init'}:${workerStationItemIdsKey}`;
+    if (
+      syncedWorkerEntriesKeyRef.current === syncKey &&
+      entriesByReportIdRef.current[targetReportId]
+    ) {
+      return;
+    }
 
-    const scheduleFlush = () => {
-      if (!flushScheduled) {
-        flushScheduled = true;
-        queueMicrotask(flushEntries);
-      }
-    };
-
-    const unsubs = itemIds.map((itemId) =>
-      onSnapshot(
-        doc(db, 'dailyReports', targetReportId, 'entries', itemId),
-        (snap) => {
-          if (snap.exists()) {
-            entryMap[itemId] = { id: snap.id, ...snap.data() } as DailyReportEntry;
-          } else {
-            delete entryMap[itemId];
-          }
-          scheduleFlush();
-        },
-        (err) =>
-          handleFirestoreError(
-            err,
-            OperationType.GET,
-            `dailyReports/${targetReportId}/entries/${itemId}`,
-          ),
-      ),
-    );
+    let cancelled = false;
+    void fetchReportEntriesOnce(targetReportId, itemIds)
+      .then((entryMap) => {
+        if (cancelled) return;
+        syncedWorkerEntriesKeyRef.current = syncKey;
+        setEntriesByReportId((prev) => ({
+          ...prev,
+          [targetReportId]: entryMap,
+        }));
+      })
+      .catch((err) => {
+        console.warn('No se pudieron cargar las entradas de la planilla:', err);
+      });
 
     return () => {
-      unmounted = true;
-      unsubs.forEach((u) => u());
+      cancelled = true;
     };
   }, [
     authReady,
-    user,
+    userUid,
     userEmail,
-    workspace?.id,
+    targetWorkspaceId,
     canManage,
-    role,
+    isWorkerTarget,
     existingReportIdsKey,
+    workerSelectedReport,
+    workerSelectedReportUpdatedAtMs,
     workerStationItemIdsKey,
+    reportHasPendingWrites,
   ]);
 
   // Manager mode: load cached entries for 7-day history + selectedDate 7-day consumption average
   useEffect(() => {
-    if (!authReady || !user || !workspace?.id || !canManage || !userEmail || !reportsLoaded) {
+    if (!authReady || !userUid || !workspace?.id || !canManage || !userEmail || !reportsLoaded) {
       return;
     }
 
@@ -804,7 +904,7 @@ export function useStationData(params: {
     };
   }, [
     authReady,
-    user,
+    userUid,
     workspace?.id,
     canManage,
     userEmail,
@@ -817,10 +917,11 @@ export function useStationData(params: {
     existingReportIdsKey,
   ]);
 
-  // Listen to invites, teamMembers, and stationLinks for managers
+  // Listen to invites, teamMembers, and stationLinks for managers ONLY
   useEffect(() => {
-    if (!authReady || !user || !workspace?.id || !canManage) return;
+    if (!authReady || !userUid || !workspace?.id || !canManage) return;
 
+    const stopTeamMetrics = perfMetrics.onListenerStart('manager_team');
     const invitesQuery = query(
       collection(db, 'invites'),
       where('ownerUid', '==', workspace.ownerUid),
@@ -875,11 +976,54 @@ export function useStationData(params: {
     );
 
     return () => {
+      stopTeamMetrics();
       unsubInvites();
       unsubMembers();
       unsubLinks();
     };
-  }, [authReady, user, workspace?.id, workspace?.ownerUid, canManage]);
+  }, [authReady, userUid, workspace?.id, workspace?.ownerUid, canManage]);
+
+  // Listen to real-time workerNotes (single filtered query)
+  useEffect(() => {
+    if (!authReady || !userUid || !targetWorkspaceId) return;
+    if (canManage && !userEmail) return;
+    if (!canManage && targetRole === 'jefe') return;
+
+    const stopNotesMetric = perfMetrics.onListenerStart('workerNotes');
+    const notesQuery = canManage
+      ? query(
+          collection(db, 'workerNotes'),
+          where('authorizedEmails', 'array-contains', userEmail),
+        )
+      : query(collection(db, 'workerNotes'), where('authorUid', '==', userUid));
+
+    const unsubNotes = onSnapshot(
+      notesQuery,
+      (snap) => {
+        const list: WorkerNote[] = [];
+        snap.forEach((d) => {
+          const raw = d.data() as Omit<WorkerNote, 'id'>;
+          const note: WorkerNote = {
+            ...raw,
+            id: d.id,
+            station: normalizeStationId(raw.station),
+          };
+          if (note.workspaceId === targetWorkspaceId) {
+            if (canManage || note.station === targetRole) {
+              list.push(note);
+            }
+          }
+        });
+        setWorkerNotes(sortWorkerNotesNewestFirst(list));
+      },
+      (err) => handleFirestoreError(err, OperationType.LIST, 'workerNotes'),
+    );
+
+    return () => {
+      stopNotesMetric();
+      unsubNotes();
+    };
+  }, [authReady, userUid, userEmail, targetWorkspaceId, canManage, targetRole]);
 
   const effectiveEntriesByReportId = useMemo(() => {
     if (canManage || !workerFallback?.report) return entriesByReportId;
@@ -917,6 +1061,61 @@ export function useStationData(params: {
     return Object.values(consolidatedEntriesByItemId);
   }, [consolidatedEntriesByItemId]);
 
+  // Write-through snapshot cache update + dev live sync metric for worker sessions
+  useEffect(() => {
+    if (
+      !authReady ||
+      !userUid ||
+      !workspace?.id ||
+      canManage ||
+      role === 'jefe' ||
+      !stationsLoaded ||
+      !itemsLoaded ||
+      !reportsLoaded
+    ) {
+      return;
+    }
+
+    const activeStation = effectiveStations.find((st) => st.id === role) ?? null;
+    const activeReport = reportsForSelectedDate[role] ?? null;
+    const activeEntries = activeReport
+      ? effectiveEntriesByReportId[activeReport.id] ?? {}
+      : {};
+
+    writeWorkerSnapshotCache(userUid, {
+      workspace,
+      workspaceUpdatedAtMs: getTimestampMs(workspace.updatedAt),
+      role,
+      isOwner: false,
+      station: activeStation,
+      stationUpdatedAtMs: getTimestampMs(activeStation?.updatedAt),
+      items: effectiveItems,
+      dateStr: effectiveSelectedDate,
+      todayReport: activeReport,
+      todayReportUpdatedAtMs: getTimestampMs(activeReport?.updatedAt),
+      todayEntries: activeEntries,
+      workerNotes,
+    });
+
+    perfMetrics.mark('liveSyncComplete');
+    perfMetrics.logSummary('worker-live-sync');
+  }, [
+    authReady,
+    userUid,
+    workspace,
+    canManage,
+    role,
+    stationsLoaded,
+    itemsLoaded,
+    reportsLoaded,
+    effectiveStations,
+    effectiveItems,
+    effectiveSelectedDate,
+    reportsForSelectedDate,
+    effectiveEntriesByReportId,
+    workerNotes,
+  ]);
+
   // Keep authorizedEmails limited strictly to owner + active co-admins ('jefe')
   useEffect(() => {
     if (!canManage || !workspace || !stationsLoaded || !itemsLoaded) return;
@@ -947,13 +1146,25 @@ export function useStationData(params: {
           items,
           reports: allReports,
           entries: todayAllEntries,
+          workerNotes,
         }),
       )
       .catch((err) => {
         console.error('Error syncing co-admin access emails:', err);
         syncingEmailsKeyRef.current = '';
       });
-  }, [canManage, workspace, stationsLoaded, itemsLoaded, members, stations, items, allReports, todayAllEntries]);
+  }, [
+    canManage,
+    workspace,
+    stationsLoaded,
+    itemsLoaded,
+    members,
+    stations,
+    items,
+    allReports,
+    todayAllEntries,
+    workerNotes,
+  ]);
 
   const yesterdayHasReports = useMemo(
     () => allReports.some((r) => r.date === yesterdayStr),
@@ -976,6 +1187,7 @@ export function useStationData(params: {
     invites,
     members,
     stationLinksByCode,
+    workerNotes,
     yesterdayHasReports,
     migratedPacksNotice,
     dismissMigratedPacksNotice,

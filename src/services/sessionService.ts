@@ -9,6 +9,7 @@ import {
   setDoc,
   updateDoc,
   where,
+  type DocumentSnapshot,
 } from 'firebase/firestore';
 import {
   DEFAULT_SHIFT_SCHEDULE,
@@ -25,6 +26,12 @@ import type {
   TeamStationId,
   Workspace,
 } from '../types';
+import { perfMetrics } from '../utils/perfMetrics';
+import {
+  readCachedStationLinkPreview,
+  readWorkerSnapshotCache,
+  writeCachedStationLinkPreview,
+} from '../utils/workerCache';
 import { clampString } from './shared';
 
 export interface ResolvedSession {
@@ -42,24 +49,74 @@ export class SessionAccessError extends Error {
   }
 }
 
+interface LiveLinkFetchResult {
+  exists: boolean;
+  link: StationLink | null;
+}
+
+const inFlightLinkFetches = new Map<string, Promise<LiveLinkFetchResult>>();
+
+function fetchLiveStationLink(accessCode: string): Promise<LiveLinkFetchResult> {
+  if (!accessCode || accessCode.length < 6) {
+    return Promise.resolve({ exists: false, link: null });
+  }
+  const existingPromise = inFlightLinkFetches.get(accessCode);
+  if (existingPromise) return existingPromise;
+
+  const promise = (async (): Promise<LiveLinkFetchResult> => {
+    perfMetrics.recordRead('stationLinks');
+    const snap = await getDoc(doc(db, 'stationLinks', accessCode));
+    perfMetrics.mark('linkPreview');
+    if (!snap.exists()) {
+      return { exists: false, link: null };
+    }
+    const data = { id: snap.id, ...snap.data() } as StationLink;
+    if (data.active) {
+      writeCachedStationLinkPreview(data);
+    }
+    return { exists: true, link: data };
+  })().catch((err) => {
+    inFlightLinkFetches.delete(accessCode);
+    throw err;
+  });
+
+  inFlightLinkFetches.set(accessCode, promise);
+  return promise;
+}
+
+export function preloadStationLinkPreview(accessCode: string | null | undefined): void {
+  if (!accessCode || accessCode.length < 6) return;
+  void fetchLiveStationLink(accessCode).catch(() => {
+    // Preview preload is best-effort; resolveUserWorkspace handles errors explicitly
+  });
+}
+
 export async function fetchStationLinkPreview(accessCode: string): Promise<StationLink | null> {
   if (!accessCode || accessCode.length < 6) return null;
   try {
-    const snap = await getDoc(doc(db, 'stationLinks', accessCode));
-    if (!snap.exists()) return null;
-    const data = { id: snap.id, ...snap.data() } as StationLink;
-    return data.active ? data : null;
+    const result = await fetchLiveStationLink(accessCode);
+    return result.link && result.link.active ? result.link : null;
   } catch {
-    return null;
+    return readCachedStationLinkPreview(accessCode);
   }
 }
 
 async function checkIsAdminUser(uid: string): Promise<boolean> {
   try {
+    perfMetrics.recordRead('admins');
     const snap = await getDoc(doc(db, 'admins', uid));
     return snap.exists();
   } catch {
     return false;
+  }
+}
+
+async function safeSpeculativeWorkspaceGet(workspaceId: string): Promise<DocumentSnapshot | null> {
+  try {
+    perfMetrics.recordRead('workspaces');
+    return await getDoc(doc(db, 'workspaces', workspaceId));
+  } catch {
+    return null;
   }
 }
 
@@ -72,61 +129,91 @@ export async function resolveUserWorkspace(
     user.displayName || email.split('@')[0] || 'Usuario',
     MAX_NAME_LENGTH,
   );
-  const isAdmin = await checkIsAdminUser(user.uid);
 
-  // 0. If user arrived via a QR / Share Link (?puesto=...&codigo=...)
   const rawAccessCode = linkParams?.accessCode?.trim() || '';
   if (rawAccessCode.length > 0 && rawAccessCode.length < 6) {
     throw new SessionAccessError('El enlace o código QR ingresado no es válido.');
   }
 
+  const cachedWorkerSnapshot = readWorkerSnapshotCache(user.uid);
+  const cachedLinkPreview =
+    rawAccessCode.length >= 6 ? readCachedStationLinkPreview(rawAccessCode) : null;
+  const speculativeWsId =
+    cachedLinkPreview?.workspaceId ?? cachedWorkerSnapshot?.workspace?.id ?? null;
+
+  const memberRef = doc(db, 'teamMembers', user.uid);
+
+  // 0. If user arrived via a QR / Share Link (?puesto=...&codigo=...):
+  // Parallelize link lookup (often already prefetched), teamMember lookup, admin check & speculative workspace read.
   if (rawAccessCode.length >= 6) {
-    let linkSnap;
+    let linkResult: LiveLinkFetchResult;
+    let existingMemberSnap: DocumentSnapshot;
+    let isAdmin: boolean;
+    let speculativeWsSnap: DocumentSnapshot | null;
+
     try {
-      linkSnap = await getDoc(doc(db, 'stationLinks', rawAccessCode));
+      perfMetrics.recordRead('teamMembers');
+      [linkResult, existingMemberSnap, isAdmin, speculativeWsSnap] = await Promise.all([
+        fetchLiveStationLink(rawAccessCode).catch((error) => {
+          handleFirestoreError(error, OperationType.GET, `stationLinks/${rawAccessCode}`);
+        }),
+        getDoc(memberRef).catch((error) => {
+          handleFirestoreError(error, OperationType.GET, `teamMembers/${user.uid}`);
+        }),
+        checkIsAdminUser(user.uid),
+        speculativeWsId
+          ? safeSpeculativeWorkspaceGet(speculativeWsId)
+          : Promise.resolve(null),
+      ]);
     } catch (error) {
-      handleFirestoreError(error, OperationType.GET, `stationLinks/${rawAccessCode}`);
+      throw error;
     }
 
-    if (!linkSnap.exists()) {
+    if (!linkResult.exists || !linkResult.link) {
       throw new SessionAccessError(
         'Este enlace o código QR ya no es válido porque fue regenerado o eliminado por el jefe.',
       );
     }
 
-    const link = { id: linkSnap.id, ...linkSnap.data() } as StationLink;
+    const link = linkResult.link;
     if (!link.active) {
       throw new SessionAccessError(
         'Este enlace está temporalmente desactivado por el jefe. Pídele que lo reactive o te comparta uno nuevo.',
       );
     }
 
-    const isBoss = link.ownerUid === user.uid || isAdmin;
-    if (isBoss) {
+    const getTargetWorkspace = async (): Promise<Workspace | null> => {
+      if (
+        speculativeWsSnap &&
+        speculativeWsSnap.exists() &&
+        speculativeWsSnap.id === link.workspaceId
+      ) {
+        return { id: speculativeWsSnap.id, ...speculativeWsSnap.data() } as Workspace;
+      }
       try {
+        perfMetrics.recordRead('workspaces');
         const wsSnap = await getDoc(doc(db, 'workspaces', link.workspaceId));
-        if (wsSnap.exists()) {
-          const workspace = { id: wsSnap.id, ...wsSnap.data() } as Workspace;
-          return {
-            workspace,
-            role: 'jefe',
-            isOwner: workspace.ownerUid === user.uid || isAdmin,
-            initialStation: link.stationId,
-            stationLinkInfo: link,
-          };
-        }
+        return wsSnap.exists() ? ({ id: wsSnap.id, ...wsSnap.data() } as Workspace) : null;
       } catch (error) {
         handleFirestoreError(error, OperationType.GET, `workspaces/${link.workspaceId}`);
       }
+    };
+
+    const isBoss = link.ownerUid === user.uid || isAdmin;
+    if (isBoss) {
+      const workspace = await getTargetWorkspace();
+      if (workspace) {
+        return {
+          workspace,
+          role: 'jefe',
+          isOwner: workspace.ownerUid === user.uid || isAdmin,
+          initialStation: link.stationId,
+          stationLinkInfo: link,
+        };
+      }
     }
 
-    const memberRef = doc(db, 'teamMembers', user.uid);
-    let existingMemberSnap;
-    try {
-      existingMemberSnap = await getDoc(memberRef);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.GET, `teamMembers/${user.uid}`);
-    }
+    const desiredMemberDisplayName = link.workerName || displayName;
 
     if (existingMemberSnap.exists()) {
       const existing = { id: existingMemberSnap.id, ...existingMemberSnap.data() } as TeamMember;
@@ -139,10 +226,10 @@ export async function resolveUserWorkspace(
         );
       }
       if (existing.station === 'jefe') {
-        const wsSnap = await getDoc(doc(db, 'workspaces', link.workspaceId));
-        if (wsSnap.exists()) {
+        const workspace = await getTargetWorkspace();
+        if (workspace) {
           return {
-            workspace: { id: wsSnap.id, ...wsSnap.data() } as Workspace,
+            workspace,
             role: 'jefe',
             isOwner: false,
             initialStation: link.stationId,
@@ -156,23 +243,29 @@ export async function resolveUserWorkspace(
         );
       }
 
-      try {
-        await updateDoc(memberRef, {
+      // Only update teamMember metadata when inviteId or displayName actually changed, and never block QR entry
+      if (
+        existing.inviteId !== rawAccessCode ||
+        existing.displayName !== desiredMemberDisplayName
+      ) {
+        perfMetrics.recordWrite('teamMembers');
+        void updateDoc(memberRef, {
           inviteId: rawAccessCode,
-          displayName: link.workerName || displayName,
+          displayName: desiredMemberDisplayName,
           updatedAt: serverTimestamp(),
+        }).catch((error) => {
+          console.warn('No se pudo actualizar metadatos de miembro en segundo plano:', error);
         });
-      } catch (error) {
-        handleFirestoreError(error, OperationType.UPDATE, `teamMembers/${user.uid}`);
       }
     } else {
       try {
+        perfMetrics.recordWrite('teamMembers');
         await setDoc(memberRef, {
           workspaceId: link.workspaceId,
           ownerUid: link.ownerUid,
           uid: user.uid,
           email,
-          displayName: link.workerName || displayName,
+          displayName: desiredMemberDisplayName,
           station: link.stationId,
           inviteId: rawAccessCode,
           active: true,
@@ -184,30 +277,29 @@ export async function resolveUserWorkspace(
       }
     }
 
-    try {
-      const wsSnap = await getDoc(doc(db, 'workspaces', link.workspaceId));
-      if (wsSnap.exists()) {
-        return {
-          workspace: { id: wsSnap.id, ...wsSnap.data() } as Workspace,
-          role: link.stationId,
-          isOwner: false,
-          initialStation: link.stationId,
-          stationLinkInfo: link,
-        };
-      }
-    } catch (error) {
-      handleFirestoreError(error, OperationType.GET, `workspaces/${link.workspaceId}`);
+    const workspace = await getTargetWorkspace();
+    if (workspace) {
+      return {
+        workspace,
+        role: link.stationId,
+        isOwner: false,
+        initialStation: link.stationId,
+        stationLinkInfo: link,
+      };
     }
   }
 
-  // 1. Check existing teamMember profile
-  const memberPath = `teamMembers/${user.uid}`;
-  let memberSnap;
-  try {
-    memberSnap = await getDoc(doc(db, 'teamMembers', user.uid));
-  } catch (error) {
-    handleFirestoreError(error, OperationType.GET, memberPath);
-  }
+  // 1. Direct entry (no QR params): parallelize teamMembers/{uid}, admins/{uid}, and speculative workspace read
+  perfMetrics.recordRead('teamMembers');
+  const [memberSnap, isAdmin, speculativeWsSnap] = await Promise.all([
+    getDoc(memberRef).catch((error) => {
+      handleFirestoreError(error, OperationType.GET, `teamMembers/${user.uid}`);
+    }),
+    checkIsAdminUser(user.uid),
+    cachedWorkerSnapshot?.workspace?.id
+      ? safeSpeculativeWorkspaceGet(cachedWorkerSnapshot.workspace.id)
+      : Promise.resolve(null),
+  ]);
 
   if (memberSnap.exists()) {
     const member = { id: memberSnap.id, ...memberSnap.data() } as TeamMember;
@@ -218,7 +310,21 @@ export async function resolveUserWorkspace(
         );
       }
     } else {
+      if (
+        speculativeWsSnap &&
+        speculativeWsSnap.exists() &&
+        speculativeWsSnap.id === member.workspaceId
+      ) {
+        const workspace = { id: speculativeWsSnap.id, ...speculativeWsSnap.data() } as Workspace;
+        return {
+          workspace,
+          role: member.station,
+          isOwner: workspace.ownerUid === user.uid || isAdmin,
+        };
+      }
+
       try {
+        perfMetrics.recordRead('workspaces');
         const wsSnap = await getDoc(doc(db, 'workspaces', member.workspaceId));
         if (wsSnap.exists()) {
           const workspace = { id: wsSnap.id, ...wsSnap.data() } as Workspace;
@@ -234,74 +340,79 @@ export async function resolveUserWorkspace(
     }
   }
 
-  // 2. Check pending email invite
-  if (email) {
-    try {
-      const inviteQuery = query(collection(db, 'invites'), where('email', '==', email));
-      const inviteSnaps = await getDocs(inviteQuery);
-      if (!inviteSnaps.empty) {
-        const inviteDoc = inviteSnaps.docs[0];
-        const invite = { id: inviteDoc.id, ...inviteDoc.data() } as Invite;
+  // 2 & 3. Invited user or owner/admin: parallelize invites query, main workspace, and owned workspaces
+  const [inviteResult, mainWsSnap, ownedSnaps] = await Promise.all([
+    email
+      ? (() => {
+          perfMetrics.recordRead('invites');
+          return getDocs(query(collection(db, 'invites'), where('email', '==', email))).catch(
+            (error) => {
+              handleFirestoreError(error, OperationType.LIST, 'invites');
+            },
+          );
+        })()
+      : Promise.resolve(null),
+    (() => {
+      perfMetrics.recordRead('workspaces');
+      return getDoc(doc(db, 'workspaces', MAIN_WORKSPACE_ID)).catch(() => null);
+    })(),
+    (() => {
+      perfMetrics.recordRead('workspaces');
+      return getDocs(query(collection(db, 'workspaces'), where('ownerUid', '==', user.uid))).catch(
+        () => null,
+      );
+    })(),
+  ]);
 
-        await setDoc(doc(db, 'teamMembers', user.uid), {
-          workspaceId: invite.workspaceId,
-          ownerUid: invite.ownerUid,
-          uid: user.uid,
-          email,
-          displayName: invite.displayName || displayName,
-          station: invite.station,
-          inviteId: invite.id,
-          active: true,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+  if (inviteResult && !inviteResult.empty) {
+    const inviteDoc = inviteResult.docs[0];
+    const invite = { id: inviteDoc.id, ...inviteDoc.data() } as Invite;
 
-        const wsSnap = await getDoc(doc(db, 'workspaces', invite.workspaceId));
-        if (wsSnap.exists()) {
-          const workspace = { id: wsSnap.id, ...wsSnap.data() } as Workspace;
-          return {
-            workspace,
-            role: invite.station,
-            isOwner: workspace.ownerUid === user.uid || isAdmin,
-          };
-        }
-      }
-    } catch (error) {
-      handleFirestoreError(error, OperationType.LIST, 'invites');
+    perfMetrics.recordWrite('teamMembers');
+    await setDoc(memberRef, {
+      workspaceId: invite.workspaceId,
+      ownerUid: invite.ownerUid,
+      uid: user.uid,
+      email,
+      displayName: invite.displayName || displayName,
+      station: invite.station,
+      inviteId: invite.id,
+      active: true,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    perfMetrics.recordRead('workspaces');
+    const wsSnap = await getDoc(doc(db, 'workspaces', invite.workspaceId));
+    if (wsSnap.exists()) {
+      const workspace = { id: wsSnap.id, ...wsSnap.data() } as Workspace;
+      return {
+        workspace,
+        role: invite.station,
+        isOwner: workspace.ownerUid === user.uid || isAdmin,
+      };
     }
   }
 
-  // 3. Check existing owned/authorized workspaces
-  try {
-    const mainWsSnap = await getDoc(doc(db, 'workspaces', MAIN_WORKSPACE_ID));
-    if (mainWsSnap.exists()) {
-      const workspace = { id: mainWsSnap.id, ...mainWsSnap.data() } as Workspace;
-      if (
-        isAdmin ||
-        workspace.ownerUid === user.uid ||
-        (email && workspace.authorizedEmails.includes(email))
-      ) {
-        return {
-          workspace,
-          role: 'jefe',
-          isOwner: workspace.ownerUid === user.uid || isAdmin,
-        };
-      }
+  if (mainWsSnap && mainWsSnap.exists()) {
+    const workspace = { id: mainWsSnap.id, ...mainWsSnap.data() } as Workspace;
+    if (
+      isAdmin ||
+      workspace.ownerUid === user.uid ||
+      (email && workspace.authorizedEmails.includes(email))
+    ) {
+      return {
+        workspace,
+        role: 'jefe',
+        isOwner: workspace.ownerUid === user.uid || isAdmin,
+      };
     }
-  } catch {
-    // User does not have access to MAIN_WORKSPACE_ID; continue to personal workspace
   }
 
-  try {
-    const ownedQuery = query(collection(db, 'workspaces'), where('ownerUid', '==', user.uid));
-    const ownedSnaps = await getDocs(ownedQuery);
-    if (!ownedSnaps.empty) {
-      const firstWs = ownedSnaps.docs[0];
-      const workspace = { id: firstWs.id, ...firstWs.data() } as Workspace;
-      return { workspace, role: 'jefe', isOwner: true };
-    }
-  } catch {
-    // Fall through to creating personal workspace
+  if (ownedSnaps && !ownedSnaps.empty) {
+    const firstWs = ownedSnaps.docs[0];
+    const workspace = { id: firstWs.id, ...firstWs.data() } as Workspace;
+    return { workspace, role: 'jefe', isOwner: true };
   }
 
   // 4. Create or open workspace for owner/admin (lazy-loads bossService for seed data)
@@ -309,6 +420,7 @@ export async function resolveUserWorkspace(
   const wsPath = `workspaces/${targetWsId}`;
 
   try {
+    perfMetrics.recordRead('workspaces');
     const wsSnap = await getDoc(doc(db, 'workspaces', targetWsId));
     if (wsSnap.exists()) {
       const workspace = { id: wsSnap.id, ...wsSnap.data() } as Workspace;
@@ -325,6 +437,7 @@ export async function resolveUserWorkspace(
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     };
+    perfMetrics.recordWrite('workspaces');
     await setDoc(doc(db, 'workspaces', targetWsId), newWorkspaceData);
 
     const createdSnap = await getDoc(doc(db, 'workspaces', targetWsId));

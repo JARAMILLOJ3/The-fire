@@ -19,6 +19,7 @@ import {
   Settings,
   ShieldAlert,
   ShoppingBag,
+  StickyNote,
   Trash2,
   TrendingUp,
   Users,
@@ -33,6 +34,7 @@ import type {
   PacksUnitMigrationRecord,
   ShiftSchedule,
   StationId,
+  WorkerNote,
   Workspace,
   Workstation,
 } from '../types';
@@ -60,6 +62,10 @@ import {
   hasClosingDeadlinePassed,
   normalizeShiftSchedule,
 } from '../utils/schedule';
+import {
+  formatWorkerNoteContextLabel,
+  sortWorkerNotesNewestFirst,
+} from '../utils/workerNotes';
 
 const RestaurantResetModal = lazy(() =>
   import('./RestaurantResetModal').then((m) => ({ default: m.RestaurantResetModal })),
@@ -86,6 +92,7 @@ interface BossDashboardProps {
   entriesByItemId: Record<string, DailyReportEntry>;
   allReports: DailyReport[];
   entriesByReportId: Record<string, Record<string, DailyReportEntry>>;
+  workerNotes?: WorkerNote[];
   onSelectDate: (dateStr: string) => void;
   onOpenStation: (stationId: StationId) => void;
   onGoToWorkstations: () => void;
@@ -149,6 +156,7 @@ export function BossDashboard({
   entriesByItemId,
   allReports,
   entriesByReportId,
+  workerNotes = [],
   onSelectDate,
   onOpenStation,
   onGoToWorkstations,
@@ -166,6 +174,8 @@ export function BossDashboard({
   const [copiedToast, setCopiedToast] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
   const [resetModalOpen, setResetModalOpen] = useState(false);
+  const [confirmDeleteNoteId, setConfirmDeleteNoteId] = useState<string | null>(null);
+  const [deletingNoteId, setDeletingNoteId] = useState<string | null>(null);
 
   const isRestaurantEmpty = stations.length === 0 && items.length === 0;
   const activeItemsCount = items.filter((it) => it.active).length;
@@ -286,6 +296,20 @@ export function BossDashboard({
       })
       .filter((n): n is { stationName: string; workerName: string; notes: string } => Boolean(n));
   }, [stations, reportsByStation]);
+
+  const sortedWorkerNotes = useMemo(
+    () => sortWorkerNotesNewestFirst(workerNotes),
+    [workerNotes],
+  );
+
+  const workerNotesByStation = useMemo(() => {
+    const map: Record<string, WorkerNote[]> = {};
+    sortedWorkerNotes.forEach((n) => {
+      if (!map[n.station]) map[n.station] = [];
+      map[n.station].push(n);
+    });
+    return map;
+  }, [sortedWorkerNotes]);
 
   const closingDeadlinePassed = useMemo(
     () =>
@@ -444,7 +468,20 @@ export function BossDashboard({
   };
 
   const handleExportCsv = () => {
-    downloadDailyCsvReport(selectedDate, consolidatedRows, stations);
+    downloadDailyCsvReport(selectedDate, consolidatedRows, stations, sortedWorkerNotes);
+  };
+
+  const handleDeleteWorkerNote = async (noteId: string) => {
+    setDeletingNoteId(noteId);
+    try {
+      const { deleteWorkerNoteByBoss } = await import('../services/bossService');
+      await deleteWorkerNoteByBoss(noteId);
+      setConfirmDeleteNoteId(null);
+    } catch (err) {
+      console.error('Error al borrar nota:', err);
+    } finally {
+      setDeletingNoteId(null);
+    }
   };
 
   const showSwitchToYesterday =
@@ -944,26 +981,96 @@ export function BossDashboard({
       )}
 
       {/* Actionable Daily Highlights: Notes & Things to Keep in Mind */}
-      {stationNotes.length > 0 && (
-        <section className="bg-amber-50/70 border border-amber-200 rounded-2xl p-4 sm:p-5 space-y-2.5">
-          <div className="flex items-center gap-2 text-sm font-bold text-amber-950">
-            <MessageSquareText className="w-4 h-4 text-amber-700 shrink-0" />
-            <span>Novedades y notas dejadas por las trabajadoras</span>
+      {(stationNotes.length > 0 || sortedWorkerNotes.length > 0) && (
+        <section className="bg-amber-50/70 border border-amber-200 rounded-2xl p-4 sm:p-5 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-sm font-bold text-amber-950">
+              <MessageSquareText className="w-4 h-4 text-amber-700 shrink-0" />
+              <span>Novedades y notas dejadas por las trabajadoras</span>
+            </div>
+            <span className="text-[11px] text-amber-800">No modifican el inventario</span>
           </div>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
-            {stationNotes.map((item) => (
-              <div
-                key={item.stationName}
-                className="bg-white/90 border border-amber-200/80 rounded-xl px-3.5 py-2.5 text-sm"
-              >
-                <p className="text-xs font-semibold text-stone-900">
-                  {item.stationName}{' '}
-                  <span className="font-normal text-stone-600">· {item.workerName}</span>
-                </p>
-                <p className="text-xs text-stone-700 mt-0.5">&ldquo;{item.notes}&rdquo;</p>
-              </div>
-            ))}
-          </div>
+
+          {sortedWorkerNotes.length > 0 && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+              {sortedWorkerNotes.map((note) => {
+                const stName = stationMap[note.station]?.name ?? note.station;
+                const contextLabel = formatWorkerNoteContextLabel(note);
+                const isConfirming = confirmDeleteNoteId === note.id;
+                return (
+                  <div
+                    key={note.id}
+                    className="bg-white/95 border border-amber-200/80 rounded-xl px-3.5 py-2.5 text-sm space-y-1.5"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="text-xs font-semibold text-stone-900">
+                          {stName}{' '}
+                          <span className="font-normal text-stone-600">· {note.authorName}</span>{' '}
+                          <span className="font-mono tabular-nums font-normal text-stone-500">
+                            · {note.timeLabel}
+                          </span>
+                        </p>
+                        {contextLabel && (
+                          <p className="text-[11px] font-semibold text-orange-800 mt-0.5">
+                            {contextLabel}
+                          </p>
+                        )}
+                      </div>
+                      {isConfirming ? (
+                        <div className="flex items-center gap-1 shrink-0 no-print">
+                          <button
+                            type="button"
+                            disabled={deletingNoteId === note.id}
+                            onClick={() => handleDeleteWorkerNote(note.id)}
+                            className="min-h-[32px] px-2 py-1 text-[11px] font-semibold text-white bg-red-600 rounded-lg hover:bg-red-700 disabled:opacity-50 cursor-pointer"
+                          >
+                            {deletingNoteId === note.id ? '...' : 'Eliminar'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteNoteId(null)}
+                            className="min-h-[32px] px-2 py-1 text-[11px] font-semibold text-stone-700 bg-stone-100 rounded-lg hover:bg-stone-200 cursor-pointer"
+                          >
+                            No
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDeleteNoteId(note.id)}
+                          aria-label={`Borrar nota de ${stName}`}
+                          className="min-w-[32px] min-h-[32px] flex items-center justify-center text-stone-400 hover:text-red-700 hover:bg-red-50 rounded-lg shrink-0 no-print cursor-pointer"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
+                    <p className="text-xs text-stone-800 leading-relaxed break-words">
+                      &ldquo;{note.text}&rdquo;
+                    </p>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {stationNotes.length > 0 && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+              {stationNotes.map((item) => (
+                <div
+                  key={item.stationName}
+                  className="bg-white/90 border border-amber-200/80 rounded-xl px-3.5 py-2.5 text-sm"
+                >
+                  <p className="text-xs font-semibold text-stone-900">
+                    {item.stationName}{' '}
+                    <span className="font-normal text-stone-600">· {item.workerName} (cierre)</span>
+                  </p>
+                  <p className="text-xs text-stone-700 mt-0.5">&ldquo;{item.notes}&rdquo;</p>
+                </div>
+              ))}
+            </div>
+          )}
         </section>
       )}
 
@@ -986,6 +1093,7 @@ export function BossDashboard({
           {stations.map((station) => {
             const report = reportsByStation[station.id];
             const stationRows = consolidatedRows.filter((r) => r.item.station === station.id);
+            const stationQuickNotes = workerNotesByStation[station.id] ?? [];
             const lowCount = stationRows.filter(
               (r) => r.stockLevel === 'agotado' || r.stockLevel === 'comprar',
             ).length;
@@ -1058,6 +1166,34 @@ export function BossDashboard({
                     <p className="text-xs text-stone-600 bg-stone-50 rounded-xl px-2.5 py-1.5 line-clamp-2 border border-stone-100">
                       &ldquo;{report.notes}&rdquo;
                     </p>
+                  )}
+
+                  {stationQuickNotes.length > 0 && (
+                    <div className="space-y-1">
+                      <p className="text-[11px] font-semibold text-amber-800 flex items-center gap-1">
+                        <StickyNote className="w-3 h-3 shrink-0" />
+                        <span>
+                          {stationQuickNotes.length}{' '}
+                          {stationQuickNotes.length === 1 ? 'nota rápida' : 'notas rápidas'}
+                        </span>
+                      </p>
+                      {stationQuickNotes.slice(0, 2).map((n) => (
+                        <p
+                          key={n.id}
+                          className="text-xs text-stone-700 bg-amber-50/70 rounded-xl px-2.5 py-1.5 line-clamp-2 border border-amber-200/70"
+                        >
+                          <span className="font-mono text-[11px] text-amber-900">
+                            {n.timeLabel}
+                          </span>{' '}
+                          · {n.text}
+                        </p>
+                      ))}
+                      {stationQuickNotes.length > 2 && (
+                        <p className="text-[11px] text-stone-500">
+                          +{stationQuickNotes.length - 2} más en &ldquo;Ver planilla&rdquo;
+                        </p>
+                      )}
+                    </div>
                   )}
                 </div>
 

@@ -10,7 +10,9 @@ import {
   RotateCcw,
   Save,
   Search,
+  StickyNote,
   Sun,
+  Trash2,
   WifiOff,
   X,
 } from 'lucide-react';
@@ -18,7 +20,7 @@ import { MAX_NOTES_LENGTH } from '../constants';
 import {
   ConcurrencyConflictError,
   DiagnosticSaveError,
-  fetchStationEntriesOnce,
+  fetchStationEntriesWithStatusOnce,
   saveStationReportBatch,
 } from '../services/workerService';
 import type {
@@ -27,6 +29,7 @@ import type {
   DraftEntryRow,
   InventoryItem,
   OpeningAuditStatus,
+  WorkerNote,
   Workspace,
   Workstation,
 } from '../types';
@@ -46,10 +49,17 @@ import {
   type StationSaveErrorInfo,
 } from '../utils/inventory';
 import { formatTime12h, type WorkerScheduleStatus } from '../utils/schedule';
+import {
+  formatWorkerNoteContextLabel,
+  sortWorkerNotesNewestFirst,
+} from '../utils/workerNotes';
+import { perfMetrics } from '../utils/perfMetrics';
+import { readWorkerSnapshotCache, writeWorkerSnapshotCache } from '../utils/workerCache';
 import { ShiftDesktopItemRow } from './shift/ShiftDesktopItemRow';
 import { ShiftMobileItemCard } from './shift/ShiftMobileItemCard';
 import { ShiftOutsideHoursView } from './shift/ShiftOutsideHoursView';
 import { ShiftSubmitConfirmModal } from './shift/ShiftSubmitConfirmModal';
+import { WorkerNotesModal } from './shift/WorkerNotesModal';
 
 interface StationShiftViewProps {
   workspace: Workspace;
@@ -61,8 +71,11 @@ interface StationShiftViewProps {
   items: InventoryItem[];
   report: DailyReport | undefined;
   entriesByItemId: Record<string, DailyReportEntry>;
+  workerNotes?: WorkerNote[];
   isOnline?: boolean;
   hasPendingWrites?: boolean;
+  reportsLoaded?: boolean;
+  isCacheHydrated?: boolean;
   onSaved?: () => void;
 }
 
@@ -237,8 +250,11 @@ export function StationShiftView({
   items,
   report,
   entriesByItemId,
+  workerNotes = [],
   isOnline = true,
   hasPendingWrites = false,
+  reportsLoaded = true,
+  isCacheHydrated = false,
   onSaved,
 }: StationShiftViewProps) {
   const stationItems = useMemo(
@@ -286,6 +302,27 @@ export function StationShiftView({
     anomalies: EntryAnomaly[];
   } | null>(null);
   const [isTextInputFocused, setIsTextInputFocused] = useState(false);
+  const [notesModalOpen, setNotesModalOpen] = useState(false);
+  const [bossConfirmDeleteNoteId, setBossConfirmDeleteNoteId] = useState<string | null>(null);
+  const [bossDeletingNoteId, setBossDeletingNoteId] = useState<string | null>(null);
+
+  const sortedStationWorkerNotes = useMemo(
+    () => sortWorkerNotesNewestFirst(workerNotes),
+    [workerNotes],
+  );
+
+  const handleBossDeleteNote = useCallback(async (noteId: string) => {
+    setBossDeletingNoteId(noteId);
+    try {
+      const { deleteWorkerNoteByBoss } = await import('../services/bossService');
+      await deleteWorkerNoteByBoss(noteId);
+      setBossConfirmDeleteNoteId(null);
+    } catch (err) {
+      console.error('Error al borrar nota del puesto:', err);
+    } finally {
+      setBossDeletingNoteId(null);
+    }
+  }, []);
 
   const touchedRef = useRef<Record<string, TouchedFlags>>({});
   const notesTouchedRef = useRef(false);
@@ -312,6 +349,17 @@ export function StationShiftView({
     report?.updatedAt && typeof report.updatedAt.toMillis === 'function'
       ? report.updatedAt.toMillis()
       : null;
+
+  useEffect(() => {
+    if (!canManage) {
+      perfMetrics.mark('firstSheetPaint', {
+        paintSource: isCacheHydrated ? 'cache' : 'network',
+      });
+      if (isCacheHydrated) {
+        perfMetrics.logSummary('worker-cache-paint');
+      }
+    }
+  }, [canManage, isCacheHydrated]);
 
   useEffect(() => {
     return () => {
@@ -559,75 +607,131 @@ export function StationShiftView({
     }
   }, [stationItems, entriesByItemId, report?.notes, report?.updatedAt, report?.reportedByName, storageKey]);
 
-  // 3. Auto-preload yesterday's closing as "Por confirmar" (hasOpening remains false until confirmed or edited)
+  // 3. Auto-preload yesterday's closing as "Por confirmar" (skipping items that already have opening/prevClosing and reusing cache)
   useEffect(() => {
-    if (isWorkerOutsideHours || stationItems.length === 0) return;
+    if (isWorkerOutsideHours || !reportsLoaded || stationItems.length === 0) return;
     const itemSignature = stationItems.map((i) => i.id).join(',');
     const key = `${workspace.id}_${selectedDate}_${station.id}_${itemSignature}`;
     if (yesterdayPreloadKeyRef.current === key) return;
     yesterdayPreloadKeyRef.current = key;
 
-    let cancelled = false;
     const prevDate = getPreviousDateStr(selectedDate);
     setYesterdayDateStr(prevDate);
-    setYesterdayStatus('loading');
 
-    fetchStationEntriesOnce(
-      workspace.id,
-      prevDate,
-      station.id,
-      stationItems.map((i) => i.id),
-    )
-      .then((prevEntries) => {
-        if (cancelled) return;
-        const validClosings = Object.values(prevEntries).filter(
-          (e) => e && e.hasClosing && !e.notApplicable,
-        );
-        const anyExistingPrevClosing = Object.values(latestEntriesRef.current).some(
-          (e) => typeof e?.previousClosing === 'number',
-        );
+    const itemsMissingPrev = stationItems.filter((it) => {
+      const entry = latestEntriesRef.current[it.id];
+      return (
+        !entry?.hasOpening &&
+        !entry?.notApplicable &&
+        typeof entry?.previousClosing !== 'number'
+      );
+    });
 
-        if (validClosings.length === 0 && !anyExistingPrevClosing) {
-          setYesterdayStatus('none');
-          return;
-        }
+    if (itemsMissingPrev.length === 0) {
+      const anyExistingPrevClosing = Object.values(latestEntriesRef.current).some(
+        (e) => typeof e?.previousClosing === 'number',
+      );
+      setYesterdayStatus(anyExistingPrevClosing ? 'found' : 'none');
+      return;
+    }
 
-        setYesterdayStatus('found');
-        setDrafts((prev) => {
-          let changed = false;
-          const updated = { ...prev };
+    const applyPrevEntriesToDrafts = (prevEntries: Record<string, DailyReportEntry>) => {
+      const validClosings = Object.values(prevEntries).filter(
+        (e) => e && e.hasClosing && !e.notApplicable,
+      );
+      const anyExistingPrevClosing = Object.values(latestEntriesRef.current).some(
+        (e) => typeof e?.previousClosing === 'number',
+      );
 
-          Object.keys(updated).forEach((itemId) => {
-            const cur = updated[itemId];
-            const prevEntry = prevEntries[itemId];
-            if (!prevEntry || !prevEntry.hasClosing || prevEntry.notApplicable) return;
+      if (validClosings.length === 0 && !anyExistingPrevClosing) {
+        setYesterdayStatus('none');
+        return;
+      }
 
-            const touched = touchedRef.current[itemId];
-            const remoteEntry = latestEntriesRef.current[itemId];
-            const nextPrevClosing = prevEntry.closing;
+      setYesterdayStatus('found');
+      setDrafts((prev) => {
+        let changed = false;
+        const updated = { ...prev };
 
-            // Only attach previousClosing + prefill opening as "Por confirmar" when not yet saved/edited
-            if (!cur.hasOpening && !cur.notApplicable && !touched?.opening && !touched?.notApplicable && !remoteEntry?.hasOpening) {
-              if (cur.opening !== nextPrevClosing || cur.previousClosing !== nextPrevClosing) {
-                updated[itemId] = {
-                  ...cur,
-                  opening: nextPrevClosing,
-                  hasOpening: false,
-                  previousClosing: nextPrevClosing,
-                };
-                changed = true;
-              }
-            } else if (cur.previousClosing === undefined) {
+        Object.keys(updated).forEach((itemId) => {
+          const cur = updated[itemId];
+          const prevEntry = prevEntries[itemId];
+          if (!prevEntry || !prevEntry.hasClosing || prevEntry.notApplicable) return;
+
+          const touched = touchedRef.current[itemId];
+          const remoteEntry = latestEntriesRef.current[itemId];
+          const nextPrevClosing = prevEntry.closing;
+
+          if (
+            !cur.hasOpening &&
+            !cur.notApplicable &&
+            !touched?.opening &&
+            !touched?.notApplicable &&
+            !remoteEntry?.hasOpening
+          ) {
+            if (cur.opening !== nextPrevClosing || cur.previousClosing !== nextPrevClosing) {
               updated[itemId] = {
                 ...cur,
+                opening: nextPrevClosing,
+                hasOpening: false,
                 previousClosing: nextPrevClosing,
               };
               changed = true;
             }
-          });
-
-          return changed ? updated : prev;
+          } else if (cur.previousClosing === undefined) {
+            updated[itemId] = {
+              ...cur,
+              previousClosing: nextPrevClosing,
+            };
+            changed = true;
+          }
         });
+
+        return changed ? updated : prev;
+      });
+    };
+
+    if (!canManage) {
+      const cached = readWorkerSnapshotCache(user.uid);
+      if (
+        cached &&
+        cached.workspace.id === workspace.id &&
+        cached.role === station.id &&
+        cached.yesterdayDateStr === prevDate &&
+        cached.yesterdayStatus
+      ) {
+        if (cached.yesterdayStatus === 'none') {
+          setYesterdayStatus('none');
+          return;
+        }
+        if (cached.yesterdayEntries) {
+          applyPrevEntriesToDrafts(cached.yesterdayEntries);
+          return;
+        }
+      }
+    }
+
+    let cancelled = false;
+    setYesterdayStatus('loading');
+
+    fetchStationEntriesWithStatusOnce(
+      workspace.id,
+      prevDate,
+      station.id,
+      itemsMissingPrev.map((i) => i.id),
+    )
+      .then((result) => {
+        if (cancelled) return;
+        applyPrevEntriesToDrafts(result.entries);
+        if (!canManage) {
+          writeWorkerSnapshotCache(user.uid, {
+            workspace,
+            role: station.id,
+            yesterdayDateStr: prevDate,
+            yesterdayStatus: result.reportExists ? 'found' : 'none',
+            yesterdayEntries: result.entries,
+          });
+        }
       })
       .catch(() => {
         if (!cancelled) {
@@ -638,7 +742,16 @@ export function StationShiftView({
     return () => {
       cancelled = true;
     };
-  }, [isWorkerOutsideHours, workspace.id, selectedDate, station.id, stationItems]);
+  }, [
+    isWorkerOutsideHours,
+    reportsLoaded,
+    canManage,
+    user.uid,
+    workspace,
+    selectedDate,
+    station.id,
+    stationItems,
+  ]);
 
   const applyRowMutation = useCallback(
     (
@@ -1104,17 +1217,6 @@ export function StationShiftView({
   const closingTime = report?.status === 'completed' ? formatTimeShort(report?.updatedAt) : null;
   const draftTime = report?.status === 'opening_saved' ? formatTimeShort(report?.updatedAt) : null;
 
-  // Outside Allowed Shift Schedule (Workers only)
-  if (isWorkerOutsideHours) {
-    return (
-      <ShiftOutsideHoursView
-        station={station}
-        selectedDate={selectedDate}
-        scheduleStatus={scheduleStatus}
-      />
-    );
-  }
-
   const showClosingThankYou =
     !canManage && (submittedThankYouMode === 'closing' || isLocked);
   const showOpeningThankYou =
@@ -1123,13 +1225,70 @@ export function StationShiftView({
     (submittedThankYouMode === 'opening' ||
       (isWorkerOpeningPhase && report?.status === 'opening_saved' && !isCompleted));
 
+  const hasMobileBottomCtaBar =
+    !canManage &&
+    !isWorkerOutsideHours &&
+    !showClosingThankYou &&
+    !showOpeningThankYou &&
+    stationItems.length > 0 &&
+    !isLocked &&
+    !isTextInputFocused;
+
+  const workerNotesFloatingUi = !canManage ? (
+    <>
+      <button
+        type="button"
+        onClick={() => setNotesModalOpen(true)}
+        className={`fixed right-4 z-40 min-h-[46px] inline-flex items-center gap-2 px-4 py-2.5 text-sm font-semibold text-white bg-stone-950 border border-stone-800 rounded-2xl shadow-lg hover:bg-stone-900 active:scale-[0.98] transition-all no-print cursor-pointer ${
+          hasMobileBottomCtaBar
+            ? 'bottom-[calc(5rem+env(safe-area-inset-bottom))] lg:bottom-6'
+            : 'bottom-[calc(1rem+env(safe-area-inset-bottom))] lg:bottom-6'
+        }`}
+      >
+        <StickyNote className="w-4 h-4 text-orange-400 shrink-0" />
+        <span>
+          Mis notas
+          {sortedStationWorkerNotes.length > 0 ? ` (${sortedStationWorkerNotes.length})` : ''}
+        </span>
+      </button>
+
+      <WorkerNotesModal
+        open={notesModalOpen}
+        onClose={() => setNotesModalOpen(false)}
+        workspace={workspace}
+        user={user}
+        station={station}
+        operationalDate={selectedDate}
+        stationItems={stationItems}
+        notes={sortedStationWorkerNotes}
+      />
+    </>
+  ) : null;
+
+  // Outside Allowed Shift Schedule (Workers only)
+  if (isWorkerOutsideHours) {
+    return (
+      <>
+        <div className="pb-20 lg:pb-8">
+          <ShiftOutsideHoursView
+            station={station}
+            selectedDate={selectedDate}
+            scheduleStatus={scheduleStatus}
+          />
+        </div>
+        {workerNotesFloatingUi}
+      </>
+    );
+  }
+
   // Full-screen non-editable thank-you view after successful save (apertura or cierre)
   if (showClosingThankYou || showOpeningThankYou) {
     const closingStart12h = formatTime12h(scheduleStatus.schedule.closingStart);
     const openingStart12h = formatTime12h(scheduleStatus.schedule.openingStart);
 
     return (
-      <div className="min-h-[65dvh] py-6 sm:py-12 flex items-center justify-center">
+      <>
+        <div className="min-h-[65dvh] pt-6 pb-24 sm:py-12 flex items-center justify-center">
         <div className="w-full max-w-lg bg-white border border-emerald-200 rounded-2xl p-5 sm:p-8 text-center space-y-5 shadow-xs animate-tf-fade-up">
           <div className="w-16 h-16 rounded-2xl bg-emerald-50 border border-emerald-200 text-emerald-700 flex items-center justify-center mx-auto">
             <CheckCircle2 className="w-9 h-9" />
@@ -1209,13 +1368,16 @@ export function StationShiftView({
             </span>
           </div>
         </div>
-      </div>
+        </div>
+        {workerNotesFloatingUi}
+      </>
     );
   }
 
   return (
-    <div
-      ref={viewContainerRef}
+    <>
+      <div
+        ref={viewContainerRef}
       onFocusCapture={handleContainerFocusCapture}
       onBlurCapture={handleContainerBlurCapture}
       className="space-y-4 sm:space-y-5 pb-32 lg:pb-8 min-w-0"
@@ -1618,6 +1780,80 @@ export function StationShiftView({
         )}
       </div>
 
+      {/* Boss-Visible Station Worker Notes */}
+      {canManage && sortedStationWorkerNotes.length > 0 && (
+        <div className="bg-amber-50/70 border border-amber-200 rounded-2xl p-4 sm:p-5 space-y-3">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-sm font-bold text-amber-950">
+              <StickyNote className="w-4 h-4 text-amber-700 shrink-0" />
+              <span>
+                Notas rápidas de la trabajadora ({sortedStationWorkerNotes.length})
+              </span>
+            </div>
+            <span className="text-[11px] text-amber-800">No modifican el inventario</span>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+            {sortedStationWorkerNotes.map((note) => {
+              const contextLabel = formatWorkerNoteContextLabel(note);
+              const isConfirming = bossConfirmDeleteNoteId === note.id;
+              return (
+                <div
+                  key={note.id}
+                  className="bg-white/95 border border-amber-200/90 rounded-xl px-3.5 py-2.5 space-y-1.5"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="text-xs font-semibold text-stone-900">
+                        {note.authorName}{' '}
+                        <span className="font-mono tabular-nums font-normal text-stone-500">
+                          · {note.timeLabel}
+                        </span>
+                      </p>
+                      {contextLabel && (
+                        <p className="text-[11px] font-semibold text-orange-800 mt-0.5">
+                          {contextLabel}
+                        </p>
+                      )}
+                    </div>
+                    {isConfirming ? (
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          type="button"
+                          disabled={bossDeletingNoteId === note.id}
+                          onClick={() => handleBossDeleteNote(note.id)}
+                          className="min-h-[32px] px-2 py-1 text-[11px] font-semibold text-white bg-red-600 rounded-lg hover:bg-red-700 disabled:opacity-50 cursor-pointer"
+                        >
+                          {bossDeletingNoteId === note.id ? '...' : 'Eliminar'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setBossConfirmDeleteNoteId(null)}
+                          className="min-h-[32px] px-2 py-1 text-[11px] font-semibold text-stone-700 bg-stone-100 rounded-lg hover:bg-stone-200 cursor-pointer"
+                        >
+                          No
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => setBossConfirmDeleteNoteId(note.id)}
+                        aria-label={`Borrar nota de ${note.authorName}`}
+                        className="min-w-[32px] min-h-[32px] flex items-center justify-center text-stone-400 hover:text-red-700 hover:bg-red-50 rounded-lg shrink-0 cursor-pointer"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+                  <p className="text-xs text-stone-800 leading-relaxed break-words">
+                    {note.text}
+                  </p>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Notes & Desktop Save Section */}
       {stationItems.length > 0 && (
         <div className="bg-white border border-stone-200 rounded-2xl p-4 sm:p-5 space-y-4">
@@ -1922,6 +2158,8 @@ export function StationShiftView({
           confirmModalState && executeSave(confirmModalState.mode)
         }
       />
-    </div>
+      </div>
+      {workerNotesFloatingUi}
+    </>
   );
 }

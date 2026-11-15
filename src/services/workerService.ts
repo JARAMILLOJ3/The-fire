@@ -1,6 +1,21 @@
 import type { User } from 'firebase/auth';
-import { doc, getDoc, serverTimestamp, setDoc, updateDoc, writeBatch } from 'firebase/firestore';
-import { MAX_NAME_LENGTH, MAX_NOTES_LENGTH } from '../constants';
+import {
+  deleteDoc,
+  deleteField,
+  doc,
+  getDoc,
+  serverTimestamp,
+  setDoc,
+  updateDoc,
+  writeBatch,
+} from 'firebase/firestore';
+import {
+  MAX_NAME_LENGTH,
+  MAX_NOTES_LENGTH,
+  MAX_TIME_LABEL_LENGTH,
+  MAX_UNIT_LENGTH,
+  MAX_WORKER_NOTE_LENGTH,
+} from '../constants';
 import { db, handleFirestoreError, OperationType } from '../firebase';
 import type {
   DailyReport,
@@ -13,7 +28,10 @@ import type {
   Workspace,
   Workstation,
 } from '../types';
-import { clampNumber, clampString } from './shared';
+import { formatBogotaTimeExact, getOperationalDateStr } from '../utils/date';
+import { getEffectiveItemUnit } from '../utils/inventory';
+import { perfMetrics } from '../utils/perfMetrics';
+import { clampNumber, clampString, makeCleanId } from './shared';
 
 export class ConcurrencyConflictError extends Error {
   readonly reason: 'completed_locked' | 'concurrent_create' | 'concurrent_update';
@@ -129,6 +147,65 @@ export function evaluateReportSaveGuard(params: {
   };
 }
 
+export async function fetchStationItemsOnce(
+  workspaceId: string,
+  stationId: StationId,
+  itemIds: string[],
+): Promise<InventoryItem[]> {
+  if (itemIds.length === 0) return [];
+  perfMetrics.recordRead('items', itemIds.length);
+  const snaps = await Promise.all(
+    itemIds.map((itemId) =>
+      getDoc(doc(db, 'items', itemId)).catch((err) => {
+        handleFirestoreError(err, OperationType.GET, `items/${itemId}`);
+      }),
+    ),
+  );
+
+  const list: InventoryItem[] = [];
+  snaps.forEach((snap) => {
+    if (!snap.exists()) return;
+    const raw = snap.data() as Omit<InventoryItem, 'id'>;
+    const normalizedStation = raw.station === 'hamburguesas' ? 'comida_rapida' : raw.station;
+    if (raw.workspaceId === workspaceId && normalizedStation === stationId) {
+      list.push({
+        ...raw,
+        id: snap.id,
+        station: normalizedStation,
+      });
+    }
+  });
+  list.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name));
+  return list;
+}
+
+export async function fetchReportEntriesOnce(
+  reportId: string,
+  itemIds: string[],
+): Promise<Record<string, DailyReportEntry>> {
+  if (!reportId || itemIds.length === 0) return {};
+  perfMetrics.recordRead('todayEntries', itemIds.length);
+  const snaps = await Promise.all(
+    itemIds.map((itemId) =>
+      getDoc(doc(db, 'dailyReports', reportId, 'entries', itemId)).catch((err) => {
+        handleFirestoreError(
+          err,
+          OperationType.GET,
+          `dailyReports/${reportId}/entries/${itemId}`,
+        );
+      }),
+    ),
+  );
+  const map: Record<string, DailyReportEntry> = {};
+  snaps.forEach((snap) => {
+    if (snap.exists()) {
+      const entry = { id: snap.id, ...snap.data() } as DailyReportEntry;
+      map[entry.itemId] = entry;
+    }
+  });
+  return map;
+}
+
 export async function loadWorkerStationFallback(params: {
   workspaceId: string;
   stationId: string;
@@ -141,6 +218,7 @@ export async function loadWorkerStationFallback(params: {
 }> {
   const { workspaceId, stationId, dateStr } = params;
   try {
+    perfMetrics.recordRead('stations');
     const stSnap = await getDoc(doc(db, 'stations', stationId));
     const station = stSnap.exists()
       ? ({ id: stSnap.id, ...stSnap.data() } as Workstation)
@@ -160,36 +238,25 @@ export async function loadWorkerStationFallback(params: {
       }
     }
 
-    const itemPromises = itemIdsToFetch.map((id) =>
-      getDoc(doc(db, 'items', id)).then((snap) =>
-        snap.exists() ? ({ id: snap.id, ...snap.data() } as InventoryItem) : null,
-      ),
-    );
-    const fetchedItems = (await Promise.all(itemPromises)).filter(
-      (it): it is InventoryItem => Boolean(it && it.active && it.station === stationId),
-    );
-    fetchedItems.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name));
-
     const reportId = `${workspaceId}_${dateStr}_${stationId}`;
-    const repSnap = await getDoc(doc(db, 'dailyReports', reportId));
+    perfMetrics.recordRead('dailyReports');
+    const [fetchedItems, repSnap] = await Promise.all([
+      fetchStationItemsOnce(workspaceId, stationId, itemIdsToFetch).then((items) =>
+        items.filter((it) => it.active),
+      ),
+      getDoc(doc(db, 'dailyReports', reportId)),
+    ]);
+
     const report = repSnap.exists()
       ? ({ id: repSnap.id, ...repSnap.data() } as DailyReport)
       : undefined;
 
-    const entries: Record<string, DailyReportEntry> = {};
-    if (report) {
-      const entrySnaps = await Promise.all(
-        fetchedItems.map((it) =>
-          getDoc(doc(db, 'dailyReports', reportId, 'entries', it.id)),
-        ),
-      );
-      entrySnaps.forEach((snap) => {
-        if (snap.exists()) {
-          const entry = { id: snap.id, ...snap.data() } as DailyReportEntry;
-          entries[entry.itemId] = entry;
-        }
-      });
-    }
+    const entries = report
+      ? await fetchReportEntriesOnce(
+          reportId,
+          fetchedItems.map((it) => it.id),
+        )
+      : {};
 
     return { station, items: fetchedItems, report, entries };
   } catch (error) {
@@ -197,18 +264,22 @@ export async function loadWorkerStationFallback(params: {
   }
 }
 
-export async function fetchStationEntriesOnce(
+export async function fetchStationEntriesWithStatusOnce(
   workspaceId: string,
   dateStr: string,
   station: StationId,
   itemIds: string[],
-): Promise<Record<string, DailyReportEntry>> {
+): Promise<{ reportExists: boolean; entries: Record<string, DailyReportEntry> }> {
   const reportId = `${workspaceId}_${dateStr}_${station}`;
   const path = `dailyReports/${reportId}`;
   try {
+    perfMetrics.recordRead('yesterdayReport');
     const repSnap = await getDoc(doc(db, 'dailyReports', reportId));
-    if (!repSnap.exists()) return {};
+    if (!repSnap.exists() || itemIds.length === 0) {
+      return { reportExists: repSnap.exists(), entries: {} };
+    }
 
+    perfMetrics.recordRead('yesterdayEntries', itemIds.length);
     const snaps = await Promise.all(
       itemIds.map((itemId) => getDoc(doc(db, 'dailyReports', reportId, 'entries', itemId))),
     );
@@ -219,10 +290,20 @@ export async function fetchStationEntriesOnce(
         map[entry.itemId] = entry;
       }
     });
-    return map;
+    return { reportExists: true, entries: map };
   } catch (error) {
     handleFirestoreError(error, OperationType.GET, path);
   }
+}
+
+export async function fetchStationEntriesOnce(
+  workspaceId: string,
+  dateStr: string,
+  station: StationId,
+  itemIds: string[],
+): Promise<Record<string, DailyReportEntry>> {
+  const result = await fetchStationEntriesWithStatusOnce(workspaceId, dateStr, station, itemIds);
+  return result.entries;
 }
 
 export async function saveStationReportBatch(params: {
@@ -529,7 +610,6 @@ export async function saveStationReportBatch(params: {
     Promise.all(batches.map((b) => b.commit())).catch((error) => {
       console.error('Error al sincronizar envío offline al reconectar:', error);
     });
-    await new Promise((resolve) => window.setTimeout(resolve, 120));
     return { queuedOffline: true };
   }
 
@@ -778,5 +858,109 @@ export async function saveStationReportBatch(params: {
     }
 
     return { queuedOffline: false };
+  }
+}
+
+export async function createWorkerNote(params: {
+  workspace: Workspace;
+  user: User;
+  station: Workstation;
+  text: string;
+  item?: InventoryItem;
+  quantity?: number;
+  now?: Date;
+}): Promise<string> {
+  const { workspace, user, station, text, item, quantity, now = new Date() } = params;
+  const noteId = makeCleanId('nota');
+  const cleanText = clampString(text, MAX_WORKER_NOTE_LENGTH);
+  if (!cleanText) {
+    throw new Error('Escribe una nota antes de guardar.');
+  }
+
+  const authorName = clampString(
+    user.displayName || user.email?.split('@')[0] || station.workerName || 'Encargada',
+    MAX_NAME_LENGTH,
+  );
+  const authorizedEmails =
+    Array.isArray(workspace.authorizedEmails) && workspace.authorizedEmails.length > 0
+      ? workspace.authorizedEmails.slice(0, 15)
+      : [workspace.ownerEmail.trim().toLowerCase()];
+
+  const payload: Record<string, unknown> = {
+    workspaceId: workspace.id,
+    ownerUid: workspace.ownerUid,
+    authorizedEmails,
+    station: station.id,
+    authorUid: user.uid,
+    authorName,
+    date: getOperationalDateStr(now),
+    timeLabel: clampString(formatBogotaTimeExact(now), MAX_TIME_LABEL_LENGTH),
+    text: cleanText,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  };
+
+  if (item) {
+    payload.itemId = item.id;
+    payload.itemName = clampString(item.name, MAX_NAME_LENGTH);
+    payload.itemUnit = clampString(getEffectiveItemUnit(item), MAX_UNIT_LENGTH);
+  }
+  if (typeof quantity === 'number' && Number.isFinite(quantity) && quantity >= 0) {
+    payload.quantity = clampNumber(quantity);
+  }
+
+  try {
+    await setDoc(doc(db, 'workerNotes', noteId), payload);
+    return noteId;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, `workerNotes/${noteId}`);
+  }
+}
+
+export async function updateWorkerNote(params: {
+  noteId: string;
+  text: string;
+  item?: InventoryItem;
+  quantity?: number;
+}): Promise<void> {
+  const { noteId, text, item, quantity } = params;
+  const cleanText = clampString(text, MAX_WORKER_NOTE_LENGTH);
+  if (!cleanText) {
+    throw new Error('Escribe una nota antes de guardar.');
+  }
+
+  const updates: Record<string, unknown> = {
+    text: cleanText,
+    updatedAt: serverTimestamp(),
+  };
+
+  if (item) {
+    updates.itemId = item.id;
+    updates.itemName = clampString(item.name, MAX_NAME_LENGTH);
+    updates.itemUnit = clampString(getEffectiveItemUnit(item), MAX_UNIT_LENGTH);
+  } else {
+    updates.itemId = deleteField();
+    updates.itemName = deleteField();
+    updates.itemUnit = deleteField();
+  }
+
+  if (typeof quantity === 'number' && Number.isFinite(quantity) && quantity >= 0) {
+    updates.quantity = clampNumber(quantity);
+  } else {
+    updates.quantity = deleteField();
+  }
+
+  try {
+    await updateDoc(doc(db, 'workerNotes', noteId), updates);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `workerNotes/${noteId}`);
+  }
+}
+
+export async function deleteWorkerNote(noteId: string): Promise<void> {
+  try {
+    await deleteDoc(doc(db, 'workerNotes', noteId));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, `workerNotes/${noteId}`);
   }
 }

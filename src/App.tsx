@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Calendar,
   Citrus,
@@ -18,32 +18,44 @@ import {
 } from 'lucide-react';
 import { AuthScreen } from './components/AuthScreen';
 import { BrandLogo } from './components/BrandLogo';
+import { LazyViewBoundary, lazyWithRetry } from './components/LazyViewBoundary';
+import { StationShiftSkeleton } from './components/shift/StationShiftSkeleton';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { useShiftClock } from './hooks/useShiftClock';
 import { useStationData } from './hooks/useStationData';
 import { useWorkspaceSession } from './hooks/useWorkspaceSession';
 import type { DailyReport, DailyReportEntry, StationId } from './types';
+import { hasCachedWorkerHint } from './utils/workerCache';
+
+const loadStationShiftView = () =>
+  import('./components/StationShiftView').then((m) => ({ default: m.StationShiftView }));
+
+// Preload worker view chunk immediately if opening via QR link or returning worker cache
+if (typeof window !== 'undefined') {
+  const sp = new URLSearchParams(window.location.search);
+  if (sp.get('codigo') || sp.get('puesto') || hasCachedWorkerHint()) {
+    void loadStationShiftView();
+  }
+}
 
 // Lazy-load role-specific views so worker QR sessions skip boss dashboards, QR generators & modals
-const StationShiftView = lazy(() =>
-  import('./components/StationShiftView').then((m) => ({ default: m.StationShiftView })),
-);
-const BossDashboard = lazy(() =>
+const StationShiftView = lazyWithRetry(loadStationShiftView);
+const BossDashboard = lazyWithRetry(() =>
   import('./components/BossDashboard').then((m) => ({ default: m.BossDashboard })),
 );
-const WorkstationsManager = lazy(() =>
+const WorkstationsManager = lazyWithRetry(() =>
   import('./components/WorkstationsManager').then((m) => ({ default: m.WorkstationsManager })),
 );
-const CatalogManager = lazy(() =>
+const CatalogManager = lazyWithRetry(() =>
   import('./components/CatalogManager').then((m) => ({ default: m.CatalogManager })),
 );
-const TeamManager = lazy(() =>
+const TeamManager = lazyWithRetry(() =>
   import('./components/TeamManager').then((m) => ({ default: m.TeamManager })),
 );
-const BossWelcomeModal = lazy(() =>
+const BossWelcomeModal = lazyWithRetry(() =>
   import('./components/BossWelcomeModal').then((m) => ({ default: m.BossWelcomeModal })),
 );
-const ShiftScheduleModal = lazy(() =>
+const ShiftScheduleModal = lazyWithRetry(() =>
   import('./components/ShiftScheduleModal').then((m) => ({ default: m.ShiftScheduleModal })),
 );
 
@@ -81,6 +93,7 @@ export default function App() {
   const {
     linkParams,
     pendingLink,
+    optimisticStationContext,
     user,
     authReady,
     authLoading,
@@ -95,6 +108,20 @@ export default function App() {
     handleSignIn,
     handleSignOut,
   } = useWorkspaceSession();
+
+  const isWorkerEntryHint = Boolean(
+    linkParams.accessCode ||
+      linkParams.stationId ||
+      (workspace && !canManage) ||
+      (!authReady && hasCachedWorkerHint()),
+  );
+
+  // Preload StationShiftView as soon as a worker role is confirmed
+  useEffect(() => {
+    if (workspace && !canManage && role !== 'jefe') {
+      void loadStationShiftView();
+    }
+  }, [workspace, canManage, role]);
 
   const { scheduleStatus: workerScheduleStatus, todayStr, yesterdayStr } = useShiftClock(
     workspace?.shiftSchedule,
@@ -156,6 +183,7 @@ export default function App() {
     invites,
     members,
     stationLinksByCode,
+    workerNotes,
     yesterdayHasReports,
     migratedPacksNotice,
     dismissMigratedPacksNotice,
@@ -166,6 +194,7 @@ export default function App() {
     workspace,
     canManage,
     role,
+    optimisticStationContext,
     effectiveSelectedDate,
     todayStr,
     yesterdayStr,
@@ -216,11 +245,24 @@ export default function App() {
     [currentStationReportId, effectiveEntriesByReportId],
   );
 
+  const selectedDateWorkerNotes = useMemo(
+    () => workerNotes.filter((n) => n.date === effectiveSelectedDate),
+    [workerNotes, effectiveSelectedDate],
+  );
+
+  const currentStationWorkerNotes = useMemo(
+    () =>
+      currentStation
+        ? selectedDateWorkerNotes.filter((n) => n.station === currentStation.id)
+        : [],
+    [selectedDateWorkerNotes, currentStation],
+  );
+
   const handleStationSaved = useCallback(() => {
-    if (!canManage) {
+    if (!canManage && (!isOnline || !stationsLoaded || !itemsLoaded)) {
       void refreshWorkerFallback();
     }
-  }, [canManage, refreshWorkerFallback]);
+  }, [canManage, isOnline, stationsLoaded, itemsLoaded, refreshWorkerFallback]);
 
   const handleSelectDate = useCallback((nextDate: string) => {
     if (!nextDate) return;
@@ -242,6 +284,18 @@ export default function App() {
   }, [todayStr]);
 
   if (!authReady) {
+    if (isWorkerEntryHint) {
+      return (
+        <div className="min-h-dvh bg-stone-50 text-stone-900">
+          <div className="max-w-6xl w-full mx-auto px-3.5 sm:px-6 lg:px-8 py-5 sm:py-8">
+            <StationShiftSkeleton
+              stationName={pendingLink?.stationName}
+              workerName={pendingLink?.workerName}
+            />
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="min-h-dvh bg-stone-50 flex items-center justify-center p-6">
         <div className="flex items-center gap-3 text-sm font-medium text-stone-600">
@@ -265,9 +319,9 @@ export default function App() {
   }
 
   if (sessionLoading || !workspace) {
-    return (
-      <div className="min-h-dvh bg-stone-50 flex flex-col items-center justify-center p-6 gap-4">
-        {sessionError ? (
+    if (sessionError) {
+      return (
+        <div className="min-h-dvh bg-stone-50 flex flex-col items-center justify-center p-6 gap-4">
           <div className="max-w-md bg-white border border-red-200 rounded-2xl p-6 text-center space-y-4">
             <p className="text-sm text-red-700">{sessionError}</p>
             <button
@@ -278,12 +332,29 @@ export default function App() {
               Cerrar sesión
             </button>
           </div>
-        ) : (
-          <div className="w-full max-w-md space-y-3">
-            <div className="h-5 w-44 bg-stone-200 rounded-lg animate-pulse mx-auto" />
-            <div className="h-3 w-64 bg-stone-200 rounded-lg animate-pulse mx-auto" />
+        </div>
+      );
+    }
+
+    if (isWorkerEntryHint) {
+      return (
+        <div className="min-h-dvh bg-stone-50 text-stone-900">
+          <div className="max-w-6xl w-full mx-auto px-3.5 sm:px-6 lg:px-8 py-5 sm:py-8">
+            <StationShiftSkeleton
+              stationName={pendingLink?.stationName}
+              workerName={pendingLink?.workerName}
+            />
           </div>
-        )}
+        </div>
+      );
+    }
+
+    return (
+      <div className="min-h-dvh bg-stone-50 flex flex-col items-center justify-center p-6 gap-4">
+        <div className="w-full max-w-md space-y-3">
+          <div className="h-5 w-44 bg-stone-200 rounded-lg animate-pulse mx-auto" />
+          <div className="h-3 w-64 bg-stone-200 rounded-lg animate-pulse mx-auto" />
+        </div>
       </div>
     );
   }
@@ -586,10 +657,29 @@ export default function App() {
         {/* Workspace Viewport */}
         <main className="flex-1 max-w-6xl w-full mx-auto px-3.5 sm:px-6 lg:px-8 py-5 sm:py-8 min-w-0">
           {dataLoading ? (
-            <ViewSkeleton />
+            !canManage || isWorkerEntryHint ? (
+              <StationShiftSkeleton
+                stationName={currentStation?.name ?? pendingLink?.stationName}
+                workerName={currentStation?.workerName ?? pendingLink?.workerName}
+              />
+            ) : (
+              <ViewSkeleton />
+            )
           ) : (
-            <Suspense fallback={<ViewSkeleton />}>
-              <div key={activeSection} className="min-w-0 animate-tf-fade-up">
+            <LazyViewBoundary resetKey={activeSection}>
+              <Suspense
+                fallback={
+                  !canManage ? (
+                    <StationShiftSkeleton
+                      stationName={currentStation?.name ?? pendingLink?.stationName}
+                      workerName={currentStation?.workerName ?? pendingLink?.workerName}
+                    />
+                  ) : (
+                    <ViewSkeleton />
+                  )
+                }
+              >
+                <div key={activeSection} className="min-w-0 animate-tf-fade-up">
                     {activeSection === 'jefe' && canManage ? (
                       <BossDashboard
                         workspace={workspace}
@@ -609,6 +699,7 @@ export default function App() {
                         entriesByItemId={consolidatedEntriesByItemId}
                         allReports={allReports}
                         entriesByReportId={dashboardEntriesByReportId}
+                        workerNotes={selectedDateWorkerNotes}
                         onSelectDate={handleSelectDate}
                         onOpenStation={(stId) => navigateTo(stId)}
                         onGoToWorkstations={() => navigateTo('puestos')}
@@ -672,8 +763,11 @@ export default function App() {
                         items={effectiveItems}
                         report={reportsForSelectedDate[currentStation.id]}
                         entriesByItemId={currentStationEntries}
+                        workerNotes={currentStationWorkerNotes}
                         isOnline={isOnline}
                         hasPendingWrites={reportHasPendingWrites}
+                        reportsLoaded={reportsLoaded}
+                        isCacheHydrated={!canManage && hasCachedWorkerHint()}
                         onSaved={handleStationSaved}
                       />
                     ) : (
@@ -699,7 +793,8 @@ export default function App() {
                     )}
                 </div>
               </Suspense>
-            )}
+            </LazyViewBoundary>
+          )}
           </main>
         </div>
 
