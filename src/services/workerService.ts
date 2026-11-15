@@ -23,14 +23,22 @@ import type {
   DraftEntryRow,
   InventoryItem,
   ReportStatus,
+  ShiftSchedule,
   StationId,
   TeamMember,
   Workspace,
   Workstation,
 } from '../types';
-import { formatBogotaTimeExact, getOperationalDateStr } from '../utils/date';
+import {
+  formatBogotaTimeExact,
+  getOperationalDateStr,
+  getServerNow,
+  syncServerClockOffset,
+} from '../utils/date';
+import { MAX_BATCH_SIZE } from '../utils/batch';
 import { getEffectiveItemUnit } from '../utils/inventory';
 import { perfMetrics } from '../utils/perfMetrics';
+import { resolveWorkerScheduleStatus } from '../utils/schedule';
 import { clampNumber, clampString, makeCleanId } from './shared';
 
 export class ConcurrencyConflictError extends Error {
@@ -306,6 +314,228 @@ export async function fetchStationEntriesOnce(
   return result.entries;
 }
 
+const EMAIL_REGEX = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+
+export function buildNormalizedAuthorizedEmails(
+  workspace: Pick<Workspace, 'ownerEmail' | 'authorizedEmails'>,
+): string[] {
+  const ownerEmail = (workspace.ownerEmail ?? '').trim().toLowerCase();
+  const rawList = (workspace.authorizedEmails ?? []).map((e) => e.trim().toLowerCase());
+  const candidates = ownerEmail ? [ownerEmail, ...rawList] : rawList;
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+  for (const email of candidates) {
+    if (email.length >= 3 && email.length <= 120 && EMAIL_REGEX.test(email) && !seen.has(email)) {
+      seen.add(email);
+      deduped.push(email);
+      if (deduped.length >= 15) break;
+    }
+  }
+  return deduped;
+}
+
+export function validateWorkerSubmitPhase(params: {
+  canManage: boolean;
+  mode: 'opening' | 'closing';
+  schedule?: ShiftSchedule;
+  now: Date;
+  reportPath: string;
+}): void {
+  const { canManage, mode, schedule, now, reportPath } = params;
+  if (canManage || !schedule?.enabled) return;
+
+  const status = resolveWorkerScheduleStatus(now, schedule);
+  if (status.phase === 'outside') {
+    throw new DiagnosticSaveError({
+      title: 'Cambio de horario detectado',
+      detail: 'El horario de captura ya terminó. Recarga la pantalla para ver el próximo horario.',
+      failedDocumentPath: reportPath,
+      code: 'phase-mismatch',
+    });
+  }
+  if (mode === 'opening' && status.phase === 'closing') {
+    throw new DiagnosticSaveError({
+      title: 'Cambio de horario detectado',
+      detail: 'Ya empezó el cierre, recarga la pantalla para pasar al inventario de cierre.',
+      failedDocumentPath: reportPath,
+      code: 'phase-mismatch',
+    });
+  }
+  if (mode === 'closing' && status.phase === 'opening') {
+    throw new DiagnosticSaveError({
+      title: 'Cambio de horario detectado',
+      detail: 'Todavía estás en horario de apertura, recarga la pantalla para guardar el inicio.',
+      failedDocumentPath: reportPath,
+      code: 'phase-mismatch',
+    });
+  }
+}
+
+export interface PreparedEntryOp {
+  itemId: string;
+  itemName: string;
+  kind: 'update' | 'set';
+  hasOpening: boolean;
+  hasClosing: boolean;
+  notApplicable: boolean;
+  updateFields: Record<string, unknown>;
+  createFields: Record<string, unknown>;
+}
+
+export function prepareStationReportEntries(params: {
+  workspace: Workspace;
+  userUid: string;
+  reporterName: string;
+  canManage: boolean;
+  date: string;
+  station: StationId;
+  reportId: string;
+  mode: 'opening' | 'closing';
+  rows: DraftEntryRow[];
+  mergedExistingEntries: Record<string, DailyReportEntry>;
+  authorizedEmails: string[];
+  timestampValue: unknown;
+}): PreparedEntryOp[] {
+  const {
+    workspace,
+    userUid,
+    reporterName,
+    canManage,
+    date,
+    station,
+    reportId,
+    mode,
+    rows,
+    mergedExistingEntries,
+    authorizedEmails,
+    timestampValue,
+  } = params;
+
+  const ops: PreparedEntryOp[] = [];
+
+  rows.forEach((row) => {
+    const prev = mergedExistingEntries[row.itemId];
+    const notApplicable = Boolean(row.notApplicable);
+    const hasOpening = notApplicable
+      ? false
+      : row.hasOpening || Boolean(prev?.hasOpening && mode === 'closing');
+    const hasClosing = notApplicable
+      ? false
+      : row.hasClosing || Boolean(prev?.hasClosing && mode === 'opening');
+    const addedVal = clampNumber(row.added);
+
+    if (!prev && !hasOpening && !hasClosing && !notApplicable && addedVal === 0) {
+      return;
+    }
+
+    const openingVal =
+      !row.hasOpening && prev?.hasOpening ? clampNumber(prev.opening) : clampNumber(row.opening);
+    const effectiveAdded =
+      !row.hasOpening && prev && row.added === 0 ? clampNumber(prev.added) : addedVal;
+    const closingVal =
+      !row.hasClosing && prev?.hasClosing ? clampNumber(prev.closing) : clampNumber(row.closing);
+
+    const previousClosingVal =
+      typeof row.previousClosing === 'number'
+        ? clampNumber(row.previousClosing)
+        : typeof prev?.previousClosing === 'number'
+          ? clampNumber(prev.previousClosing)
+          : undefined;
+    const derivedOpeningStatus =
+      notApplicable
+        ? undefined
+        : row.openingStatus ??
+          (hasOpening && previousClosingVal !== undefined
+            ? openingVal === previousClosingVal
+              ? 'confirmed_match'
+              : 'adjusted'
+            : hasOpening
+              ? prev?.openingStatus ?? 'manual'
+              : prev?.openingStatus);
+
+    const updateFields: Record<string, unknown> = {
+      opening: openingVal,
+      added: effectiveAdded,
+      closing: closingVal,
+      hasOpening,
+      hasClosing,
+      notApplicable,
+      updatedByUid: userUid,
+      updatedByName: reporterName,
+      updatedAt: timestampValue,
+    };
+    if (previousClosingVal !== undefined) {
+      updateFields.previousClosing = previousClosingVal;
+    }
+    if (derivedOpeningStatus !== undefined) {
+      updateFields.openingStatus = derivedOpeningStatus;
+    }
+    if (canManage) {
+      updateFields.authorizedEmails = authorizedEmails;
+      updateFields.itemName = row.itemName;
+      updateFields.unit = row.unit;
+      updateFields.minStock = clampNumber(row.minStock);
+      updateFields.targetStock = clampNumber(row.targetStock);
+    }
+
+    const createFields: Record<string, unknown> = {
+      workspaceId: workspace.id,
+      ownerUid: workspace.ownerUid,
+      authorizedEmails,
+      reportId,
+      itemId: row.itemId,
+      station,
+      date,
+      itemName: row.itemName,
+      unit: row.unit,
+      minStock: canManage ? clampNumber(row.minStock) : Number(row.minStock),
+      targetStock: canManage ? clampNumber(row.targetStock) : Number(row.targetStock),
+      opening: openingVal,
+      added: effectiveAdded,
+      closing: closingVal,
+      hasOpening,
+      hasClosing,
+      notApplicable,
+      updatedByUid: userUid,
+      updatedByName: reporterName,
+      createdAt: timestampValue,
+      updatedAt: timestampValue,
+    };
+    if (previousClosingVal !== undefined) {
+      createFields.previousClosing = previousClosingVal;
+    }
+    if (derivedOpeningStatus !== undefined) {
+      createFields.openingStatus = derivedOpeningStatus;
+    }
+
+    ops.push({
+      itemId: row.itemId,
+      itemName: row.itemName,
+      kind: prev ? 'update' : 'set',
+      hasOpening,
+      hasClosing,
+      notApplicable,
+      updateFields,
+      createFields,
+    });
+  });
+
+  if (
+    mode === 'opening' &&
+    !ops.some((op) => op.hasOpening || op.notApplicable)
+  ) {
+    throw new DiagnosticSaveError({
+      title: 'Falta contar al menos un insumo',
+      detail:
+        'No hay insumos contados para guardar la apertura. Cuenta o confirma al menos un insumo antes de enviar.',
+      failedDocumentPath: `dailyReports/${reportId}`,
+      code: 'no-opening-items',
+    });
+  }
+
+  return ops;
+}
+
 export async function saveStationReportBatch(params: {
   workspace: Workspace;
   user: User;
@@ -319,6 +549,7 @@ export async function saveStationReportBatch(params: {
   existingEntries: Record<string, DailyReportEntry>;
   expectedUpdatedAtMs?: number | null;
   forceOverwrite?: boolean;
+  now?: Date;
 }): Promise<{ queuedOffline: boolean }> {
   const {
     workspace,
@@ -333,6 +564,7 @@ export async function saveStationReportBatch(params: {
     existingEntries,
     expectedUpdatedAtMs,
     forceOverwrite,
+    now: providedNow,
   } = params;
   const reportId = `${workspace.id}_${date}_${station}`;
   const reporterName = clampString(
@@ -340,17 +572,22 @@ export async function saveStationReportBatch(params: {
     MAX_NAME_LENGTH,
   );
   const cleanNotes = clampString(notes, MAX_NOTES_LENGTH);
-  const rawAuthorizedEmails = (workspace.authorizedEmails ?? [])
-    .map((e) => e.trim().toLowerCase())
-    .filter((e) => e.length >= 3 && e.length <= 120 && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e))
-    .slice(0, 15);
-  const authorizedEmails =
-    rawAuthorizedEmails.length > 0
-      ? rawAuthorizedEmails
-      : [workspace.ownerEmail.trim().toLowerCase()];
+  const authorizedEmails = buildNormalizedAuthorizedEmails(workspace);
   const reportRef = doc(db, 'dailyReports', reportId);
 
   let detectedOffline = typeof navigator !== 'undefined' && !navigator.onLine;
+  if (!detectedOffline && !providedNow) {
+    await syncServerClockOffset();
+  }
+  const effectiveNow = providedNow ?? getServerNow();
+  validateWorkerSubmitPhase({
+    canManage,
+    mode,
+    schedule: workspace.shiftSchedule,
+    now: effectiveNow,
+    reportPath: `dailyReports/${reportId}`,
+  });
+
   let serverExists = Boolean(existingReport);
   let serverStatus: ReportStatus | undefined = existingReport?.status;
   let serverUpdatedAtMs: number | null = existingReport?.updatedAt?.toMillis?.() ?? null;
@@ -424,6 +661,21 @@ export async function saveStationReportBatch(params: {
     }
   }
 
+  const preparedOps = prepareStationReportEntries({
+    workspace,
+    userUid: user.uid,
+    reporterName,
+    canManage,
+    date,
+    station,
+    reportId,
+    mode,
+    rows,
+    mergedExistingEntries,
+    authorizedEmails,
+    timestampValue: serverTimestamp(),
+  });
+
   interface EntryWriteOp {
     itemId: string;
     itemName: string;
@@ -434,115 +686,17 @@ export async function saveStationReportBatch(params: {
     createPayload: Record<string, unknown>;
   }
 
-  const entryOperations: EntryWriteOp[] = [];
+  const entryOperations: EntryWriteOp[] = preparedOps.map((op) => ({
+    itemId: op.itemId,
+    itemName: op.itemName,
+    ref: doc(db, 'dailyReports', reportId, 'entries', op.itemId),
+    kind: op.kind,
+    payload: op.kind === 'update' ? op.updateFields : op.createFields,
+    updatePayload: op.updateFields,
+    createPayload: op.createFields,
+  }));
 
-  rows.forEach((row) => {
-    const prev = mergedExistingEntries[row.itemId];
-    const notApplicable = Boolean(row.notApplicable);
-    const hasOpening = notApplicable
-      ? false
-      : row.hasOpening || Boolean(prev?.hasOpening && mode === 'closing');
-    const hasClosing = notApplicable
-      ? false
-      : row.hasClosing || Boolean(prev?.hasClosing && mode === 'opening');
-    const addedVal = clampNumber(row.added);
-
-    if (!prev && !hasOpening && !hasClosing && !notApplicable && addedVal === 0) {
-      return;
-    }
-
-    const entryRef = doc(db, 'dailyReports', reportId, 'entries', row.itemId);
-    const openingVal =
-      !row.hasOpening && prev?.hasOpening ? clampNumber(prev.opening) : clampNumber(row.opening);
-    const effectiveAdded =
-      !row.hasOpening && prev && row.added === 0 ? clampNumber(prev.added) : addedVal;
-    const closingVal =
-      !row.hasClosing && prev?.hasClosing ? clampNumber(prev.closing) : clampNumber(row.closing);
-
-    const previousClosingVal =
-      typeof row.previousClosing === 'number'
-        ? clampNumber(row.previousClosing)
-        : typeof prev?.previousClosing === 'number'
-          ? clampNumber(prev.previousClosing)
-          : undefined;
-    const derivedOpeningStatus =
-      notApplicable
-        ? undefined
-        : row.openingStatus ??
-          (hasOpening && previousClosingVal !== undefined
-            ? openingVal === previousClosingVal
-              ? 'confirmed_match'
-              : 'adjusted'
-            : hasOpening
-              ? prev?.openingStatus ?? 'manual'
-              : prev?.openingStatus);
-
-    const updatePayload: Record<string, unknown> = {
-      opening: openingVal,
-      added: effectiveAdded,
-      closing: closingVal,
-      hasOpening,
-      hasClosing,
-      notApplicable,
-      updatedByUid: user.uid,
-      updatedByName: reporterName,
-      updatedAt: serverTimestamp(),
-    };
-    if (previousClosingVal !== undefined) {
-      updatePayload.previousClosing = previousClosingVal;
-    }
-    if (derivedOpeningStatus !== undefined) {
-      updatePayload.openingStatus = derivedOpeningStatus;
-    }
-    if (canManage) {
-      updatePayload.itemName = row.itemName;
-      updatePayload.unit = row.unit;
-      updatePayload.minStock = clampNumber(row.minStock);
-      updatePayload.targetStock = clampNumber(row.targetStock);
-    }
-
-    const createPayload: Record<string, unknown> = {
-      workspaceId: workspace.id,
-      ownerUid: workspace.ownerUid,
-      authorizedEmails,
-      reportId,
-      itemId: row.itemId,
-      station,
-      date,
-      itemName: row.itemName,
-      unit: row.unit,
-      minStock: canManage ? clampNumber(row.minStock) : Number(row.minStock),
-      targetStock: canManage ? clampNumber(row.targetStock) : Number(row.targetStock),
-      opening: openingVal,
-      added: effectiveAdded,
-      closing: closingVal,
-      hasOpening,
-      hasClosing,
-      notApplicable,
-      updatedByUid: user.uid,
-      updatedByName: reporterName,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    };
-    if (previousClosingVal !== undefined) {
-      createPayload.previousClosing = previousClosingVal;
-    }
-    if (derivedOpeningStatus !== undefined) {
-      createPayload.openingStatus = derivedOpeningStatus;
-    }
-
-    entryOperations.push({
-      itemId: row.itemId,
-      itemName: row.itemName,
-      ref: entryRef,
-      kind: prev ? 'update' : 'set',
-      payload: prev ? updatePayload : createPayload,
-      updatePayload,
-      createPayload,
-    });
-  });
-
-  const MAX_ENTRIES_PER_BATCH = 8;
+  const MAX_ENTRIES_PER_BATCH = MAX_BATCH_SIZE;
   const entryChunks: EntryWriteOp[][] = [];
   if (entryOperations.length === 0) {
     entryChunks.push([]);
@@ -881,10 +1035,7 @@ export async function createWorkerNote(params: {
     user.displayName || user.email?.split('@')[0] || station.workerName || 'Encargada',
     MAX_NAME_LENGTH,
   );
-  const authorizedEmails =
-    Array.isArray(workspace.authorizedEmails) && workspace.authorizedEmails.length > 0
-      ? workspace.authorizedEmails.slice(0, 15)
-      : [workspace.ownerEmail.trim().toLowerCase()];
+  const authorizedEmails = buildNormalizedAuthorizedEmails(workspace);
 
   const payload: Record<string, unknown> = {
     workspaceId: workspace.id,

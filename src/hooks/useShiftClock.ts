@@ -1,23 +1,63 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { ShiftSchedule } from '../types';
+import { getServerNow, syncServerClockOffset } from '../utils/date';
 import { getPreviousDateStr, getTodayDateStr } from '../utils/inventory';
-import { resolveWorkerScheduleStatus, type WorkerScheduleStatus } from '../utils/schedule';
+import {
+  getNextScheduleTransitionMs,
+  resolveWorkerScheduleStatus,
+  type WorkerScheduleStatus,
+} from '../utils/schedule';
 
 export interface ShiftClockState {
   scheduleStatus: WorkerScheduleStatus;
   todayStr: string;
   yesterdayStr: string;
+  now: Date;
 }
 
 export function useShiftClock(shiftSchedule?: ShiftSchedule): ShiftClockState {
-  const [now, setNow] = useState<Date>(() => new Date());
+  const [now, setNow] = useState<Date>(() => getServerNow());
 
   useEffect(() => {
-    const id = window.setInterval(() => {
-      setNow(new Date());
-    }, 30000);
-    return () => window.clearInterval(id);
+    let active = true;
+    const refreshFromServer = (force = false) => {
+      void syncServerClockOffset(force).then(() => {
+        if (active) {
+          setNow(getServerNow());
+        }
+      });
+    };
+
+    refreshFromServer(true);
+
+    const handleFocusOrOnline = () => {
+      setNow(getServerNow());
+      refreshFromServer(false);
+    };
+
+    window.addEventListener('focus', handleFocusOrOnline);
+    window.addEventListener('online', handleFocusOrOnline);
+
+    const intervalId = window.setInterval(() => {
+      setNow(getServerNow());
+    }, 15000);
+
+    return () => {
+      active = false;
+      window.removeEventListener('focus', handleFocusOrOnline);
+      window.removeEventListener('online', handleFocusOrOnline);
+      window.clearInterval(intervalId);
+    };
   }, []);
+
+  // Re-evaluate automatically at the exact next schedule phase transition boundary
+  useEffect(() => {
+    const delayMs = getNextScheduleTransitionMs(now, shiftSchedule);
+    const timeoutId = window.setTimeout(() => {
+      setNow(getServerNow());
+    }, delayMs);
+    return () => window.clearTimeout(timeoutId);
+  }, [now, shiftSchedule]);
 
   const rawStatus = resolveWorkerScheduleStatus(now, shiftSchedule);
   const todayStr = getTodayDateStr(now);
@@ -45,7 +85,9 @@ export function useShiftClock(shiftSchedule?: ShiftSchedule): ShiftClockState {
       scheduleStatus,
       todayStr,
       yesterdayStr,
+      now,
     }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [scheduleStatus, todayStr, yesterdayStr],
   );
 }

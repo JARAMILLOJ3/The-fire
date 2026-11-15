@@ -1,4 +1,4 @@
-import { lazy, Suspense, useMemo, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 import {
   AlertOctagon,
   AlertTriangle,
@@ -13,8 +13,10 @@ import {
   GitCompareArrows,
   MessageSquareText,
   Package,
+  Pencil,
   Printer,
   QrCode,
+  RefreshCw,
   Search,
   Settings,
   ShieldAlert,
@@ -26,6 +28,7 @@ import {
   X,
 } from 'lucide-react';
 import { WORKER_GRACE_MINUTES } from '../constants';
+import type { PacksMigrationState } from '../hooks/useStationData';
 import type {
   ConsolidatedItemRow,
   DailyReport,
@@ -42,10 +45,13 @@ import {
   buildConsolidatedRows,
   buildWeeklyStationHistory,
   buildWhatsAppShoppingList,
+  confirmPacksThresholdSignature,
   detectDashboardConsumptionAnomalies,
   downloadDailyCsvReport,
+  findPacksItemsNeedingThresholdReview,
   formatDateHuman,
   formatItemStockDisplay,
+  formatPackEquivalent,
   formatPurchaseRecommendation,
   formatTimeShort,
   getEffectiveItemUnit,
@@ -53,6 +59,7 @@ import {
   getStockLevelMeta,
   hasTargetBelowMin,
   pluralizeSpanishLabel,
+  readConfirmedPacksThresholds,
   sanitizeStockQuantity,
 } from '../utils/inventory';
 import { getBogotaNowParts } from '../utils/date';
@@ -60,6 +67,7 @@ import type { ResetScope } from '../utils/reset';
 import {
   formatTime12h,
   hasClosingDeadlinePassed,
+  isClosingWindowStarted,
   normalizeShiftSchedule,
 } from '../utils/schedule';
 import {
@@ -81,6 +89,7 @@ interface BossDashboardProps {
   workspaceName: string;
   ownerName?: string;
   shiftSchedule?: ShiftSchedule;
+  now?: Date;
   selectedDate: string;
   todayStr: string;
   yesterdayStr: string;
@@ -97,10 +106,14 @@ interface BossDashboardProps {
   onOpenStation: (stationId: StationId) => void;
   onGoToWorkstations: () => void;
   onGoToCatalog: () => void;
+  onEditItemInCatalog?: (itemId: string) => void;
   onGoToTeam: () => void;
   onOpenScheduleModal: () => void;
   onResetComplete: (scope: ResetScope) => void;
   migratedPacksNotice?: PacksUnitMigrationRecord[];
+  migratedPacksIds?: string[];
+  packsMigrationState?: PacksMigrationState;
+  onRetryPacksMigration?: () => void;
   onDismissMigratedPacksNotice?: () => void;
 }
 
@@ -145,6 +158,7 @@ export function BossDashboard({
   workspaceName,
   ownerName,
   shiftSchedule,
+  now,
   selectedDate,
   todayStr,
   yesterdayStr,
@@ -161,10 +175,14 @@ export function BossDashboard({
   onOpenStation,
   onGoToWorkstations,
   onGoToCatalog,
+  onEditItemInCatalog,
   onGoToTeam,
   onOpenScheduleModal,
   onResetComplete,
   migratedPacksNotice = [],
+  migratedPacksIds = [],
+  packsMigrationState,
+  onRetryPacksMigration,
   onDismissMigratedPacksNotice,
 }: BossDashboardProps) {
   const [viewTab, setViewTab] = useState<ViewTab>('compras');
@@ -176,6 +194,19 @@ export function BossDashboard({
   const [resetModalOpen, setResetModalOpen] = useState(false);
   const [confirmDeleteNoteId, setConfirmDeleteNoteId] = useState<string | null>(null);
   const [deletingNoteId, setDeletingNoteId] = useState<string | null>(null);
+  const [confirmedThresholds, setConfirmedThresholds] = useState<Record<string, string>>(() =>
+    readConfirmedPacksThresholds(workspace.id),
+  );
+
+  useEffect(() => {
+    setConfirmedThresholds(readConfirmedPacksThresholds(workspace.id));
+  }, [workspace.id, items]);
+
+  const migratedPacksIdSet = useMemo(() => new Set(migratedPacksIds), [migratedPacksIds]);
+  const packsThresholdReviewItems = useMemo(
+    () => findPacksItemsNeedingThresholdReview(items, confirmedThresholds, migratedPacksIdSet),
+    [items, confirmedThresholds, migratedPacksIdSet],
+  );
 
   const isRestaurantEmpty = stations.length === 0 && items.length === 0;
   const activeItemsCount = items.filter((it) => it.active).length;
@@ -311,15 +342,22 @@ export function BossDashboard({
     return map;
   }, [sortedWorkerNotes]);
 
+  const effectiveNow = now ?? new Date();
+
   const closingDeadlinePassed = useMemo(
     () =>
       hasClosingDeadlinePassed(
-        new Date(),
+        effectiveNow,
         selectedDate,
         normalizedSchedule,
         WORKER_GRACE_MINUTES,
       ),
-    [selectedDate, normalizedSchedule],
+    [effectiveNow, selectedDate, normalizedSchedule],
+  );
+
+  const closingStarted = useMemo(
+    () => isClosingWindowStarted(effectiveNow, selectedDate, normalizedSchedule),
+    [effectiveNow, selectedDate, normalizedSchedule],
   );
 
   const overdueStations = useMemo(() => {
@@ -590,6 +628,40 @@ export function BossDashboard({
         </div>
       )}
 
+      {packsMigrationState &&
+        (packsMigrationState.status === 'running' || packsMigrationState.status === 'error') && (
+          <div
+            role={packsMigrationState.status === 'error' ? 'alert' : 'status'}
+            className={`rounded-2xl border px-4 sm:px-5 py-3.5 flex flex-wrap items-center justify-between gap-3 text-xs sm:text-sm no-print ${
+              packsMigrationState.status === 'error'
+                ? 'bg-red-50 border-red-200 text-red-950'
+                : 'bg-sky-50 border-sky-200 text-sky-950'
+            }`}
+          >
+            <div className="space-y-0.5 min-w-0">
+              <p className="font-bold">
+                Actualizando unidades por paquetes ·{' '}
+                <span className="font-mono tabular-nums">
+                  {packsMigrationState.processed} de {packsMigrationState.total} procesados
+                </span>
+              </p>
+              {packsMigrationState.errorMessage && (
+                <p className="text-xs text-red-800">{packsMigrationState.errorMessage}</p>
+              )}
+            </div>
+            {packsMigrationState.status === 'error' && onRetryPacksMigration && (
+              <button
+                type="button"
+                onClick={onRetryPacksMigration}
+                className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-red-600 rounded-xl hover:bg-red-700 cursor-pointer"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                Reintentar
+              </button>
+            )}
+          </div>
+        )}
+
       {migratedPacksNotice.length > 0 && (
         <div
           role="status"
@@ -621,6 +693,72 @@ export function BossDashboard({
             </button>
           )}
         </div>
+      )}
+
+      {packsThresholdReviewItems.length > 0 && (
+        <section
+          aria-label="Confirmar mínimos e ideales en insumos por paquetes"
+          className="bg-amber-50/80 border border-amber-200 rounded-2xl p-4 sm:p-5 space-y-3 no-print"
+        >
+          <div className="flex items-start gap-2.5">
+            <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+            <div className="min-w-0 space-y-0.5">
+              <p className="text-sm font-bold text-amber-950">
+                Confirma mínimo e ideal de insumos por paquetes ({packsThresholdReviewItems.length})
+              </p>
+              <p className="text-xs text-amber-900 leading-relaxed">
+                En Paquetes + sueltas el mínimo y el ideal se expresan en unidades sueltas. Confirma si los valores actuales son correctos o edítalos.
+              </p>
+            </div>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+            {packsThresholdReviewItems.map((item) => {
+              const packSize = item.packSize ?? 1;
+              const packLabel = item.packLabel || 'paquete';
+              const minEq = packSize > 1 ? formatPackEquivalent(item.minStock, packSize, packLabel) : '';
+              const targetEq =
+                packSize > 1 ? formatPackEquivalent(item.targetStock, packSize, packLabel) : '';
+
+              return (
+                <div
+                  key={item.id}
+                  className="bg-white border border-amber-200 rounded-xl px-3.5 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5"
+                >
+                  <div className="min-w-0 space-y-0.5">
+                    <p className="text-sm font-semibold text-stone-900 truncate">{item.name}</p>
+                    <p className="text-xs text-stone-600 font-mono tabular-nums">
+                      Mín: {formatItemStockDisplay(item.minStock, item)}
+                      {minEq ? ` (${minEq})` : ''} · Ideal: {formatItemStockDisplay(item.targetStock, item)}
+                      {targetEq ? ` (${targetEq})` : ''}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setConfirmedThresholds(confirmPacksThresholdSignature(workspace.id, item))
+                      }
+                      className="min-h-[38px] inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg hover:bg-emerald-100 cursor-pointer"
+                    >
+                      <Check className="w-3.5 h-3.5" />
+                      Confirmar
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onEditItemInCatalog ? onEditItemInCatalog(item.id) : onGoToCatalog()
+                      }
+                      className="min-h-[38px] inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-stone-800 bg-white border border-stone-200 rounded-lg hover:bg-stone-100 cursor-pointer"
+                    >
+                      <Pencil className="w-3.5 h-3.5" />
+                      Editar
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
       )}
 
       {/* Catalog threshold warning if any item has targetStock < minStock */}
@@ -795,7 +933,11 @@ export function BossDashboard({
               className={`w-2.5 h-2.5 rounded-full shrink-0 ${
                 metrics.missingStations === 0 && stations.length > 0
                   ? 'bg-emerald-500'
-                  : 'bg-amber-500'
+                  : closingDeadlinePassed
+                    ? 'bg-red-500'
+                    : closingStarted
+                      ? 'bg-amber-500'
+                      : 'bg-stone-300'
               }`}
             />
           </div>
@@ -813,7 +955,11 @@ export function BossDashboard({
           <p className="text-xs text-stone-600 mt-1">
             {metrics.missingStations === 0 && stations.length > 0
               ? 'Todos cerraron turno'
-              : `${metrics.completedStations} cerrados · en espera`}
+              : !closingStarted && normalizedSchedule.enabled
+                ? `Cierre desde ${formatTime12h(normalizedSchedule.closingStart)}`
+                : closingDeadlinePassed
+                  ? `${metrics.completedStations} cerrados · cierre vencido`
+                  : `${metrics.completedStations} cerrados · en espera`}
           </p>
         </div>
 
@@ -1114,8 +1260,8 @@ export function BossDashboard({
                     <h3 className="font-display text-base font-bold text-stone-900 leading-snug truncate">
                       {station.name}
                     </h3>
-                    <span className="font-mono tabular-nums text-xs font-medium text-stone-500 shrink-0 pt-0.5">
-                      {stationRows.length} ins.
+                    <span className="font-mono tabular-nums text-xs font-medium text-stone-500 shrink-0 pt-0.5 whitespace-nowrap">
+                      {stationRows.length} {stationRows.length === 1 ? 'insumo' : 'insumos'}
                     </span>
                   </div>
 
@@ -1485,15 +1631,15 @@ export function BossDashboard({
               <table className="w-full text-left border-collapse">
                 <thead>
                   <tr className="border-b border-stone-200 bg-stone-50 text-xs font-semibold text-stone-600">
-                    <th className="py-3.5 px-5">Insumo</th>
-                    <th className="py-3.5 px-4">Puesto</th>
-                    <th className="py-3.5 px-4 text-right">Base / Inicio</th>
-                    <th className="py-3.5 px-4 text-right">Surtido</th>
-                    <th className="py-3.5 px-4 text-right">Quedan al cierre</th>
-                    <th className="py-3.5 px-4 text-right">Consumo</th>
-                    <th className="py-3.5 px-4 text-right">Mínimo</th>
-                    <th className="py-3.5 px-4 text-right">Pedir</th>
-                    <th className="py-3.5 px-5">Estado</th>
+                    <th className="py-3.5 px-4 min-w-[160px]">Insumo</th>
+                    <th className="py-3.5 px-3 whitespace-nowrap">Puesto</th>
+                    <th className="py-3.5 px-3 text-right whitespace-nowrap">Base / Inicio</th>
+                    <th className="py-3.5 px-3 text-right whitespace-nowrap">Surtido</th>
+                    <th className="py-3.5 px-3 text-right whitespace-nowrap">Quedan al cierre</th>
+                    <th className="py-3.5 px-3 text-right whitespace-nowrap">Consumo</th>
+                    <th className="py-3.5 px-3 text-right whitespace-nowrap">Mínimo</th>
+                    <th className="py-3.5 px-3 text-right whitespace-nowrap">Pedir</th>
+                    <th className="py-3.5 px-4 whitespace-nowrap">Estado</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-stone-100 text-sm">
@@ -1524,14 +1670,14 @@ export function BossDashboard({
 
                     return (
                       <tr key={row.item.id} className="hover:bg-stone-50/80 transition-colors">
-                        <td className="py-3.5 px-5">
+                        <td className="py-3.5 px-4">
                           <div className="font-semibold text-stone-900">{row.item.name}</div>
                           <div className="text-xs text-stone-500">{effectiveUnit}</div>
                         </td>
-                        <td className="py-3.5 px-4 text-stone-600 whitespace-nowrap max-w-[200px] truncate">
+                        <td className="py-3.5 px-3 text-stone-600 whitespace-nowrap">
                           {stName}
                         </td>
-                        <td className="py-3.5 px-4 text-right font-mono tabular-nums text-stone-700">
+                        <td className="py-3.5 px-3 text-right font-mono tabular-nums text-stone-700 whitespace-nowrap">
                           {row.entry?.hasOpening && !row.isNotApplicable ? (
                             <div>
                               <span>{formatItemStockDisplay(row.entry.opening, row.item)}</span>
@@ -1549,39 +1695,39 @@ export function BossDashboard({
                             '—'
                           )}
                         </td>
-                        <td className="py-3.5 px-4 text-right font-mono tabular-nums text-stone-600">
+                        <td className="py-3.5 px-3 text-right font-mono tabular-nums text-stone-600 whitespace-nowrap">
                           {row.entry && !row.isNotApplicable && row.entry.added > 0
                             ? `+${formatItemStockDisplay(row.entry.added, row.item)}`
                             : '—'}
                         </td>
-                        <td className="py-3.5 px-4 text-right font-mono tabular-nums font-semibold text-stone-900">
+                        <td className="py-3.5 px-3 text-right font-mono tabular-nums font-semibold text-stone-900 whitespace-nowrap">
                           {row.isNotApplicable ? (
-                            <span className="text-stone-500 font-normal">No aplica</span>
+                            <span className="text-stone-500 font-normal whitespace-nowrap">No aplica</span>
                           ) : row.hasCountedClosing && row.currentStock !== null ? (
                             formatItemStockDisplay(row.currentStock, row.item)
                           ) : row.isProvisional && row.provisionalStock !== null ? (
                             <span
-                              className="text-amber-700 font-medium"
+                              className="text-amber-700 font-medium whitespace-nowrap"
                               title="Valor provisional de apertura; no entra en alertas de compra"
                             >
                               {formatItemStockDisplay(row.provisionalStock, row.item)} (prov.)
                             </span>
                           ) : (
-                            <span className="text-stone-500 font-normal">Pendiente de contar</span>
+                            <span className="text-stone-500 font-normal whitespace-nowrap">Pendiente de contar</span>
                           )}
                         </td>
-                        <td className="py-3.5 px-4 text-right font-mono tabular-nums text-stone-700">
+                        <td className="py-3.5 px-3 text-right font-mono tabular-nums text-stone-700 whitespace-nowrap">
                           {consumptionAnomalyByItemId[row.item.id]?.kind ===
                           'closing_exceeds_available' ? (
                             <span
-                              className="text-red-700 font-semibold"
+                              className="text-red-700 font-semibold whitespace-nowrap"
                               title={consumptionAnomalyByItemId[row.item.id].summary}
                             >
                               Anómalo (sobra)
                             </span>
                           ) : isLevelRestock ? (
                             <span
-                              className="text-sky-700 font-semibold"
+                              className="text-sky-700 font-semibold whitespace-nowrap"
                               title="¿Llegó un envase nuevo? Revisar Surtido"
                             >
                               Reposición
@@ -1590,8 +1736,8 @@ export function BossDashboard({
                             <span
                               className={
                                 consumptionAnomalyByItemId[row.item.id]
-                                  ? 'text-red-700 font-semibold'
-                                  : undefined
+                                  ? 'text-red-700 font-semibold whitespace-nowrap'
+                                  : 'whitespace-nowrap'
                               }
                             >
                               {formatItemStockDisplay(row.consumed, row.item)}
@@ -1600,7 +1746,7 @@ export function BossDashboard({
                             '—'
                           )}
                         </td>
-                        <td className="py-3.5 px-4 text-right font-mono tabular-nums text-stone-600">
+                        <td className="py-3.5 px-3 text-right font-mono tabular-nums text-stone-600 whitespace-nowrap">
                           <div>{formatItemStockDisplay(row.item.minStock, row.item)}</div>
                           {hasTargetBelowMin(row.item.minStock, row.item.targetStock) && (
                             <div className="text-[10px] font-semibold text-amber-700">
@@ -1608,7 +1754,7 @@ export function BossDashboard({
                             </div>
                           )}
                         </td>
-                        <td className="py-3.5 px-4 text-right font-mono tabular-nums font-bold">
+                        <td className="py-3.5 px-3 text-right font-mono tabular-nums font-bold whitespace-nowrap">
                           {row.hasCountedClosing && row.suggestedBuy > 0 ? (
                             <span className="text-red-700 whitespace-nowrap">
                               {formatPurchaseRecommendation(row.suggestedBuy, row.item)}
@@ -1617,9 +1763,9 @@ export function BossDashboard({
                             <span className="text-stone-400 font-normal">—</span>
                           )}
                         </td>
-                        <td className="py-3.5 px-5 whitespace-nowrap">
+                        <td className="py-3.5 px-4 whitespace-nowrap">
                           <span
-                            className={`inline-flex items-center gap-1.5 text-xs font-semibold ${meta.textClass}`}
+                            className={`inline-flex items-center gap-1.5 text-xs font-semibold whitespace-nowrap ${meta.textClass}`}
                           >
                             {(row.stockLevel === 'agotado' || row.stockLevel === 'comprar') && (
                               <AlertTriangle className="w-3.5 h-3.5 shrink-0" />

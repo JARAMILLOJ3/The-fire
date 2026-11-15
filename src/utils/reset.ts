@@ -10,6 +10,7 @@ import {
   getItemInputType,
   sanitizeStockQuantity,
 } from './inventory';
+import { chunkArrayWithLimit, MAX_BATCH_SIZE } from './batch';
 
 export type ResetScope = 'reports_only' | 'all';
 
@@ -37,7 +38,7 @@ export interface ResetExecutionProgress {
   currentStepLabel: string;
 }
 
-export const MAX_RESET_BATCH_SIZE = 20;
+export const MAX_RESET_BATCH_SIZE = MAX_BATCH_SIZE;
 export const RESET_CONFIRMATION_WORD = 'REINICIAR';
 
 export const RESET_CATEGORY_ORDER: readonly ResetTargetCategory[] = [
@@ -77,13 +78,7 @@ export function chunkResetTasks(
   tasks: ResetTaskItem[],
   batchSize: number = MAX_RESET_BATCH_SIZE,
 ): ResetTaskItem[][] {
-  const safeSize = Math.max(1, Math.floor(batchSize));
-  const sorted = sortResetTasks(tasks);
-  const chunks: ResetTaskItem[][] = [];
-  for (let i = 0; i < sorted.length; i += safeSize) {
-    chunks.push(sorted.slice(i, i + safeSize));
-  }
-  return chunks;
+  return chunkArrayWithLimit(sortResetTasks(tasks), batchSize);
 }
 
 export function countResetTasksByCategory(

@@ -47,6 +47,7 @@ import type {
   RestaurantBackupPayload,
 } from '../utils/reset';
 import { buildPacksUnitMigrationPlan } from '../utils/inventory';
+import { executeChunkedBatch, MAX_BATCH_SIZE, PartialBatchError } from '../utils/batch';
 import { validateShiftSchedule } from '../utils/schedule';
 import { clampNumber, clampString, generateAccessCode, makeCleanId } from './shared';
 
@@ -543,30 +544,76 @@ function buildItemCapturePayload(
   return result;
 }
 
+export class PacksMigrationPartialError extends Error {
+  processedCount: number;
+  totalCount: number;
+  migratedRecords: PacksUnitMigrationRecord[];
+  remainingItems: InventoryItem[];
+
+  constructor(params: {
+    message: string;
+    processedCount: number;
+    totalCount: number;
+    migratedRecords: PacksUnitMigrationRecord[];
+    remainingItems: InventoryItem[];
+  }) {
+    super(params.message);
+    this.name = 'PacksMigrationPartialError';
+    this.processedCount = params.processedCount;
+    this.totalCount = params.totalCount;
+    this.migratedRecords = params.migratedRecords;
+    this.remainingItems = params.remainingItems;
+  }
+}
+
 export async function migratePacksItemUnits(
   items: InventoryItem[],
+  options?: {
+    onProgress?: (processed: number, total: number) => void;
+  },
 ): Promise<PacksUnitMigrationRecord[]> {
   const plan = buildPacksUnitMigrationPlan(items);
   if (plan.length === 0) return [];
 
-  const CHUNK_SIZE = 20;
-  for (let i = 0; i < plan.length; i += CHUNK_SIZE) {
-    const chunk = plan.slice(i, i + CHUNK_SIZE);
-    const batch = writeBatch(db);
-    chunk.forEach((rec) => {
-      batch.update(doc(db, 'items', rec.id), {
-        unit: clampString(rec.newUnit, MAX_UNIT_LENGTH),
-        updatedAt: serverTimestamp(),
-      });
+  const itemById = new Map(items.map((it) => [it.id, it]));
+  const migratedRecords: PacksUnitMigrationRecord[] = [];
+
+  try {
+    await executeChunkedBatch({
+      items: plan,
+      batchSize: MAX_BATCH_SIZE,
+      onProgress: options?.onProgress,
+      commitBatch: async (chunk) => {
+        const batch = writeBatch(db);
+        chunk.forEach((rec) => {
+          batch.update(doc(db, 'items', rec.id), {
+            unit: clampString(rec.newUnit, MAX_UNIT_LENGTH),
+            updatedAt: serverTimestamp(),
+          });
+        });
+        await batch.commit();
+        migratedRecords.push(...chunk);
+      },
+      buildErrorMessage: ({ processedCount, totalCount }) =>
+        `Se migraron ${processedCount} de ${totalCount} insumos por paquetes antes de un error de conexión.`,
     });
-    try {
-      await batch.commit();
-    } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, `items/${chunk[0]?.id ?? 'migration'}`);
+  } catch (err) {
+    if (err instanceof PartialBatchError) {
+      const remainingItems = err.remainingItems
+        .map((rec) => itemById.get(rec.id))
+        .filter((it): it is InventoryItem => Boolean(it));
+      throw new PacksMigrationPartialError({
+        message: err.message,
+        processedCount: err.processedCount,
+        totalCount: err.totalCount,
+        migratedRecords,
+        remainingItems,
+      });
     }
+    throw err;
   }
 
-  return plan;
+  return migratedRecords;
 }
 
 function computeStationAssignedIds(
@@ -743,49 +790,103 @@ export async function assignWorkstationItems(params: {
   allStations: Workstation[];
   allItems: InventoryItem[];
   selectedItemIds: string[];
+  onProgress?: (processed: number, total: number) => void;
 }): Promise<void> {
-  const { station, allStations, allItems, selectedItemIds } = params;
+  const { station, allStations, allItems, selectedItemIds, onProgress } = params;
   const selectedSet = new Set(selectedItemIds);
-  const batch = writeBatch(db);
-  const overrides: Record<string, { station: StationId; active: boolean }> = {};
+  const committedOverrides: Record<string, { station: StationId; active: boolean }> = {};
   const touchedStationIds = new Set<string>([station.id]);
   const stationById = new Map(allStations.map((st) => [st.id, st]));
 
+  interface ItemStationUpdate {
+    itemId: string;
+    nextStation: StationId;
+  }
+
+  const itemUpdates: ItemStationUpdate[] = [];
   allItems.forEach((item) => {
     if (!item.active) return;
     const shouldBelongHere = selectedSet.has(item.id);
     const currentlyHere = item.station === station.id;
 
     if (shouldBelongHere && !currentlyHere) {
-      batch.update(doc(db, 'items', item.id), {
-        station: station.id,
-        updatedAt: serverTimestamp(),
-      });
-      overrides[item.id] = { station: station.id, active: true };
+      itemUpdates.push({ itemId: item.id, nextStation: station.id });
       if (item.station && item.station !== UNASSIGNED_STATION_ID && stationById.has(item.station)) {
         touchedStationIds.add(item.station);
       }
     } else if (!shouldBelongHere && currentlyHere) {
-      batch.update(doc(db, 'items', item.id), {
-        station: UNASSIGNED_STATION_ID,
-        updatedAt: serverTimestamp(),
-      });
-      overrides[item.id] = { station: UNASSIGNED_STATION_ID, active: true };
+      itemUpdates.push({ itemId: item.id, nextStation: UNASSIGNED_STATION_ID });
     }
   });
 
-  touchedStationIds.forEach((stId) => {
-    const targetStation = stationById.get(stId);
-    if (!targetStation) return;
-    batch.update(doc(db, 'stations', stId), {
-      assignedItemIds: computeStationAssignedIds(stId, allItems, overrides),
-      updatedAt: serverTimestamp(),
+  const targetStations = Array.from(touchedStationIds)
+    .map((stId) => stationById.get(stId))
+    .filter((st): st is Workstation => Boolean(st));
+
+  const syncTouchedStations = async () => {
+    await executeChunkedBatch({
+      items: targetStations,
+      batchSize: MAX_BATCH_SIZE,
+      commitBatch: async (stationChunk) => {
+        const stBatch = writeBatch(db);
+        stationChunk.forEach((targetStation) => {
+          stBatch.update(doc(db, 'stations', targetStation.id), {
+            assignedItemIds: computeStationAssignedIds(
+              targetStation.id,
+              allItems,
+              committedOverrides,
+            ),
+            updatedAt: serverTimestamp(),
+          });
+        });
+        await stBatch.commit();
+      },
     });
-  });
+  };
+
+  if (itemUpdates.length > 0) {
+    try {
+      await executeChunkedBatch({
+        items: itemUpdates,
+        batchSize: MAX_BATCH_SIZE,
+        onProgress,
+        commitBatch: async (chunk) => {
+          const itemBatch = writeBatch(db);
+          chunk.forEach(({ itemId, nextStation }) => {
+            itemBatch.update(doc(db, 'items', itemId), {
+              station: nextStation,
+              updatedAt: serverTimestamp(),
+            });
+          });
+          await itemBatch.commit();
+          chunk.forEach(({ itemId, nextStation }) => {
+            committedOverrides[itemId] = { station: nextStation, active: true };
+          });
+        },
+        buildErrorMessage: ({ processedCount, totalCount }) =>
+          `${processedCount} de ${totalCount} insumos procesados. Reintenta para guardar los restantes.`,
+      });
+    } catch (err) {
+      if (Object.keys(committedOverrides).length > 0) {
+        try {
+          await syncTouchedStations();
+        } catch {
+          // Best-effort sync of station lists already partially updated
+        }
+      }
+      if (err instanceof PartialBatchError) {
+        throw err;
+      }
+      handleFirestoreError(err, OperationType.UPDATE, `stations/${station.id}`);
+    }
+  }
 
   try {
-    await batch.commit();
+    await syncTouchedStations();
   } catch (error) {
+    if (error instanceof PartialBatchError) {
+      throw error;
+    }
     handleFirestoreError(error, OperationType.UPDATE, `stations/${station.id}`);
   }
 }
@@ -830,44 +931,32 @@ export async function syncAuthorizedEmailsAcrossWorkspace(params: {
     nextEmails.every((e, i) => params.workspace.authorizedEmails[i] === e);
   if (unchanged) return;
 
-  const batch = writeBatch(db);
-  batch.update(doc(db, 'workspaces', params.workspace.id), {
-    authorizedEmails: nextEmails,
-    updatedAt: serverTimestamp(),
-  });
-  params.stations.forEach((st) => {
-    batch.update(doc(db, 'stations', st.id), {
-      authorizedEmails: nextEmails,
-      updatedAt: serverTimestamp(),
-    });
-  });
-  params.items.forEach((item) => {
-    batch.update(doc(db, 'items', item.id), {
-      authorizedEmails: nextEmails,
-      updatedAt: serverTimestamp(),
-    });
-  });
-  params.reports.forEach((rep) => {
-    batch.update(doc(db, 'dailyReports', rep.id), {
-      authorizedEmails: nextEmails,
-      updatedAt: serverTimestamp(),
-    });
-  });
-  params.entries.forEach((entry) => {
-    batch.update(doc(db, 'dailyReports', entry.reportId, 'entries', entry.itemId), {
-      authorizedEmails: nextEmails,
-      updatedAt: serverTimestamp(),
-    });
-  });
-  params.workerNotes?.forEach((note) => {
-    batch.update(doc(db, 'workerNotes', note.id), {
-      authorizedEmails: nextEmails,
-      updatedAt: serverTimestamp(),
-    });
-  });
+  const targets: Array<{ ref: ReturnType<typeof doc> }> = [
+    { ref: doc(db, 'workspaces', params.workspace.id) },
+    ...params.stations.map((st) => ({ ref: doc(db, 'stations', st.id) })),
+    ...params.items.map((item) => ({ ref: doc(db, 'items', item.id) })),
+    ...params.reports.map((rep) => ({ ref: doc(db, 'dailyReports', rep.id) })),
+    ...params.entries.map((entry) => ({
+      ref: doc(db, 'dailyReports', entry.reportId, 'entries', entry.itemId),
+    })),
+    ...(params.workerNotes ?? []).map((note) => ({ ref: doc(db, 'workerNotes', note.id) })),
+  ];
 
   try {
-    await batch.commit();
+    await executeChunkedBatch({
+      items: targets,
+      batchSize: MAX_BATCH_SIZE,
+      commitBatch: async (chunk) => {
+        const batch = writeBatch(db);
+        chunk.forEach(({ ref }) => {
+          batch.update(ref, {
+            authorizedEmails: nextEmails,
+            updatedAt: serverTimestamp(),
+          });
+        });
+        await batch.commit();
+      },
+    });
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, `workspaces/${params.workspace.id}`);
   }

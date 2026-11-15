@@ -103,3 +103,51 @@ export function formatBogotaTimeExact(now: Date = new Date()): string {
   const second = String(Number(map.second) || 0).padStart(2, '0');
   return `${hour}:${minute}:${second}`;
 }
+
+let serverTimeOffsetMs = 0;
+let lastServerSyncAtMs = 0;
+
+export function getServerTimeOffsetMs(): number {
+  return serverTimeOffsetMs;
+}
+
+export function setServerTimeOffsetMs(offsetMs: number): void {
+  serverTimeOffsetMs = Number.isFinite(offsetMs) ? offsetMs : 0;
+}
+
+export function getServerNow(localNowMs: number = Date.now()): Date {
+  return new Date(localNowMs + serverTimeOffsetMs);
+}
+
+export async function syncServerClockOffset(force = false): Promise<number> {
+  if (typeof window === 'undefined' || typeof fetch !== 'function') {
+    return serverTimeOffsetMs;
+  }
+  const nowMs = Date.now();
+  if (!force && lastServerSyncAtMs > 0 && nowMs - lastServerSyncAtMs < 60_000) {
+    return serverTimeOffsetMs;
+  }
+
+  try {
+    const reqStart = Date.now();
+    const res = await fetch(`/?__ts=${reqStart}`, {
+      method: 'HEAD',
+      cache: 'no-store',
+    });
+    const reqEnd = Date.now();
+    const dateHeader = res.headers.get('date');
+    if (dateHeader) {
+      const serverMs = Date.parse(dateHeader);
+      if (Number.isFinite(serverMs)) {
+        const midpoint = Math.round((reqStart + reqEnd) / 2);
+        serverTimeOffsetMs = serverMs - midpoint;
+        lastServerSyncAtMs = reqEnd;
+      }
+    }
+  } catch {
+    // Keep existing offset / local fallback when offline or unreachable
+  }
+
+  return serverTimeOffsetMs;
+}
+

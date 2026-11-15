@@ -44,6 +44,22 @@ interface WorkerFallbackState {
   entries: Record<string, DailyReportEntry>;
 }
 
+export interface PacksMigrationState {
+  status: 'idle' | 'running' | 'error';
+  processed: number;
+  total: number;
+  errorMessage: string | null;
+  remainingItems: InventoryItem[];
+}
+
+const IDLE_PACKS_MIGRATION: PacksMigrationState = {
+  status: 'idle',
+  processed: 0,
+  total: 0,
+  errorMessage: null,
+  remainingItems: [],
+};
+
 const REPORT_FETCH_CHUNK_SIZE = 6;
 const ENTRY_FETCH_CHUNK_SIZE = 6;
 
@@ -106,6 +122,10 @@ export function useStationData(params: {
   const [workerNotes, setWorkerNotes] = useState<WorkerNote[]>([]);
   const [workerFallback, setWorkerFallback] = useState<WorkerFallbackState | null>(null);
   const [migratedPacksNotice, setMigratedPacksNotice] = useState<PacksUnitMigrationRecord[]>([]);
+  const [packsMigrationState, setPacksMigrationState] = useState<PacksMigrationState>(IDLE_PACKS_MIGRATION);
+  const [migratedPacksIds, setMigratedPacksIds] = useState<string[]>([]);
+
+  const isWorkspaceOwner = Boolean(workspace?.ownerUid && userUid && workspace.ownerUid === userUid);
 
   const migrationAttemptedRef = useRef<string | null>(null);
   const packsUnitMigratedIdsRef = useRef<Set<string>>(new Set());
@@ -158,6 +178,8 @@ export function useStationData(params: {
     setWorkerNotes([]);
     setWorkerFallback(null);
     setMigratedPacksNotice([]);
+    setPacksMigrationState(IDLE_PACKS_MIGRATION);
+    setMigratedPacksIds([]);
     packsUnitMigratedIdsRef.current = new Set();
     packsUnitMigrationWorkspaceRef.current = null;
   }, [userUid, targetWorkspaceId]);
@@ -210,14 +232,17 @@ export function useStationData(params: {
 
   // Effect 1A: Static workspace collections for managers ONLY (never run for workers)
   useEffect(() => {
-    if (!authReady || !userUid || !workspace?.id || !canManage || !userEmail) return;
+    if (!authReady || !userUid || !workspace?.id || !canManage) return;
+    if (!isWorkspaceOwner && !userEmail) return;
     setStationsLoaded(false);
     setItemsLoaded(false);
 
     const stopStationsMetric = perfMetrics.onListenerStart('stations_list');
     const stationsQuery = query(
       collection(db, 'stations'),
-      where('authorizedEmails', 'array-contains', userEmail),
+      isWorkspaceOwner
+        ? where('ownerUid', '==', userUid)
+        : where('authorizedEmails', 'array-contains', userEmail),
     );
     const unsubStations = onSnapshot(
       stationsQuery,
@@ -239,7 +264,9 @@ export function useStationData(params: {
     const stopItemsMetric = perfMetrics.onListenerStart('items_list');
     const itemsQuery = query(
       collection(db, 'items'),
-      where('authorizedEmails', 'array-contains', userEmail),
+      isWorkspaceOwner
+        ? where('ownerUid', '==', userUid)
+        : where('authorizedEmails', 'array-contains', userEmail),
     );
     const unsubItems = onSnapshot(
       itemsQuery,
@@ -269,7 +296,7 @@ export function useStationData(params: {
       unsubStations();
       unsubItems();
     };
-  }, [authReady, userUid, workspace?.id, canManage, userEmail]);
+  }, [authReady, userUid, workspace?.id, canManage, isWorkspaceOwner, userEmail]);
 
   // Effect 1B: Worker static station listener (single doc, never torn down on date switch)
   useEffect(() => {
@@ -623,6 +650,82 @@ export function useStationData(params: {
       });
   }, [canManage, workspace, stationsLoaded, itemsLoaded, stations, items]);
 
+  const runPacksMigration = useCallback(async (candidates: InventoryItem[]) => {
+    if (candidates.length === 0) return;
+    candidates.forEach((it) => packsUnitMigratedIdsRef.current.add(it.id));
+    setPacksMigrationState({
+      status: 'running',
+      processed: 0,
+      total: candidates.length,
+      errorMessage: null,
+      remainingItems: candidates,
+    });
+
+    try {
+      const { migratePacksItemUnits, PacksMigrationPartialError } = await import(
+        '../services/bossService'
+      );
+      try {
+        const records = await migratePacksItemUnits(candidates, {
+          onProgress: (processed, total) => {
+            setPacksMigrationState((prev) => ({
+              ...prev,
+              status: 'running',
+              processed,
+              total,
+            }));
+          },
+        });
+        if (records.length > 0) {
+          setMigratedPacksNotice((prev) => {
+            const byId = new Map(prev.map((r) => [r.id, r]));
+            records.forEach((r) => byId.set(r.id, r));
+            return Array.from(byId.values());
+          });
+          setMigratedPacksIds((prev) =>
+            Array.from(new Set([...prev, ...records.map((r) => r.id)])),
+          );
+        }
+        setPacksMigrationState(IDLE_PACKS_MIGRATION);
+      } catch (err) {
+        if (err instanceof PacksMigrationPartialError) {
+          if (err.migratedRecords.length > 0) {
+            setMigratedPacksNotice((prev) => {
+              const byId = new Map(prev.map((r) => [r.id, r]));
+              err.migratedRecords.forEach((r) => byId.set(r.id, r));
+              return Array.from(byId.values());
+            });
+            setMigratedPacksIds((prev) =>
+              Array.from(new Set([...prev, ...err.migratedRecords.map((r) => r.id)])),
+            );
+          }
+          setPacksMigrationState({
+            status: 'error',
+            processed: err.processedCount,
+            total: err.totalCount,
+            errorMessage: err.message,
+            remainingItems: err.remainingItems,
+          });
+          return;
+        }
+        setPacksMigrationState({
+          status: 'error',
+          processed: 0,
+          total: candidates.length,
+          errorMessage:
+            err instanceof Error
+              ? err.message
+              : 'No se pudo completar la actualización en lotes pequeños.',
+          remainingItems: candidates,
+        });
+      }
+    } catch (err) {
+      candidates.forEach((it) => packsUnitMigratedIdsRef.current.delete(it.id));
+      setPacksMigrationState(IDLE_PACKS_MIGRATION);
+      console.error('Error migrando unidad de insumos por paquetes:', err);
+    }
+  }, []);
+
   // Auto-migrate packs items whose stored unit differs from unitLabel (manager-only)
   useEffect(() => {
     if (!canManage || !workspace?.id || !itemsLoaded) return;
@@ -630,6 +733,8 @@ export function useStationData(params: {
       packsUnitMigrationWorkspaceRef.current = workspace.id;
       packsUnitMigratedIdsRef.current = new Set();
       setMigratedPacksNotice([]);
+      setPacksMigrationState(IDLE_PACKS_MIGRATION);
+      setMigratedPacksIds([]);
     }
 
     const candidates = getPacksItemsNeedingUnitMigration(items).filter(
@@ -637,22 +742,13 @@ export function useStationData(params: {
     );
     if (candidates.length === 0) return;
 
-    candidates.forEach((it) => packsUnitMigratedIdsRef.current.add(it.id));
-    void import('../services/bossService')
-      .then(({ migratePacksItemUnits }) => migratePacksItemUnits(candidates))
-      .then((records) => {
-        if (records.length === 0) return;
-        setMigratedPacksNotice((prev) => {
-          const byId = new Map(prev.map((r) => [r.id, r]));
-          records.forEach((r) => byId.set(r.id, r));
-          return Array.from(byId.values());
-        });
-      })
-      .catch((err) => {
-        candidates.forEach((it) => packsUnitMigratedIdsRef.current.delete(it.id));
-        console.error('Error migrando unidad de insumos por paquetes:', err);
-      });
-  }, [canManage, workspace?.id, itemsLoaded, items]);
+    void runPacksMigration(candidates);
+  }, [canManage, workspace?.id, itemsLoaded, items, runPacksMigration]);
+
+  const retryPacksMigration = useCallback(() => {
+    if (packsMigrationState.remainingItems.length === 0) return;
+    void runPacksMigration(packsMigrationState.remainingItems);
+  }, [packsMigrationState.remainingItems, runPacksMigration]);
 
   const dismissMigratedPacksNotice = useCallback(() => {
     setMigratedPacksNotice([]);
@@ -744,7 +840,7 @@ export function useStationData(params: {
   useEffect(() => {
     if (!authReady || !userUid || !targetWorkspaceId) return;
 
-    if (canManage && userEmail) {
+    if (canManage && (isWorkspaceOwner || userEmail)) {
       const reportIds = existingReportIdsKey ? existingReportIdsKey.split('|') : [];
       if (reportIds.length === 0) {
         setEntriesByReportId({});
@@ -756,7 +852,9 @@ export function useStationData(params: {
         const entriesPath = `dailyReports/${repId}/entries`;
         const q = query(
           collection(db, 'dailyReports', repId, 'entries'),
-          where('authorizedEmails', 'array-contains', userEmail),
+          isWorkspaceOwner
+            ? where('ownerUid', '==', userUid)
+            : where('authorizedEmails', 'array-contains', userEmail),
         );
         return onSnapshot(
           q,
@@ -838,9 +936,10 @@ export function useStationData(params: {
 
   // Manager mode: load cached entries for 7-day history + selectedDate 7-day consumption average
   useEffect(() => {
-    if (!authReady || !userUid || !workspace?.id || !canManage || !userEmail || !reportsLoaded) {
+    if (!authReady || !userUid || !workspace?.id || !canManage || !reportsLoaded) {
       return;
     }
+    if (!isWorkspaceOwner && !userEmail) return;
 
     if (allReports.length === 0) {
       setHistoricalEntriesByReportId({});
@@ -874,7 +973,9 @@ export function useStationData(params: {
             try {
               const q = query(
                 collection(db, 'dailyReports', rep.id, 'entries'),
-                where('authorizedEmails', 'array-contains', userEmail),
+                isWorkspaceOwner
+                  ? where('ownerUid', '==', userUid)
+                  : where('authorizedEmails', 'array-contains', userEmail),
               );
               const snap = await getDocs(q);
               const map: Record<string, DailyReportEntry> = {};
@@ -907,6 +1008,7 @@ export function useStationData(params: {
     userUid,
     workspace?.id,
     canManage,
+    isWorkspaceOwner,
     userEmail,
     reportsLoaded,
     allReports,
@@ -986,14 +1088,16 @@ export function useStationData(params: {
   // Listen to real-time workerNotes (single filtered query)
   useEffect(() => {
     if (!authReady || !userUid || !targetWorkspaceId) return;
-    if (canManage && !userEmail) return;
+    if (canManage && !isWorkspaceOwner && !userEmail) return;
     if (!canManage && targetRole === 'jefe') return;
 
     const stopNotesMetric = perfMetrics.onListenerStart('workerNotes');
     const notesQuery = canManage
       ? query(
           collection(db, 'workerNotes'),
-          where('authorizedEmails', 'array-contains', userEmail),
+          isWorkspaceOwner
+            ? where('ownerUid', '==', userUid)
+            : where('authorizedEmails', 'array-contains', userEmail),
         )
       : query(collection(db, 'workerNotes'), where('authorUid', '==', userUid));
 
@@ -1023,7 +1127,7 @@ export function useStationData(params: {
       stopNotesMetric();
       unsubNotes();
     };
-  }, [authReady, userUid, userEmail, targetWorkspaceId, canManage, targetRole]);
+  }, [authReady, userUid, userEmail, targetWorkspaceId, canManage, isWorkspaceOwner, targetRole]);
 
   const effectiveEntriesByReportId = useMemo(() => {
     if (canManage || !workerFallback?.report) return entriesByReportId;
@@ -1190,6 +1294,9 @@ export function useStationData(params: {
     workerNotes,
     yesterdayHasReports,
     migratedPacksNotice,
+    migratedPacksIds,
+    packsMigrationState,
+    retryPacksMigration,
     dismissMigratedPacksNotice,
     refreshWorkerFallback,
   };

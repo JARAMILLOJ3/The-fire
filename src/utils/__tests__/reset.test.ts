@@ -54,10 +54,11 @@ describe('restaurant reset utilities', () => {
     }));
 
     const chunks = chunkResetTasks(manyTasks);
-    expect(chunks).toHaveLength(3);
-    expect(chunks[0]).toHaveLength(MAX_RESET_BATCH_SIZE);
-    expect(chunks[1]).toHaveLength(MAX_RESET_BATCH_SIZE);
-    expect(chunks[2]).toHaveLength(5);
+    expect(MAX_RESET_BATCH_SIZE).toBe(8);
+    expect(chunks).toHaveLength(6);
+    expect(chunks[0]).toHaveLength(8);
+    expect(chunks[4]).toHaveLength(8);
+    expect(chunks[5]).toHaveLength(5);
   });
 
   it('tracks progress across small batches, reports exact pending items on mid-flight failure, and resumes cleanly', async () => {
@@ -96,17 +97,17 @@ describe('restaurant reset utilities', () => {
     }
 
     expect(caughtError).toBeInstanceOf(PartialResetError);
-    expect(caughtError?.deletedCount).toBe(20);
+    expect(caughtError?.deletedCount).toBe(8);
     expect(caughtError?.totalCount).toBe(45);
-    expect(caughtError?.pendingTasks).toHaveLength(25);
-    expect(caughtError?.pendingByCategory.entries).toBe(12);
+    expect(caughtError?.pendingTasks).toHaveLength(37);
+    expect(caughtError?.pendingByCategory.entries).toBe(24);
     expect(caughtError?.pendingByCategory.reports).toBe(13);
     expect(formatPendingResetSummary(caughtError!.pendingByCategory)).toBe(
-      '12 conteos de insumos, 13 reportes diarios',
+      '24 conteos de insumos, 13 reportes diarios',
     );
-    expect(progressEvents.some((p) => p.deletedCount === 20)).toBe(true);
+    expect(progressEvents.some((p) => p.deletedCount === 8)).toBe(true);
 
-    // Retry ONLY the remaining 25 pending tasks
+    // Retry ONLY the remaining 37 pending tasks
     const retryResult = await executeChunkedResetTasks({
       tasks: caughtError!.pendingTasks,
       commitChunk: async (chunk) => {
@@ -114,7 +115,7 @@ describe('restaurant reset utilities', () => {
       },
     });
 
-    expect(retryResult).toEqual({ deletedCount: 25, totalCount: 25 });
+    expect(retryResult).toEqual({ deletedCount: 37, totalCount: 37 });
     expect(committedPaths).toHaveLength(45);
     expect(new Set(committedPaths).size).toBe(45);
     expect(countResetTasksByCategory(tasks)).toEqual({

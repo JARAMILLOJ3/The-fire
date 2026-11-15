@@ -1,10 +1,20 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react';
-import { AlertTriangle, Archive, ArchiveRestore, Pencil, Plus, X } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
+import {
+  AlertTriangle,
+  Archive,
+  ArchiveRestore,
+  Check,
+  Pencil,
+  Plus,
+  RefreshCw,
+  X,
+} from 'lucide-react';
 import {
   MAX_NAME_LENGTH,
   MAX_UNIT_LENGTH,
   UNASSIGNED_STATION_ID,
 } from '../constants';
+import type { PacksMigrationState } from '../hooks/useStationData';
 import {
   createInventoryItem,
   setInventoryItemActive,
@@ -13,12 +23,15 @@ import {
 import type {
   CaptureInputType,
   InventoryItem,
+  PacksUnitMigrationRecord,
   StationId,
   Workspace,
   Workstation,
 } from '../types';
 import {
   buildItemCaptureFields,
+  confirmPacksThresholdSignature,
+  findPacksItemsNeedingThresholdReview,
   formatContainerFractionLabel,
   formatItemStockDisplay,
   formatPackEquivalent,
@@ -30,9 +43,9 @@ import {
   isInvalidLevelUnit,
   parseCaptureDecimalInput,
   pluralizeSpanishLabel,
+  readConfirmedPacksThresholds,
   validateCatalogItemInput,
 } from '../utils/inventory';
-import type { PacksUnitMigrationRecord } from '../types';
 import { ItemCaptureFields } from './ItemCaptureFields';
 import { OptionSelect } from './OptionSelect';
 
@@ -41,8 +54,13 @@ interface CatalogManagerProps {
   stations: Workstation[];
   items: InventoryItem[];
   initialFilterStation?: string;
+  initialEditItemId?: string | null;
+  onConsumeInitialEditItem?: () => void;
   onGoToWorkstations?: () => void;
   migratedPacksNotice?: PacksUnitMigrationRecord[];
+  migratedPacksIds?: string[];
+  packsMigrationState?: PacksMigrationState;
+  onRetryPacksMigration?: () => void;
   onDismissMigratedPacksNotice?: () => void;
 }
 
@@ -51,8 +69,13 @@ export function CatalogManager({
   stations,
   items,
   initialFilterStation = 'all',
+  initialEditItemId = null,
+  onConsumeInitialEditItem,
   onGoToWorkstations,
   migratedPacksNotice = [],
+  migratedPacksIds = [],
+  packsMigrationState,
+  onRetryPacksMigration,
   onDismissMigratedPacksNotice,
 }: CatalogManagerProps) {
   const [stationFilter, setStationFilter] = useState<'all' | StationId>(initialFilterStation);
@@ -77,6 +100,20 @@ export function CatalogManager({
   const [unitLabel, setUnitLabel] = useState('und');
   const [capacityInput, setCapacityInput] = useState('5');
   const [allowClosedContainers, setAllowClosedContainers] = useState(false);
+
+  const [confirmedThresholds, setConfirmedThresholds] = useState<Record<string, string>>(() =>
+    readConfirmedPacksThresholds(workspace.id),
+  );
+
+  useEffect(() => {
+    setConfirmedThresholds(readConfirmedPacksThresholds(workspace.id));
+  }, [workspace.id, items]);
+
+  const migratedPacksIdSet = useMemo(() => new Set(migratedPacksIds), [migratedPacksIds]);
+  const packsThresholdReviewItems = useMemo(
+    () => findPacksItemsNeedingThresholdReview(items, confirmedThresholds, migratedPacksIdSet),
+    [items, confirmedThresholds, migratedPacksIdSet],
+  );
 
   useEffect(() => {
     setStationFilter(initialFilterStation);
@@ -170,7 +207,7 @@ export function CatalogManager({
     setShowForm(true);
   };
 
-  const openEditForm = (item: InventoryItem) => {
+  const openEditForm = useCallback((item: InventoryItem) => {
     const mode = getItemInputType(item);
     const nextUnitLabel = item.unitLabel ?? (item.unit || 'und');
     setEditingItem(item);
@@ -188,7 +225,15 @@ export function CatalogManager({
     setErrorMsg(null);
     setActionFeedback(null);
     setShowForm(true);
-  };
+  }, []);
+
+  useEffect(() => {
+    if (!initialEditItemId) return;
+    const match = items.find((it) => it.id === initialEditItemId);
+    if (!match) return;
+    openEditForm(match);
+    onConsumeInitialEditItem?.();
+  }, [initialEditItemId, items, openEditForm, onConsumeInitialEditItem]);
 
   const handleInputTypeChange = (nextType: CaptureInputType) => {
     setInputType(nextType);
@@ -250,6 +295,19 @@ export function CatalogManager({
             allItems: items,
           },
         );
+        if (inputType === 'packs') {
+          setConfirmedThresholds(
+            confirmPacksThresholdSignature(workspace.id, {
+              ...editingItem,
+              station: stationId,
+              name: cleanName,
+              unit: cleanUnit,
+              minStock,
+              targetStock,
+              ...capturePayload,
+            }),
+          );
+        }
       } else {
         const targetStationObj = stations.find((s) => s.id === stationId);
         await createInventoryItem(
@@ -410,6 +468,40 @@ export function CatalogManager({
         </div>
       </div>
 
+      {packsMigrationState &&
+        (packsMigrationState.status === 'running' || packsMigrationState.status === 'error') && (
+          <div
+            role={packsMigrationState.status === 'error' ? 'alert' : 'status'}
+            className={`px-4 py-3.5 rounded-2xl border flex flex-wrap items-center justify-between gap-3 text-xs sm:text-sm ${
+              packsMigrationState.status === 'error'
+                ? 'bg-red-50 border-red-200 text-red-950'
+                : 'bg-sky-50 border-sky-200 text-sky-950'
+            }`}
+          >
+            <div className="space-y-0.5 min-w-0">
+              <p className="font-semibold">
+                Actualizando unidades por paquetes ·{' '}
+                <span className="font-mono tabular-nums">
+                  {packsMigrationState.processed} de {packsMigrationState.total} procesados
+                </span>
+              </p>
+              {packsMigrationState.errorMessage && (
+                <p className="text-xs text-red-800">{packsMigrationState.errorMessage}</p>
+              )}
+            </div>
+            {packsMigrationState.status === 'error' && onRetryPacksMigration && (
+              <button
+                type="button"
+                onClick={onRetryPacksMigration}
+                className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-red-600 rounded-xl hover:bg-red-700 cursor-pointer"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                Reintentar
+              </button>
+            )}
+          </div>
+        )}
+
       {migratedPacksNotice.length > 0 && (
         <div
           role="status"
@@ -438,6 +530,70 @@ export function CatalogManager({
               <X className="w-4 h-4" />
             </button>
           )}
+        </div>
+      )}
+
+      {packsThresholdReviewItems.length > 0 && (
+        <div
+          role="status"
+          className="px-4 py-4 rounded-2xl bg-amber-50 border border-amber-200 space-y-3"
+        >
+          <div className="flex items-start gap-2.5 text-xs sm:text-sm text-amber-950">
+            <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+            <div>
+              <p className="font-bold">
+                Confirma mínimo e ideal de insumos por paquetes ({packsThresholdReviewItems.length})
+              </p>
+              <p className="text-xs text-amber-900 mt-0.5">
+                Verifica que el mínimo y el ideal estén escritos en unidades sueltas y no en paquetes.
+              </p>
+            </div>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+            {packsThresholdReviewItems.map((item) => {
+              const packSize = item.packSize ?? 1;
+              const packLabel = item.packLabel || 'paquete';
+              const minEq = packSize > 1 ? formatPackEquivalent(item.minStock, packSize, packLabel) : '';
+              const targetEq =
+                packSize > 1 ? formatPackEquivalent(item.targetStock, packSize, packLabel) : '';
+
+              return (
+                <div
+                  key={item.id}
+                  className="bg-white border border-amber-200 rounded-xl px-3.5 py-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2"
+                >
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold text-stone-900 truncate">{item.name}</p>
+                    <p className="text-xs text-stone-600 font-mono tabular-nums">
+                      Mín: {formatItemStockDisplay(item.minStock, item)}
+                      {minEq ? ` (${minEq})` : ''} · Ideal: {formatItemStockDisplay(item.targetStock, item)}
+                      {targetEq ? ` (${targetEq})` : ''}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setConfirmedThresholds(confirmPacksThresholdSignature(workspace.id, item))
+                      }
+                      className="min-h-[38px] inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-lg hover:bg-emerald-100 cursor-pointer"
+                    >
+                      <Check className="w-3.5 h-3.5" />
+                      Confirmar
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => openEditForm(item)}
+                      className="min-h-[38px] inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-stone-800 bg-white border border-stone-200 rounded-lg hover:bg-stone-100 cursor-pointer"
+                    >
+                      <Pencil className="w-3.5 h-3.5" />
+                      Editar
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         </div>
       )}
 

@@ -313,3 +313,57 @@ export function hasClosingDeadlinePassed(
 
   return nowOffset >= closeEndOffset + graceMinutes;
 }
+
+export function isClosingWindowStarted(
+  now: Date,
+  targetOperationalDate: string,
+  rawSchedule?: ShiftSchedule,
+): boolean {
+  const schedule = normalizeShiftSchedule(rawSchedule);
+  if (!schedule.enabled) return true;
+
+  const operationalToday = getOperationalDateStr(now);
+  if (targetOperationalDate < operationalToday) return true;
+  if (targetOperationalDate > operationalToday) return false;
+
+  const bogota = getBogotaNowParts(now);
+  const cutoffMin = OPERATIONAL_DAY_CUTOFF_HOUR * 60;
+  const toOpOffset = (min: number) => (min - cutoffMin + 1440) % 1440;
+
+  const nowOffset = toOpOffset(bogota.totalMinutes);
+  const closeStartOffset = toOpOffset(parseTimeToMinutes(schedule.closingStart));
+  return nowOffset >= closeStartOffset;
+}
+
+export function getNextScheduleTransitionMs(
+  now: Date,
+  rawSchedule?: ShiftSchedule,
+  graceMinutes: number = WORKER_GRACE_MINUTES,
+): number {
+  const schedule = normalizeShiftSchedule(rawSchedule);
+  const bogota = getBogotaNowParts(now);
+  const nowSecInDay = bogota.totalMinutes * 60 + now.getUTCSeconds();
+
+  const boundariesMin = [OPERATIONAL_DAY_CUTOFF_HOUR * 60];
+  if (schedule.enabled) {
+    boundariesMin.push(
+      parseTimeToMinutes(schedule.openingStart),
+      (parseTimeToMinutes(schedule.openingEnd) + graceMinutes) % 1440,
+      parseTimeToMinutes(schedule.closingStart),
+      (parseTimeToMinutes(schedule.closingEnd) + graceMinutes) % 1440,
+    );
+  }
+
+  let minDeltaSec = 86400;
+  boundariesMin.forEach((bMin) => {
+    const bSec = ((bMin % 1440) + 1440) % 1440 * 60;
+    const delta = (bSec - nowSecInDay + 86400) % 86400 || 86400;
+    if (delta < minDeltaSec) {
+      minDeltaSec = delta;
+    }
+  });
+
+  const deltaMs = minDeltaSec * 1000 - now.getUTCMilliseconds() + 150;
+  return Math.max(500, deltaMs);
+}
+

@@ -2,11 +2,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { User } from 'firebase/auth';
 import {
   AlertTriangle,
+  ArrowLeft,
   CheckCheck,
   CheckCircle2,
   Clock,
+  Eye,
   Lock,
   Moon,
+  Pencil,
   RotateCcw,
   Save,
   Search,
@@ -39,11 +42,14 @@ import {
   confirmPreloadedOpeningRow,
   detectReportAnomalies,
   formatDateHuman,
+  formatItemStockDisplay,
   formatStationSaveError,
   formatTimeShort,
+  getItemInputType,
   getOpeningRowState,
   getPreviousDateStr,
   getStockLevel,
+  getStockLevelMeta,
   sanitizeStockQuantity,
   type EntryAnomaly,
   type StationSaveErrorInfo,
@@ -65,6 +71,7 @@ interface StationShiftViewProps {
   workspace: Workspace;
   user: User;
   canManage: boolean;
+  isPreviewMode?: boolean;
   scheduleStatus: WorkerScheduleStatus;
   station: Workstation;
   selectedDate: string;
@@ -77,6 +84,7 @@ interface StationShiftViewProps {
   reportsLoaded?: boolean;
   isCacheHydrated?: boolean;
   onSaved?: () => void;
+  onBackToDashboard?: () => void;
 }
 
 type ItemFilter = 'todos' | 'pendientes' | 'bajos';
@@ -244,6 +252,7 @@ export function StationShiftView({
   workspace,
   user,
   canManage,
+  isPreviewMode = false,
   scheduleStatus,
   station,
   selectedDate,
@@ -256,6 +265,7 @@ export function StationShiftView({
   reportsLoaded = true,
   isCacheHydrated = false,
   onSaved,
+  onBackToDashboard,
 }: StationShiftViewProps) {
   const stationItems = useMemo(
     () => items.filter((it) => it.active && it.station === station.id),
@@ -273,10 +283,13 @@ export function StationShiftView({
   const isCompleted = report?.status === 'completed';
   const isLocked = isCompleted && !canManage;
   const isWorkerOpeningPhase = !canManage && scheduleStatus.phase === 'opening';
+  const isWorkerClosingPhase = !canManage && scheduleStatus.phase === 'closing';
   const isWorkerOutsideHours = !canManage && scheduleStatus.phase === 'outside';
   const draftMode: 'opening' | 'closing' = isWorkerOpeningPhase ? 'opening' : 'closing';
   const storageKey = getDraftStorageKey(workspace.id, station.id, selectedDate, draftMode);
 
+  const [isBossEditing, setIsBossEditing] = useState(false);
+  const isBossReadOnly = canManage && !isBossEditing;
   const [drafts, setDrafts] = useState<Record<string, DraftEntryRow>>({});
   const [notes, setNotes] = useState('');
   const [savingMode, setSavingMode] = useState<'opening' | 'closing' | null>(null);
@@ -481,6 +494,10 @@ export function StationShiftView({
     setSaveError(null);
   }, [workspace.id, station.id, selectedDate, report?.id, draftMode, storageKey]);
 
+  useEffect(() => {
+    setIsBossEditing(false);
+  }, [workspace.id, station.id, selectedDate]);
+
   // 2. Merge remote snapshot updates WITHOUT overwriting touched local fields or preloaded previousClosing
   useEffect(() => {
     const stored = readStoredDraft(storageKey);
@@ -607,9 +624,9 @@ export function StationShiftView({
     }
   }, [stationItems, entriesByItemId, report?.notes, report?.updatedAt, report?.reportedByName, storageKey]);
 
-  // 3. Auto-preload yesterday's closing as "Por confirmar" (skipping items that already have opening/prevClosing and reusing cache)
+  // 3. Auto-preload yesterday's closing as "Por confirmar" (skipping opening-saved / closing / read-only views)
   useEffect(() => {
-    if (isWorkerOutsideHours || !reportsLoaded || stationItems.length === 0) return;
+    if (isWorkerOutsideHours || isWorkerClosingPhase || !reportsLoaded || stationItems.length === 0) return;
     const itemSignature = stationItems.map((i) => i.id).join(',');
     const key = `${workspace.id}_${selectedDate}_${station.id}_${itemSignature}`;
     if (yesterdayPreloadKeyRef.current === key) return;
@@ -744,6 +761,7 @@ export function StationShiftView({
     };
   }, [
     isWorkerOutsideHours,
+    isWorkerClosingPhase,
     reportsLoaded,
     canManage,
     user.uid,
@@ -931,7 +949,7 @@ export function StationShiftView({
         return;
       }
 
-      if (openingState === 'pending_confirm') pendingConfirm += 1;
+      if (!isWorkerClosingPhase && openingState === 'pending_confirm') pendingConfirm += 1;
       if (openingState === 'uncounted') missingOpening += 1;
       if (openingState === 'confirmed') confirmedMatch += 1;
       if (openingState === 'adjusted') adjusted += 1;
@@ -947,8 +965,14 @@ export function StationShiftView({
           const lvl = getStockLevel(row.opening + row.added, item.minStock);
           if (lvl === 'agotado' || lvl === 'comprar' || lvl === 'medio') lowCount += 1;
         }
+      } else if (isWorkerClosingPhase) {
+        if (row?.hasClosing) {
+          accounted += 1;
+          const lvl = getStockLevel(row.closing, item.minStock);
+          if (lvl === 'agotado' || lvl === 'comprar' || lvl === 'medio') lowCount += 1;
+        }
       } else {
-        // Closing requires closing value AND no preloaded opening waiting confirmation
+        // Boss / unrestricted edit requires closing value AND no unconfirmed yesterday preload
         if (row?.hasClosing && openingState !== 'pending_confirm') {
           accounted += 1;
           const lvl = getStockLevel(row.closing, item.minStock);
@@ -973,12 +997,12 @@ export function StationShiftView({
       missingCount,
       lowCount,
     };
-  }, [stationItems, drafts, isWorkerOpeningPhase]);
+  }, [stationItems, drafts, isWorkerOpeningPhase, isWorkerClosingPhase]);
 
   const canSubmitMode = useCallback(
     (mode: 'opening' | 'closing'): { ok: boolean; reasonText?: string } => {
       if (counts.total === 0) return { ok: false, reasonText: 'No hay insumos activos.' };
-      if (counts.pendingConfirm > 0) {
+      if (!isWorkerClosingPhase && counts.pendingConfirm > 0) {
         return {
           ok: false,
           reasonText: `Tienes ${counts.pendingConfirm} ${
@@ -1004,7 +1028,7 @@ export function StationShiftView({
       }
       return { ok: true };
     },
-    [counts],
+    [counts, isWorkerClosingPhase],
   );
 
   const primaryBlockStatus = useMemo(
@@ -1060,6 +1084,22 @@ export function StationShiftView({
 
   const requestSaveWithConfirmation = (mode: 'opening' | 'closing') => {
     setSaveError(null);
+    if (mode === 'opening') {
+      const openingSavedCount = stationItems.reduce((acc, it) => {
+        const r = drafts[it.id];
+        return r && (r.notApplicable || r.hasOpening) ? acc + 1 : acc;
+      }, 0);
+      if (openingSavedCount === 0) {
+        setItemFilter('pendientes');
+        setSaveError({
+          title: 'Faltan insumos por contar',
+          detail: 'Cuenta al menos un insumo (o márcalo como "0" o "No aplica") antes de guardar la apertura.',
+        });
+        listSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        return;
+      }
+    }
+
     const check = canSubmitMode(mode);
     if (!check.ok && (mode === 'closing' || isWorkerOpeningPhase)) {
       setItemFilter('pendientes');
@@ -1199,7 +1239,7 @@ export function StationShiftView({
 
       if (itemFilter === 'pendientes') {
         if (isNA) return false;
-        if (openingState === 'pending_confirm') return true;
+        if (!isWorkerClosingPhase && openingState === 'pending_confirm') return true;
         return isWorkerOpeningPhase ? !row?.hasOpening : !row?.hasClosing;
       }
       if (itemFilter === 'bajos') {
@@ -1212,10 +1252,49 @@ export function StationShiftView({
       }
       return true;
     });
-  }, [stationItems, searchTerm, itemFilter, drafts, isWorkerOpeningPhase]);
+  }, [stationItems, searchTerm, itemFilter, drafts, isWorkerOpeningPhase, isWorkerClosingPhase]);
 
   const closingTime = report?.status === 'completed' ? formatTimeShort(report?.updatedAt) : null;
   const draftTime = report?.status === 'opening_saved' ? formatTimeShort(report?.updatedAt) : null;
+
+  const headerStatusSummary = useMemo(() => {
+    const savedEntries = Object.values(entriesByItemId);
+    const openingEntries = savedEntries.filter((e) => e.hasOpening || (report?.status === 'opening_saved' && e.notApplicable));
+    const hasSavedOpening =
+      report?.status === 'opening_saved' ||
+      report?.status === 'completed' ||
+      openingEntries.some((e) => e.hasOpening);
+    const hasSavedClosing =
+      report?.status === 'completed' ||
+      savedEntries.some((e) => e.hasClosing);
+
+    const openingSourceEntry = openingEntries.find((e) => e.hasOpening) ?? openingEntries[0];
+    const openingTimeLabel = hasSavedOpening
+      ? report?.status === 'opening_saved'
+        ? formatTimeShort(report.updatedAt) ?? formatTimeShort(openingSourceEntry?.updatedAt)
+        : formatTimeShort(report?.createdAt) ?? formatTimeShort(openingSourceEntry?.updatedAt)
+      : null;
+    const openingAuthor =
+      (report?.status === 'opening_saved' ? report.reportedByName : openingSourceEntry?.updatedByName) ||
+      report?.reportedByName ||
+      station.workerName;
+
+    const closingSourceEntry = savedEntries.find((e) => e.hasClosing);
+    const closingTimeLabel = hasSavedClosing
+      ? formatTimeShort(report?.updatedAt) ?? formatTimeShort(closingSourceEntry?.updatedAt)
+      : null;
+    const closingAuthor =
+      report?.reportedByName || closingSourceEntry?.updatedByName || station.workerName;
+
+    return {
+      hasSavedOpening,
+      openingTimeLabel,
+      openingAuthor,
+      hasSavedClosing,
+      closingTimeLabel,
+      closingAuthor,
+    };
+  }, [entriesByItemId, report, station.workerName]);
 
   const showClosingThankYou =
     !canManage && (submittedThankYouMode === 'closing' || isLocked);
@@ -1382,12 +1461,73 @@ export function StationShiftView({
       onBlurCapture={handleContainerBlurCapture}
       className="space-y-4 sm:space-y-5 pb-32 lg:pb-8 min-w-0"
     >
+      {/* Boss Read-Only / Edit Banner */}
+      {canManage && (
+        <div
+          className={`rounded-2xl border px-4 py-3 flex flex-wrap items-center justify-between gap-2.5 ${
+            isBossReadOnly
+              ? 'bg-stone-100/90 border-stone-300 text-stone-900'
+              : 'bg-orange-50/80 border-orange-200 text-orange-950'
+          }`}
+        >
+          <div className="flex items-center gap-2 text-xs sm:text-sm font-semibold min-w-0">
+            {isBossReadOnly ? (
+              <Eye className="w-4 h-4 text-stone-700 shrink-0" />
+            ) : (
+              <Pencil className="w-4 h-4 text-orange-700 shrink-0" />
+            )}
+            <span className="truncate">
+              {isBossReadOnly
+                ? isPreviewMode
+                  ? 'Vista del jefe (solo lectura) · Estás en modo vista previa'
+                  : 'Vista del jefe (solo lectura)'
+                : isPreviewMode
+                  ? 'Modo edición del jefe · Vista previa del enlace'
+                  : 'Modo edición del jefe'}
+            </span>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            {onBackToDashboard && (
+              <button
+                type="button"
+                onClick={onBackToDashboard}
+                className="min-h-[40px] inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-stone-700 bg-white border border-stone-300 rounded-xl hover:bg-stone-50 cursor-pointer"
+              >
+                <ArrowLeft className="w-3.5 h-3.5" />
+                Volver al panel
+              </button>
+            )}
+            {isBossReadOnly ? (
+              <button
+                type="button"
+                onClick={() => setIsBossEditing(true)}
+                className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-white bg-stone-950 rounded-xl hover:bg-stone-800 cursor-pointer"
+              >
+                <Pencil className="w-3.5 h-3.5" />
+                Editar
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setIsBossEditing(false)}
+                className="min-h-[40px] inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-stone-800 bg-white border border-stone-300 rounded-xl hover:bg-stone-100 cursor-pointer"
+              >
+                <Eye className="w-3.5 h-3.5" />
+                Volver a solo lectura
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Header */}
       <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-3.5">
         <div className="min-w-0">
           <p className="text-xs font-semibold text-orange-600">
-            ¡Hola, {station.workerName}! · {station.area || 'Tu puesto'} ·{' '}
-            {formatDateHuman(selectedDate)}
+            {canManage
+              ? `Encargada: ${station.workerName} · ${station.area || 'Puesto'} · ${formatDateHuman(selectedDate)}`
+              : `¡Hola, ${station.workerName}! · ${station.area || 'Tu puesto'} · ${formatDateHuman(selectedDate)}`}
           </p>
           <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-stone-900 mt-0.5 [text-wrap:balance]">
             {station.name}
@@ -1395,9 +1535,11 @@ export function StationShiftView({
           <p className="text-sm text-stone-600 mt-1">
             {isWorkerOpeningPhase
               ? `Apertura (${scheduleStatus.openingRangeLabel}): confirma el inicio respecto a ayer y anota si llegó mercancía.`
-              : !canManage && scheduleStatus.phase === 'closing'
-                ? `Cierre (${scheduleStatus.closingRangeLabel}): revisa inicio/surtido y cuenta cuánto quedó al terminar el turno.`
-                : 'Paso 1: Inicio y surtido del día · Paso 2: Cierre del día.'}
+              : isWorkerClosingPhase
+                ? `Cierre (${scheduleStatus.closingRangeLabel}): registra únicamente cuánto quedó hoy al terminar el turno.`
+                : isBossReadOnly
+                  ? 'Planilla guardada del puesto en modo solo lectura.'
+                  : 'Inicio, surtido y cierre del día.'}
           </p>
         </div>
 
@@ -1415,6 +1557,52 @@ export function StationShiftView({
           )}
         </div>
       </div>
+
+      {/* Boss Opening/Closing Save Status Header Cards */}
+      {canManage && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+          <div
+            className={`rounded-xl border px-3.5 py-2.5 text-xs flex items-center gap-2 ${
+              headerStatusSummary.hasSavedOpening
+                ? 'bg-emerald-50/70 border-emerald-200 text-emerald-950'
+                : 'bg-white border-stone-200 text-stone-600'
+            }`}
+          >
+            <Sun
+              className={`w-4 h-4 shrink-0 ${
+                headerStatusSummary.hasSavedOpening ? 'text-emerald-600' : 'text-stone-400'
+              }`}
+            />
+            <span>
+              {headerStatusSummary.hasSavedOpening
+                ? headerStatusSummary.openingTimeLabel
+                  ? `Apertura guardada a las ${headerStatusSummary.openingTimeLabel} por ${headerStatusSummary.openingAuthor}`
+                  : `Apertura guardada por ${headerStatusSummary.openingAuthor}`
+                : 'Apertura pendiente'}
+            </span>
+          </div>
+          <div
+            className={`rounded-xl border px-3.5 py-2.5 text-xs flex items-center gap-2 ${
+              headerStatusSummary.hasSavedClosing
+                ? 'bg-emerald-50/70 border-emerald-200 text-emerald-950'
+                : 'bg-white border-stone-200 text-stone-600'
+            }`}
+          >
+            <Moon
+              className={`w-4 h-4 shrink-0 ${
+                headerStatusSummary.hasSavedClosing ? 'text-emerald-600' : 'text-stone-400'
+              }`}
+            />
+            <span>
+              {headerStatusSummary.hasSavedClosing
+                ? headerStatusSummary.closingTimeLabel
+                  ? `Cierre guardado a las ${headerStatusSummary.closingTimeLabel} por ${headerStatusSummary.closingAuthor}`
+                  : `Cierre guardado por ${headerStatusSummary.closingAuthor}`
+                : 'Cierre pendiente'}
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* Offline / Pending sync banner */}
       {(!isOnline || hasPendingWrites) && (
@@ -1447,8 +1635,8 @@ export function StationShiftView({
         </div>
       )}
 
-      {/* No yesterday closing warning */}
-      {yesterdayStatus === 'none' && !isLocked && (
+      {/* No yesterday closing warning (only in opening / editable mode, never during closing or boss read-only) */}
+      {!isBossReadOnly && !isWorkerClosingPhase && yesterdayStatus === 'none' && !isLocked && (
         <div
           role="alert"
           className="px-4 py-3.5 rounded-2xl bg-amber-50 border border-amber-300 text-xs sm:text-sm text-amber-950 flex items-start gap-2.5"
@@ -1461,7 +1649,7 @@ export function StationShiftView({
       )}
 
       {/* Bulk confirmation bar for preloaded yesterday closings */}
-      {counts.pendingConfirm > 0 && !isLocked && (
+      {!isBossReadOnly && !isWorkerClosingPhase && counts.pendingConfirm > 0 && !isLocked && (
         <div className="px-4 py-3.5 rounded-2xl bg-sky-50 border border-sky-300 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div className="flex items-start gap-2.5 text-xs sm:text-sm text-sky-950 min-w-0">
             <Clock className="w-4 h-4 text-sky-700 shrink-0 mt-0.5" />
@@ -1486,7 +1674,7 @@ export function StationShiftView({
       )}
 
       {/* Remote concurrent edit notice */}
-      {remoteChangedBy && !isLocked && (
+      {!isBossReadOnly && remoteChangedBy && !isLocked && (
         <div className="px-4 py-3 rounded-2xl bg-amber-50 border border-amber-200 text-xs sm:text-sm text-amber-900 flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2">
             <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
@@ -1504,91 +1692,105 @@ export function StationShiftView({
         </div>
       )}
 
-      {/* Progress & Status Card */}
-      <div
-        className={`rounded-2xl border p-4 sm:p-5 space-y-3 transition-colors ${
-          isCompleted
-            ? 'bg-emerald-50/70 border-emerald-200'
-            : counts.pendingConfirm > 0
-              ? 'bg-sky-50/40 border-sky-200'
-              : 'bg-white border-stone-200'
-        }`}
-      >
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="flex items-center gap-2.5 text-sm min-w-0">
-            {report?.status === 'completed' ? (
-              <>
-                <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
-                <span className="font-semibold text-emerald-900">
-                  Cierre enviado{closingTime ? ` (${closingTime})` : ''}
-                </span>
-              </>
-            ) : isWorkerOpeningPhase ? (
-              <>
-                <Sun className="w-5 h-5 text-orange-600 shrink-0" />
-                <span className="font-semibold text-stone-900">
-                  {report?.status === 'opening_saved'
-                    ? `Apertura guardada${draftTime ? ` (${draftTime})` : ''}`
-                    : 'Paso 1: Apertura y llegada de productos'}
-                </span>
-              </>
-            ) : report?.status === 'opening_saved' ? (
-              <>
-                <Save className="w-5 h-5 text-amber-600 shrink-0" />
-                <span className="font-semibold text-amber-900">
-                  Apertura lista{draftTime ? ` (${draftTime})` : ''} · Paso 2: Cierre del día
-                </span>
-              </>
-            ) : (
-              <>
-                <Moon className="w-5 h-5 text-orange-600 shrink-0" />
-                <span className="font-semibold text-stone-900">
-                  Inicio, surtido y cierre del día
-                </span>
-              </>
-            )}
+      {/* Progress & Status Card (shown in worker / boss edit views) */}
+      {!isBossReadOnly && (
+        <div
+          className={`rounded-2xl border p-4 sm:p-5 space-y-3 transition-colors ${
+            isCompleted
+              ? 'bg-emerald-50/70 border-emerald-200'
+              : counts.pendingConfirm > 0
+                ? 'bg-sky-50/40 border-sky-200'
+                : 'bg-white border-stone-200'
+          }`}
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2.5 text-sm min-w-0">
+              {report?.status === 'completed' ? (
+                <>
+                  <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
+                  <span className="font-semibold text-emerald-900">
+                    Cierre enviado{closingTime ? ` (${closingTime})` : ''}
+                  </span>
+                </>
+              ) : isWorkerOpeningPhase ? (
+                <>
+                  <Sun className="w-5 h-5 text-orange-600 shrink-0" />
+                  <span className="font-semibold text-stone-900">
+                    {report?.status === 'opening_saved'
+                      ? `Apertura guardada${draftTime ? ` (${draftTime})` : ''}`
+                      : 'Apertura y llegada de productos'}
+                  </span>
+                </>
+              ) : isWorkerClosingPhase ? (
+                <>
+                  <Moon className="w-5 h-5 text-orange-600 shrink-0" />
+                  <span className="font-semibold text-stone-900">
+                    Cierre del día
+                    {report?.status === 'opening_saved' && draftTime
+                      ? ` · Apertura guardada (${draftTime})`
+                      : ''}
+                  </span>
+                </>
+              ) : report?.status === 'opening_saved' ? (
+                <>
+                  <Save className="w-5 h-5 text-amber-600 shrink-0" />
+                  <span className="font-semibold text-amber-900">
+                    Apertura guardada{draftTime ? ` (${draftTime})` : ''} · Cierre del día
+                  </span>
+                </>
+              ) : (
+                <>
+                  <Moon className="w-5 h-5 text-orange-600 shrink-0" />
+                  <span className="font-semibold text-stone-900">
+                    Inicio, surtido y cierre del día
+                  </span>
+                </>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2.5 font-mono tabular-nums text-xs sm:text-sm font-bold shrink-0">
+              {counts.pendingConfirm > 0 && (
+                <span className="text-sky-700">{counts.pendingConfirm} por confirmar</span>
+              )}
+              <span className="text-stone-800">
+                {counts.accounted} de {counts.total} listos
+              </span>
+            </div>
           </div>
 
-          <div className="flex items-center gap-2.5 font-mono tabular-nums text-xs sm:text-sm font-bold shrink-0">
-            {counts.pendingConfirm > 0 && (
-              <span className="text-sky-700">{counts.pendingConfirm} por confirmar</span>
-            )}
-            <span className="text-stone-800">
-              {counts.accounted} de {counts.total} listos
+          <div className="w-full h-2.5 bg-stone-200/80 rounded-full overflow-hidden">
+            <div
+              style={{ width: `${progressPct}%` }}
+              className={`h-full rounded-full transition-[width] duration-300 ease-out ${
+                isCompleted
+                  ? 'bg-emerald-600'
+                  : counts.pendingConfirm > 0
+                    ? 'bg-sky-600'
+                    : 'bg-orange-600'
+              }`}
+            />
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-stone-600">
+            <span>
+              {restoredFromLocal
+                ? 'Borrador recuperado en este dispositivo.'
+                : isWorkerClosingPhase
+                  ? 'Cuenta cuánto quedó de cada insumo al cierre, toca "0 / No queda" o "No aplica hoy".'
+                  : yesterdayStatus === 'loading'
+                    ? 'Cargando cierre de ayer para comparar...'
+                    : yesterdayStatus === 'found'
+                      ? `Precargado con cierre de ${formatDateHuman(yesterdayDateStr)}. Revisa o confirma cada insumo.`
+                      : 'Cuenta cada insumo, toca "0" si no hay o "No aplica hoy".'}
             </span>
+            {!isWorkerClosingPhase && (counts.confirmedMatch > 0 || counts.adjusted > 0) && (
+              <span className="font-mono tabular-nums text-stone-700">
+                {counts.confirmedMatch} coinciden · {counts.adjusted} corregidos
+              </span>
+            )}
           </div>
         </div>
-
-        <div className="w-full h-2.5 bg-stone-200/80 rounded-full overflow-hidden">
-          <div
-            style={{ width: `${progressPct}%` }}
-            className={`h-full rounded-full transition-[width] duration-300 ease-out ${
-              isCompleted
-                ? 'bg-emerald-600'
-                : counts.pendingConfirm > 0
-                  ? 'bg-sky-600'
-                  : 'bg-orange-600'
-            }`}
-          />
-        </div>
-
-        <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-stone-600">
-          <span>
-            {restoredFromLocal
-              ? 'Borrador recuperado en este dispositivo.'
-              : yesterdayStatus === 'loading'
-                ? 'Cargando cierre de ayer para comparar...'
-                : yesterdayStatus === 'found'
-                  ? `Precargado con cierre de ${formatDateHuman(yesterdayDateStr)}. Revisa o confirma cada insumo.`
-                  : 'Cuenta cada insumo, toca "0" si no hay o "No aplica hoy".'}
-          </span>
-          {(counts.confirmedMatch > 0 || counts.adjusted > 0) && (
-            <span className="font-mono tabular-nums text-stone-700">
-              {counts.confirmedMatch} coinciden · {counts.adjusted} corregidos
-            </span>
-          )}
-        </div>
-      </div>
+      )}
 
       {feedback && (
         <div
@@ -1604,7 +1806,7 @@ export function StationShiftView({
       )}
 
       {/* Search & Filter Toolbar */}
-      {stationItems.length > 0 && (
+      {!isBossReadOnly && stationItems.length > 0 && (
         <div
           ref={listSectionRef}
           className="flex flex-col sm:flex-row sm:items-center justify-between gap-3"
@@ -1634,17 +1836,19 @@ export function StationShiftView({
                 ? `Pendientes (${counts.missingCount})`
                 : `Faltan (${counts.missingCount})`}
             </button>
-            <button
-              type="button"
-              onClick={() => setItemFilter('bajos')}
-              className={`min-h-[40px] px-3 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
-                itemFilter === 'bajos'
-                  ? 'bg-white text-stone-900 shadow-sm'
-                  : 'text-stone-700 hover:text-stone-900'
-              }`}
-            >
-              Bajos ({counts.lowCount})
-            </button>
+            {!isWorkerClosingPhase && (
+              <button
+                type="button"
+                onClick={() => setItemFilter('bajos')}
+                className={`min-h-[40px] px-3 py-1.5 text-xs sm:text-sm font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+                  itemFilter === 'bajos'
+                    ? 'bg-white text-stone-900 shadow-sm'
+                    : 'text-stone-700 hover:text-stone-900'
+                }`}
+              >
+                Bajos ({counts.lowCount})
+              </button>
+            )}
           </div>
 
           <div className="relative w-full sm:w-64">
@@ -1667,6 +1871,161 @@ export function StationShiftView({
           <div className="p-10 text-center text-sm text-stone-600">
             No hay insumos activos en este puesto. El jefe puede agregarlos desde &ldquo;Insumos&rdquo;.
           </div>
+        ) : isBossReadOnly ? (
+          <>
+            {/* Boss Read-Only Mobile Cards (< lg) */}
+            <div className="lg:hidden divide-y divide-stone-200">
+              {stationItems.map((item) => {
+                const entry = entriesByItemId[item.id];
+                const isNA = Boolean(entry?.notApplicable);
+                const hasOpen = Boolean(entry?.hasOpening) && !isNA;
+                const hasClose = Boolean(entry?.hasClosing) && !isNA;
+                const isLevelRestock =
+                  getItemInputType(item) === 'level' &&
+                  hasOpen &&
+                  hasClose &&
+                  entry.closing > sanitizeStockQuantity(entry.opening + entry.added);
+                const consumed =
+                  hasOpen && hasClose
+                    ? sanitizeStockQuantity(Math.max(0, entry.opening + entry.added - entry.closing))
+                    : null;
+                const meta = hasClose ? getStockLevelMeta(getStockLevel(entry.closing, item.minStock)) : null;
+
+                return (
+                  <div key={item.id} className="p-4 space-y-2">
+                    <div className="flex items-start justify-between gap-2">
+                      <p className="text-base font-semibold text-stone-900">{item.name}</p>
+                      <span
+                        className={`text-xs font-semibold shrink-0 ${
+                          isNA
+                            ? 'text-stone-600'
+                            : meta
+                              ? meta.textClass
+                              : 'text-stone-400'
+                        }`}
+                      >
+                        {isNA ? 'No aplica' : meta ? meta.label : '—'}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs font-mono tabular-nums text-stone-700">
+                      <div>
+                        <span className="text-stone-500 font-sans">Inicio:</span>{' '}
+                        {isNA ? 'No aplica' : hasOpen ? formatItemStockDisplay(entry.opening, item) : '—'}
+                      </div>
+                      <div>
+                        <span className="text-stone-500 font-sans">Surtido:</span>{' '}
+                        {!isNA && entry && entry.added > 0
+                          ? `+${formatItemStockDisplay(entry.added, item)}`
+                          : '—'}
+                      </div>
+                      <div>
+                        <span className="text-stone-500 font-sans">Cierre:</span>{' '}
+                        {isNA ? 'No aplica' : hasClose ? formatItemStockDisplay(entry.closing, item) : '—'}
+                      </div>
+                      <div>
+                        <span className="text-stone-500 font-sans">Consumo:</span>{' '}
+                        {isNA
+                          ? '—'
+                          : isLevelRestock
+                            ? 'Reposición'
+                            : consumed !== null
+                              ? formatItemStockDisplay(consumed, item)
+                              : '—'}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Boss Read-Only Desktop Table (>= lg) */}
+            <div className="hidden lg:block overflow-x-auto">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="border-b border-stone-200 bg-stone-50 text-xs font-semibold text-stone-600">
+                    <th className="py-3.5 px-5 min-w-[200px]">Insumo</th>
+                    <th className="py-3.5 px-4 text-right whitespace-nowrap">Inicio</th>
+                    <th className="py-3.5 px-4 text-right whitespace-nowrap">Surtido</th>
+                    <th className="py-3.5 px-4 text-right whitespace-nowrap">Cierre</th>
+                    <th className="py-3.5 px-4 text-right whitespace-nowrap">Consumo</th>
+                    <th className="py-3.5 px-5 whitespace-nowrap">Estado</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-stone-100 text-sm">
+                  {stationItems.map((item) => {
+                    const entry = entriesByItemId[item.id];
+                    const isNA = Boolean(entry?.notApplicable);
+                    const hasOpen = Boolean(entry?.hasOpening) && !isNA;
+                    const hasClose = Boolean(entry?.hasClosing) && !isNA;
+                    const isLevelRestock =
+                      getItemInputType(item) === 'level' &&
+                      hasOpen &&
+                      hasClose &&
+                      entry.closing > sanitizeStockQuantity(entry.opening + entry.added);
+                    const consumed =
+                      hasOpen && hasClose
+                        ? sanitizeStockQuantity(Math.max(0, entry.opening + entry.added - entry.closing))
+                        : null;
+                    const meta = hasClose ? getStockLevelMeta(getStockLevel(entry.closing, item.minStock)) : null;
+
+                    return (
+                      <tr key={item.id} className="hover:bg-stone-50/70 transition-colors">
+                        <td className="py-3.5 px-5">
+                          <div className="font-semibold text-stone-900">{item.name}</div>
+                          <div className="text-xs text-stone-500 font-mono tabular-nums">
+                            Mín: {formatItemStockDisplay(item.minStock, item)}
+                          </div>
+                        </td>
+                        <td className="py-3.5 px-4 text-right font-mono tabular-nums text-stone-800 whitespace-nowrap">
+                          {isNA
+                            ? 'No aplica'
+                            : hasOpen
+                              ? formatItemStockDisplay(entry.opening, item)
+                              : '—'}
+                        </td>
+                        <td className="py-3.5 px-4 text-right font-mono tabular-nums text-stone-700 whitespace-nowrap">
+                          {!isNA && entry && entry.added > 0
+                            ? `+${formatItemStockDisplay(entry.added, item)}`
+                            : '—'}
+                        </td>
+                        <td className="py-3.5 px-4 text-right font-mono tabular-nums font-semibold text-stone-900 whitespace-nowrap">
+                          {isNA
+                            ? 'No aplica'
+                            : hasClose
+                              ? formatItemStockDisplay(entry.closing, item)
+                              : '—'}
+                        </td>
+                        <td className="py-3.5 px-4 text-right font-mono tabular-nums text-stone-700 whitespace-nowrap">
+                          {isNA ? (
+                            '—'
+                          ) : isLevelRestock ? (
+                            <span className="text-sky-700 font-semibold">Reposición</span>
+                          ) : consumed !== null ? (
+                            formatItemStockDisplay(consumed, item)
+                          ) : (
+                            '—'
+                          )}
+                        </td>
+                        <td className="py-3.5 px-5 whitespace-nowrap">
+                          <span
+                            className={`text-xs font-semibold ${
+                              isNA
+                                ? 'text-stone-600'
+                                : meta
+                                  ? meta.textClass
+                                  : 'text-stone-400 font-normal'
+                            }`}
+                          >
+                            {isNA ? 'No aplica' : meta ? meta.label : '—'}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </>
         ) : filteredItems.length === 0 ? (
           <div className="p-10 text-center space-y-2">
             <p className="text-sm font-semibold text-stone-800">
@@ -1708,6 +2067,7 @@ export function StationShiftView({
                     row={row}
                     isLocked={isLocked}
                     isWorkerOpeningPhase={isWorkerOpeningPhase}
+                    isWorkerClosingPhase={isWorkerClosingPhase}
                     draftMode={draftMode}
                     onCommitField={commitFieldValue}
                     onClearField={clearFieldValue}
@@ -1725,15 +2085,22 @@ export function StationShiftView({
                 <thead>
                   <tr className="border-b border-stone-200 bg-stone-50 text-xs font-semibold text-stone-600">
                     <th className="py-3.5 px-5 min-w-[210px]">Insumo</th>
-                    <th className="py-3.5 px-3 text-center">Inicio del día</th>
-                    <th className="py-3.5 px-3 text-center">Surtido (+)</th>
                     {isWorkerOpeningPhase ? (
                       <>
+                        <th className="py-3.5 px-3 text-center">Inicio del día</th>
+                        <th className="py-3.5 px-3 text-center">Surtido (+)</th>
                         <th className="py-3.5 px-4 text-center">Confirmación y opciones</th>
                         <th className="py-3.5 px-5 text-right">Total disponible</th>
                       </>
+                    ) : isWorkerClosingPhase ? (
+                      <>
+                        <th className="py-3.5 px-4 text-center">¿Cuánto quedó hoy?</th>
+                        <th className="py-3.5 px-4 text-center">Opciones</th>
+                      </>
                     ) : (
                       <>
+                        <th className="py-3.5 px-3 text-center">Inicio del día</th>
+                        <th className="py-3.5 px-3 text-center">Surtido (+)</th>
                         <th className="py-3.5 px-4 text-center">¿Cuánto quedó hoy? (Cierre)</th>
                         <th className="py-3.5 px-3 text-center">Opciones</th>
                         <th className="py-3.5 px-4 text-right">Consumo</th>
@@ -1764,6 +2131,7 @@ export function StationShiftView({
                         row={row}
                         isLocked={isLocked}
                         isWorkerOpeningPhase={isWorkerOpeningPhase}
+                        isWorkerClosingPhase={isWorkerClosingPhase}
                         draftMode={draftMode}
                         onCommitField={commitFieldValue}
                         onClearField={clearFieldValue}
@@ -1854,8 +2222,16 @@ export function StationShiftView({
         </div>
       )}
 
-      {/* Notes & Desktop Save Section */}
-      {stationItems.length > 0 && (
+      {/* Read-only shift note when saved */}
+      {isBossReadOnly && Boolean(report?.notes?.trim()) && (
+        <div className="bg-white border border-stone-200 rounded-2xl p-4 sm:p-5 space-y-1.5">
+          <p className="text-xs font-semibold text-stone-600">Notas del turno</p>
+          <p className="text-sm text-stone-800 whitespace-pre-wrap">{report?.notes}</p>
+        </div>
+      )}
+
+      {/* Notes & Desktop Save Section (hidden in Boss read-only mode) */}
+      {!isBossReadOnly && stationItems.length > 0 && (
         <div className="bg-white border border-stone-200 rounded-2xl p-4 sm:p-5 space-y-4">
           <div>
             <label
@@ -2045,8 +2421,8 @@ export function StationShiftView({
         </div>
       )}
 
-      {/* Mobile Sticky Bottom CTA Bar (auto-hidden when virtual keyboard is open) */}
-      {stationItems.length > 0 && !isLocked && !isTextInputFocused && (
+      {/* Mobile Sticky Bottom CTA Bar (auto-hidden when virtual keyboard is open or boss read-only) */}
+      {!isBossReadOnly && stationItems.length > 0 && !isLocked && !isTextInputFocused && (
         <div className="lg:hidden fixed bottom-0 left-0 right-0 z-30 bg-white/95 backdrop-blur-md border-t border-stone-200 shadow-lg no-print pb-[max(0.5rem,env(safe-area-inset-bottom))]">
           {pendingConflict && (
             <div className="px-4 py-2.5 bg-amber-50 border-b border-amber-200 text-amber-950">

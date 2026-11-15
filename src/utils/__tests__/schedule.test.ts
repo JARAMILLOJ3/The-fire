@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import { DEFAULT_SHIFT_SCHEDULE } from '../../constants';
 import {
   formatTime12h,
+  getNextScheduleTransitionMs,
   hasClosingDeadlinePassed,
+  isClosingWindowStarted,
   isTimeInWindow,
   resolveWorkerScheduleStatus,
   validateShiftSchedule,
@@ -210,5 +212,57 @@ describe('schedule.ts (ventanas, medianoche y gracia de 10 min)', () => {
     expect(
       hasClosingDeadlinePassed(new Date('2026-11-14T02:10:00Z'), '2026-11-13', daytimeSchedule),
     ).toBe(true);
+  });
+
+  it('knows whether closing window has started for neutral dashboard indicator before closing time', () => {
+    // Schedule 16:00-18:00 opening, 23:00-02:00 closing
+    // At 17:00 Bogota (22:00Z on 2026-11-13): closing has NOT started yet
+    expect(
+      isClosingWindowStarted(
+        new Date('2026-11-13T22:00:00Z'),
+        '2026-11-13',
+        DEFAULT_SHIFT_SCHEDULE,
+      ),
+    ).toBe(false);
+
+    // At 23:00 Bogota (04:00Z on 2026-11-14): closing window starts
+    expect(
+      isClosingWindowStarted(
+        new Date('2026-11-14T04:00:00Z'),
+        '2026-11-13',
+        DEFAULT_SHIFT_SCHEDULE,
+      ),
+    ).toBe(true);
+
+    // At 01:00 Bogota next morning (06:00Z on 2026-11-14): still same operational day 2026-11-13 -> closing started
+    expect(
+      isClosingWindowStarted(
+        new Date('2026-11-14T06:00:00Z'),
+        '2026-11-13',
+        DEFAULT_SHIFT_SCHEDULE,
+      ),
+    ).toBe(true);
+
+    // Yesterday operational date -> always true; disabled schedule -> true
+    expect(
+      isClosingWindowStarted(
+        new Date('2026-11-14T15:00:00Z'),
+        '2026-11-13',
+        DEFAULT_SHIFT_SCHEDULE,
+      ),
+    ).toBe(true);
+    expect(
+      isClosingWindowStarted(new Date('2026-11-13T15:00:00Z'), '2026-11-13', {
+        ...DEFAULT_SHIFT_SCHEDULE,
+        enabled: false,
+      }),
+    ).toBe(true);
+  });
+
+  it('computes milliseconds to next schedule phase boundary accurately for live phase switch', () => {
+    // 22:59:30 Bogota = 03:59:30Z -> closingStart is 23:00:00 -> 30 seconds (+150ms buffer)
+    const now = new Date('2026-11-14T03:59:30.000Z');
+    const ms = getNextScheduleTransitionMs(now, DEFAULT_SHIFT_SCHEDULE, 10);
+    expect(ms).toBe(30_150);
   });
 });

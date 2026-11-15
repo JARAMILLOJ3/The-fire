@@ -34,6 +34,7 @@ import {
   updateWorkstation,
 } from '../services/bossService';
 import type { InventoryItem, StationLink, Workspace, Workstation } from '../types';
+import { PartialBatchError } from '../utils/batch';
 import {
   formatItemStockDisplay,
   getEffectiveItemUnit,
@@ -71,6 +72,11 @@ export function WorkstationsManager({
   const [assignSearch, setAssignSearch] = useState('');
   const [assignError, setAssignError] = useState<string | null>(null);
   const [assignSaving, setAssignSaving] = useState(false);
+  const [assignProgress, setAssignProgress] = useState<{
+    processed: number;
+    total: number;
+  } | null>(null);
+  const [assignCanRetry, setAssignCanRetry] = useState(false);
 
   const [qrStation, setQrStation] = useState<Workstation | null>(null);
   const [qrDataUrl, setQrDataUrl] = useState<string>('');
@@ -161,6 +167,8 @@ export function WorkstationsManager({
     setAssignSelectedIds(currentlyAssigned.map((i) => i.id));
     setAssignSearch('');
     setAssignError(null);
+    setAssignProgress(null);
+    setAssignCanRetry(false);
     setAssignStation(st);
   };
 
@@ -168,11 +176,13 @@ export function WorkstationsManager({
     setAssignSelectedIds((prev) =>
       prev.includes(itemId) ? prev.filter((id) => id !== itemId) : [...prev, itemId],
     );
-    if (assignError) setAssignError(null);
+    if (assignError) {
+      setAssignError(null);
+      setAssignCanRetry(false);
+    }
   };
 
-  const handleSaveAssignment = async (e: FormEvent) => {
-    e.preventDefault();
+  const runAssignSave = async () => {
     if (!assignStation) return;
 
     const validation = validateStationItemAssignment({
@@ -186,19 +196,34 @@ export function WorkstationsManager({
 
     setAssignSaving(true);
     setAssignError(null);
+    setAssignCanRetry(false);
+    setAssignProgress(null);
     try {
       await assignWorkstationItems({
         station: assignStation,
         allStations: stations,
         allItems: items,
         selectedItemIds: assignSelectedIds,
+        onProgress: (processed, total) => setAssignProgress({ processed, total }),
       });
       setAssignStation(null);
-    } catch {
-      setAssignError('No se pudieron asignar los insumos. Intenta nuevamente.');
+      setAssignProgress(null);
+    } catch (err) {
+      if (err instanceof PartialBatchError) {
+        setAssignProgress({ processed: err.processedCount, total: err.totalCount });
+        setAssignError(err.message);
+      } else {
+        setAssignError('No se pudieron asignar los insumos. Intenta nuevamente.');
+      }
+      setAssignCanRetry(true);
     } finally {
       setAssignSaving(false);
     }
+  };
+
+  const handleSaveAssignment = async (e: FormEvent) => {
+    e.preventDefault();
+    await runAssignSave();
   };
 
   const handleSubmit = async (e: FormEvent) => {
@@ -736,10 +761,26 @@ export function WorkstationsManager({
                 {assignError && (
                   <div
                     role="alert"
-                    className="p-3 text-xs text-red-700 bg-red-50 border border-red-200 rounded-xl shrink-0"
+                    className="p-3 text-xs text-red-800 bg-red-50 border border-red-200 rounded-xl shrink-0 flex flex-wrap items-center justify-between gap-2"
                   >
-                    {assignError}
+                    <span>{assignError}</span>
+                    {assignCanRetry && (
+                      <button
+                        type="button"
+                        disabled={assignSaving}
+                        onClick={() => void runAssignSave()}
+                        className="min-h-[34px] px-3 py-1 font-semibold text-white bg-red-600 rounded-lg hover:bg-red-700 disabled:opacity-60 cursor-pointer"
+                      >
+                        Reintentar
+                      </button>
+                    )}
                   </div>
+                )}
+
+                {assignSaving && assignProgress && assignProgress.total > 0 && (
+                  <p className="text-xs font-mono tabular-nums text-stone-600 shrink-0">
+                    Guardando en lotes pequeños: {assignProgress.processed} de {assignProgress.total} procesados...
+                  </p>
                 )}
 
                 {orderedAssignItems.length === 0 ? (

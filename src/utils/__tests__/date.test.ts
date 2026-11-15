@@ -1,13 +1,20 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import {
   formatBogotaTimeExact,
   getBogotaNowParts,
   getOperationalDateStr,
   getPreviousDateStr,
+  getServerNow,
+  getServerTimeOffsetMs,
+  setServerTimeOffsetMs,
   shiftDateStr,
 } from '../date';
 
 describe('date.ts (America/Bogota UTC-5)', () => {
+  afterEach(() => {
+    setServerTimeOffsetMs(0);
+  });
+
   it('converts UTC timestamps accurately to America/Bogota local date and time', () => {
     // 2026-11-14 04:30 UTC === 2026-11-13 23:30 America/Bogota
     const utcLateNight = new Date('2026-11-14T04:30:00Z');
@@ -47,5 +54,15 @@ describe('date.ts (America/Bogota UTC-5)', () => {
     expect(getPreviousDateStr('2026-03-01')).toBe('2026-02-28');
     expect(getPreviousDateStr('2024-03-01')).toBe('2024-02-29');
     expect(shiftDateStr('2026-11-13', 2)).toBe('2026-11-15');
+  });
+
+  it('applies server time offset to compute authoritative getServerNow even if device clock is skewed', () => {
+    const localSkewedMs = Date.parse('2026-11-13T15:00:00Z');
+    setServerTimeOffsetMs(3600_000); // server is +1 hour ahead
+    expect(getServerTimeOffsetMs()).toBe(3600_000);
+    expect(getServerNow(localSkewedMs).toISOString()).toBe('2026-11-13T16:00:00.000Z');
+
+    setServerTimeOffsetMs(Number.NaN);
+    expect(getServerTimeOffsetMs()).toBe(0);
   });
 });

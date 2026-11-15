@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type {
   DailyReport,
   DailyReportEntry,
@@ -15,8 +15,10 @@ import {
   buildWeeklyStationHistory,
   buildWhatsAppShoppingList,
   computeLevelWithContainersTotal,
+  confirmPacksThresholdSignature,
   detectDashboardConsumptionAnomalies,
   detectEntryAnomalies,
+  findPacksItemsNeedingThresholdReview,
   formatContainerFractionLabel,
   formatItemStockDisplay,
   formatPackEquivalent,
@@ -29,9 +31,11 @@ import {
   getStockLevel,
   getSuggestedPurchase,
   getUnitSelectOptions,
+  getVisibleWeeklyDates,
   isInvalidLevelUnit,
   parseCaptureDecimalInput,
   parseQuantityInput,
+  readConfirmedPacksThresholds,
   sanitizeStockQuantity,
   splitLevelWithContainers,
   validateCatalogItemInput,
@@ -523,8 +527,10 @@ describe('inventory.ts (sanitización, sin_dato, anomalías y compras)', () => {
     expect(history.dates).toHaveLength(7);
     expect(history.dates[0]).toBe('2026-11-07');
     expect(history.dates[6]).toBe('2026-11-13');
+    expect(history.firstReportDate).toBe('2026-11-12');
+    expect(history.rows[0].activeDaysCount).toBe(2);
     expect(history.rows[0].completedCount).toBe(1);
-    expect(history.rows[0].lateCount).toBe(6);
+    expect(history.rows[0].lateCount).toBe(1);
     const day12 = history.rows[0].days.find((d) => d.date === '2026-11-12');
     expect(day12?.status).toBe('completed');
     expect(day12?.lowStockCount).toBe(1);
@@ -1400,5 +1406,138 @@ describe('inventory.ts (sanitización, sin_dato, anomalías y compras)', () => {
     expect(lines[2]).toContain(`"'=Salida del jefe (Cant: 2 und)"`);
     expect(lines[2]).toContain('"","","",""');
     expect(csv).not.toContain('Nota de otro día');
+  });
+
+  it('marks weekly history days prior to firstReportDate as neutral (isBeforeFirstReport, not late) and supports 4-day mobile slice', () => {
+    const station = makeStation({ id: 'mesera', name: 'Mesera' });
+    const reports: DailyReport[] = [
+      {
+        id: 'ws_1_2026-11-12_mesera',
+        workspaceId: 'ws_1',
+        ownerUid: 'owner_1',
+        authorizedEmails: ['boss@example.com'],
+        date: '2026-11-12',
+        station: 'mesera',
+        status: 'completed',
+        reportedByUid: 'worker_1',
+        reportedByName: 'Ana',
+        notes: '',
+      },
+      {
+        id: 'ws_1_2026-11-13_mesera',
+        workspaceId: 'ws_1',
+        ownerUid: 'owner_1',
+        authorizedEmails: ['boss@example.com'],
+        date: '2026-11-13',
+        station: 'mesera',
+        status: 'opening_saved',
+        reportedByUid: 'worker_1',
+        reportedByName: 'Ana',
+        notes: '',
+      },
+    ];
+
+    const history = buildWeeklyStationHistory({
+      endDateStr: '2026-11-13',
+      stations: [station],
+      items: [],
+      allReports: reports,
+      entriesByReportId: {},
+      now: new Date('2026-11-14T15:00:00Z'),
+    });
+
+    expect(history.firstReportDate).toBe('2026-11-12');
+    expect(history.dates).toEqual([
+      '2026-11-07',
+      '2026-11-08',
+      '2026-11-09',
+      '2026-11-10',
+      '2026-11-11',
+      '2026-11-12',
+      '2026-11-13',
+    ]);
+    expect(history.rows[0].activeDaysCount).toBe(2);
+    expect(history.rows[0].completedCount).toBe(1);
+
+    // Days 0..4 are before firstReportDate -> neutral, NOT marked late ("Faltó")
+    history.rows[0].days.slice(0, 5).forEach((cell) => {
+      expect(cell.isBeforeFirstReport).toBe(true);
+      expect(cell.isLate).toBe(false);
+    });
+
+    // Day 5 (2026-11-12) completed, Day 6 (2026-11-13) past deadline -> late
+    expect(history.rows[0].days[5].isBeforeFirstReport).toBe(false);
+    expect(history.rows[0].days[5].status).toBe('completed');
+    expect(history.rows[0].days[6].isBeforeFirstReport).toBe(false);
+    expect(history.rows[0].days[6].isLate).toBe(true);
+
+    // Mobile default shows last 4 days, desktop shows all 7
+    expect(getVisibleWeeklyDates(history.dates, true)).toEqual([
+      '2026-11-10',
+      '2026-11-11',
+      '2026-11-12',
+      '2026-11-13',
+    ]);
+    expect(getVisibleWeeklyDates(history.dates, false)).toHaveLength(7);
+  });
+
+  it('identifies packs items needing threshold confirmation and clears after confirm or re-opens after edit', () => {
+    // Pack item where minStock (2) < packSize (30) -> needs review
+    const cheese = makeItem({
+      id: 'asados_1',
+      name: 'Queso loncheado',
+      inputType: 'packs',
+      unit: 'loncha',
+      unitLabel: 'loncha',
+      packLabel: 'kilo',
+      packSize: 30,
+      minStock: 2,
+      targetStock: 60,
+    });
+    // Pack item already properly expressed in loose units (30 >= 30 and 90 >= 30) and not migrated -> ok
+    const bread = makeItem({
+      id: 'comida_1',
+      name: 'Pan perro',
+      inputType: 'packs',
+      unit: 'pan',
+      unitLabel: 'pan',
+      packLabel: 'paquete',
+      packSize: 30,
+      minStock: 30,
+      targetStock: 90,
+    });
+
+    const initialConfirmed: Record<string, string> = {};
+    expect(findPacksItemsNeedingThresholdReview([cheese, bread], initialConfirmed).map((i) => i.id)).toEqual([
+      'asados_1',
+    ]);
+
+    // If bread was migrated, prompt review for bread too until confirmed
+    expect(
+      findPacksItemsNeedingThresholdReview([cheese, bread], initialConfirmed, new Set(['comida_1'])).map(
+        (i) => i.id,
+      ),
+    ).toEqual(['asados_1', 'comida_1']);
+
+    // Confirming signature via localStorage helper clears cheese
+    const storageMap = new Map<string, string>();
+    vi.stubGlobal('window', {
+      localStorage: {
+        getItem: (key: string) => storageMap.get(key) ?? null,
+        setItem: (key: string, value: string) => {
+          storageMap.set(key, value);
+        },
+        removeItem: (key: string) => {
+          storageMap.delete(key);
+        },
+      },
+    });
+    try {
+      const updatedConfirmed = confirmPacksThresholdSignature('ws_confirm_test', cheese);
+      expect(readConfirmedPacksThresholds('ws_confirm_test')).toEqual(updatedConfirmed);
+      expect(findPacksItemsNeedingThresholdReview([cheese], updatedConfirmed)).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

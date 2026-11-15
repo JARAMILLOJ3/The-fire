@@ -1193,6 +1193,7 @@ export interface WeeklyStationDayCell {
   date: string;
   status: 'completed' | 'opening_saved' | 'open';
   isLate: boolean;
+  isBeforeFirstReport: boolean;
   anomalyCount: number;
   lowStockCount: number;
 }
@@ -1201,12 +1202,19 @@ export interface WeeklyStationHistoryRow {
   station: Workstation;
   days: WeeklyStationDayCell[];
   completedCount: number;
+  activeDaysCount: number;
   lateCount: number;
 }
 
 export interface WeeklyStationHistoryResult {
   dates: string[];
+  firstReportDate: string | null;
   rows: WeeklyStationHistoryRow[];
+}
+
+export function getVisibleWeeklyDates(dates: string[], mobileCondensed: boolean): string[] {
+  if (!mobileCondensed) return dates;
+  return dates.slice(-4);
 }
 
 export function buildWeeklyStationHistory(params: {
@@ -1230,8 +1238,12 @@ export function buildWeeklyStationHistory(params: {
 
   const dates = Array.from({ length: 7 }, (_, idx) => shiftDateStr(endDateStr, idx - 6));
   const reportByDateAndStation = new Map<string, DailyReport>();
+  let firstReportDate: string | null = null;
   allReports.forEach((rep) => {
     reportByDateAndStation.set(`${rep.date}|${rep.station}`, rep);
+    if (rep.date && (!firstReportDate || rep.date < firstReportDate)) {
+      firstReportDate = rep.date;
+    }
   });
 
   const activeItemsByStation = new Map<string, InventoryItem[]>();
@@ -1246,15 +1258,19 @@ export function buildWeeklyStationHistory(params: {
   const rows: WeeklyStationHistoryRow[] = stations.map((station) => {
     const stationItems = activeItemsByStation.get(station.id) ?? [];
     let completedCount = 0;
+    let activeDaysCount = 0;
     let lateCount = 0;
 
     const days: WeeklyStationDayCell[] = dates.map((date) => {
       const rep = reportByDateAndStation.get(`${date}|${station.id}`);
+      const isBeforeFirstReport = !rep && (!firstReportDate || date < firstReportDate);
       const status = rep?.status ?? 'open';
       const isLate =
+        !isBeforeFirstReport &&
         status !== 'completed' &&
         hasClosingDeadlinePassed(now, date, schedule, WORKER_GRACE_MINUTES);
 
+      if (!isBeforeFirstReport) activeDaysCount += 1;
       if (status === 'completed') completedCount += 1;
       if (isLate) lateCount += 1;
 
@@ -1285,6 +1301,7 @@ export function buildWeeklyStationHistory(params: {
         date,
         status,
         isLate,
+        isBeforeFirstReport,
         anomalyCount,
         lowStockCount,
       };
@@ -1294,11 +1311,12 @@ export function buildWeeklyStationHistory(params: {
       station,
       days,
       completedCount,
+      activeDaysCount,
       lateCount,
     };
   });
 
-  return { dates, rows };
+  return { dates, firstReportDate, rows };
 }
 
 export type DashboardConsumptionAnomalyKind =
@@ -1459,6 +1477,27 @@ export function formatStationSaveError(
   }
 
   const lower = rawMessage.toLowerCase();
+  if (
+    code === 'phase-mismatch' ||
+    lower.includes('ya empezó el cierre') ||
+    lower.includes('todavía estás en horario') ||
+    lower.includes('el horario de captura ya terminó')
+  ) {
+    return {
+      title: 'Cambio de horario detectado',
+      detail: rawMessage,
+      code: 'phase-mismatch',
+    };
+  }
+
+  if (code === 'no-opening-items' || lower.includes('no hay insumos contados')) {
+    return {
+      title: 'Falta contar al menos un insumo',
+      detail: rawMessage,
+      code: 'no-opening-items',
+    };
+  }
+
   if (!code) {
     if (lower.includes('permission') || lower.includes('insufficient')) {
       code = 'permission-denied';
@@ -1529,4 +1568,79 @@ export function formatStationSaveError(
     code,
   };
 }
+
+export function getPacksThresholdReviewSignature(item: InventoryItem): string {
+  return `${item.minStock}:${item.targetStock}:${item.packSize ?? 0}:${getEffectiveItemUnit(item)}`;
+}
+
+export function needsPacksThresholdReview(
+  item: InventoryItem,
+  confirmedSignatures: Record<string, string>,
+  migratedItemIds?: ReadonlySet<string>,
+): boolean {
+  if (!item.active || getItemInputType(item) !== 'packs') return false;
+  const packSize = item.packSize ?? 0;
+  if (!Number.isFinite(packSize) || packSize < 2) return false;
+
+  const signature = getPacksThresholdReviewSignature(item);
+  if (confirmedSignatures[item.id] === signature) return false;
+
+  if (migratedItemIds?.has(item.id)) return true;
+
+  return (
+    (item.minStock > 0 && item.minStock < packSize) ||
+    (item.targetStock > 0 && item.targetStock < packSize)
+  );
+}
+
+export function findPacksItemsNeedingThresholdReview(
+  items: InventoryItem[],
+  confirmedSignatures: Record<string, string>,
+  migratedItemIds?: ReadonlySet<string>,
+): InventoryItem[] {
+  return items.filter((it) =>
+    needsPacksThresholdReview(it, confirmedSignatures, migratedItemIds),
+  );
+}
+
+function getPacksThresholdStorageKey(workspaceId: string): string {
+  return `thefire_packs_thresh_ok:${workspaceId}`;
+}
+
+export function readConfirmedPacksThresholds(workspaceId: string): Record<string, string> {
+  if (typeof window === 'undefined' || !workspaceId) return {};
+  try {
+    const raw = window.localStorage.getItem(getPacksThresholdStorageKey(workspaceId));
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object') return {};
+    const out: Record<string, string> = {};
+    Object.entries(parsed as Record<string, unknown>).forEach(([k, v]) => {
+      if (typeof v === 'string') out[k] = v;
+    });
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+export function confirmPacksThresholdSignature(
+  workspaceId: string,
+  item: InventoryItem,
+): Record<string, string> {
+  const current = readConfirmedPacksThresholds(workspaceId);
+  const next = {
+    ...current,
+    [item.id]: getPacksThresholdReviewSignature(item),
+  };
+  if (typeof window !== 'undefined' && workspaceId) {
+    try {
+      window.localStorage.setItem(getPacksThresholdStorageKey(workspaceId), JSON.stringify(next));
+    } catch {
+      // Ignore storage quota errors
+    }
+  }
+  return next;
+}
+
 

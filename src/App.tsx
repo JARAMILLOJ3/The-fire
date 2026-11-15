@@ -123,12 +123,16 @@ export default function App() {
     }
   }, [workspace, canManage, role]);
 
-  const { scheduleStatus: workerScheduleStatus, todayStr, yesterdayStr } = useShiftClock(
-    workspace?.shiftSchedule,
-  );
+  const {
+    now: serverClockNow,
+    scheduleStatus: workerScheduleStatus,
+    todayStr,
+    yesterdayStr,
+  } = useShiftClock(workspace?.shiftSchedule);
 
   const [activeSection, setActiveSection] = useState<ActiveSection>('jefe');
   const [catalogFilterStation, setCatalogFilterStation] = useState<string>('all');
+  const [catalogEditItemId, setCatalogEditItemId] = useState<string | null>(null);
   const [selectedDate, setSelectedDate] = useState<string>(() => todayStr);
   const [autoSelectedYesterday, setAutoSelectedYesterday] = useState(false);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -186,6 +190,9 @@ export default function App() {
     workerNotes,
     yesterdayHasReports,
     migratedPacksNotice,
+    migratedPacksIds,
+    packsMigrationState,
+    retryPacksMigration,
     dismissMigratedPacksNotice,
     refreshWorkerFallback,
   } = useStationData({
@@ -688,6 +695,7 @@ export default function App() {
                         workspaceName={workspace.name}
                         ownerName={workspace.ownerName}
                         shiftSchedule={workspace.shiftSchedule}
+                        now={serverClockNow}
                         selectedDate={selectedDate}
                         todayStr={todayStr}
                         yesterdayStr={yesterdayStr}
@@ -705,12 +713,21 @@ export default function App() {
                         onGoToWorkstations={() => navigateTo('puestos')}
                         onGoToCatalog={() => {
                           setCatalogFilterStation('all');
+                          setCatalogEditItemId(null);
+                          navigateTo('catalogo');
+                        }}
+                        onEditItemInCatalog={(itemId) => {
+                          setCatalogFilterStation('all');
+                          setCatalogEditItemId(itemId);
                           navigateTo('catalogo');
                         }}
                         onGoToTeam={() => navigateTo('equipo')}
                         onOpenScheduleModal={() => setScheduleModalOpen(true)}
                         onResetComplete={handleResetComplete}
                         migratedPacksNotice={migratedPacksNotice}
+                        migratedPacksIds={migratedPacksIds}
+                        packsMigrationState={packsMigrationState}
+                        onRetryPacksMigration={retryPacksMigration}
                         onDismissMigratedPacksNotice={dismissMigratedPacksNotice}
                       />
                     ) : activeSection === 'puestos' && canManage ? (
@@ -736,8 +753,13 @@ export default function App() {
                         stations={effectiveStations}
                         items={effectiveItems}
                         initialFilterStation={catalogFilterStation}
+                        initialEditItemId={catalogEditItemId}
+                        onConsumeInitialEditItem={() => setCatalogEditItemId(null)}
                         onGoToWorkstations={() => navigateTo('puestos')}
                         migratedPacksNotice={migratedPacksNotice}
+                        migratedPacksIds={migratedPacksIds}
+                        packsMigrationState={packsMigrationState}
+                        onRetryPacksMigration={retryPacksMigration}
                         onDismissMigratedPacksNotice={dismissMigratedPacksNotice}
                       />
                     ) : activeSection === 'equipo' && canManage ? (
@@ -757,6 +779,9 @@ export default function App() {
                         workspace={workspace}
                         user={user}
                         canManage={canManage}
+                        isPreviewMode={
+                          canManage && Boolean(linkParams.accessCode || linkParams.stationId)
+                        }
                         scheduleStatus={workerScheduleStatus}
                         station={currentStation}
                         selectedDate={effectiveSelectedDate}
@@ -769,6 +794,7 @@ export default function App() {
                         reportsLoaded={reportsLoaded}
                         isCacheHydrated={!canManage && hasCachedWorkerHint()}
                         onSaved={handleStationSaved}
+                        onBackToDashboard={canManage ? () => navigateTo('jefe') : undefined}
                       />
                     ) : (
                       <div className="bg-white border border-stone-200 rounded-2xl p-10 text-center space-y-3">
