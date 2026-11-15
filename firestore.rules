@@ -200,6 +200,13 @@ service cloud.firestore {
         && itemData.targetStock == entry.targetStock;
     }
 
+    function isWorkspaceOwnerDoc(docData) {
+      return isVerifiedUser() && (
+        docData.ownerUid == request.auth.uid
+        || isAdmin()
+      );
+    }
+
     function canManageWorkspace(wsId) {
       return isVerifiedUser() && (
         isAdmin()
@@ -536,8 +543,7 @@ service cloud.firestore {
         ]);
 
       allow delete: if isValidId(stationId)
-        && isVerifiedUser()
-        && canManageWorkspace(existing().workspaceId);
+        && isWorkspaceOwnerDoc(existing());
     }
 
     match /stationLinks/{accessCode} {
@@ -566,8 +572,10 @@ service cloud.firestore {
         && incoming().diff(existing()).affectedKeys().hasOnly(['stationName', 'workerName', 'active']);
 
       allow delete: if isValidId(accessCode)
-        && isVerifiedUser()
-        && canManageWorkspace(existing().workspaceId);
+        && (
+          isWorkspaceOwnerDoc(existing())
+          || (isVerifiedUser() && canManageWorkspace(existing().workspaceId))
+        );
     }
 
     match /items/{itemId} {
@@ -629,8 +637,7 @@ service cloud.firestore {
         ]);
 
       allow delete: if isValidId(itemId)
-        && isVerifiedUser()
-        && canManageWorkspace(existing().workspaceId);
+        && isWorkspaceOwnerDoc(existing());
     }
 
     match /dailyReports/{reportId} {
@@ -716,8 +723,7 @@ service cloud.firestore {
         );
 
       allow delete: if isValidId(reportId)
-        && isVerifiedUser()
-        && canManageWorkspace(existing().workspaceId);
+        && isWorkspaceOwnerDoc(existing());
 
       match /entries/{itemId} {
         allow get: if isValidId(reportId)
@@ -826,9 +832,7 @@ service cloud.firestore {
 
         allow delete: if isValidId(reportId)
           && isValidId(itemId)
-          && isVerifiedUser()
-          && exists(/databases/$(database)/documents/dailyReports/$(reportId))
-          && canManageWorkspace(existing().workspaceId);
+          && isWorkspaceOwnerDoc(existing());
       }
     }
 
@@ -862,8 +866,10 @@ service cloud.firestore {
         && incoming().diff(existing()).affectedKeys().hasOnly(['email', 'displayName', 'station']);
 
       allow delete: if isValidId(inviteId)
-        && isVerifiedUser()
-        && canManageWorkspace(existing().workspaceId);
+        && (
+          isWorkspaceOwnerDoc(existing())
+          || (isVerifiedUser() && canManageWorkspace(existing().workspaceId))
+        );
     }
 
     match /teamMembers/{memberId} {
@@ -943,8 +949,7 @@ service cloud.firestore {
         );
 
       allow delete: if isValidId(memberId)
-        && isVerifiedUser()
-        && canManageWorkspace(existing().workspaceId);
+        && isWorkspaceOwnerDoc(existing());
     }
   }
 }

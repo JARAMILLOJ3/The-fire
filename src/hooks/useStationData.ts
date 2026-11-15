@@ -294,11 +294,12 @@ export function useStationData(params: {
     };
   }, [authReady, user, workspace?.id, canManage, role, stationsLoaded, workerNextSlot]);
 
-  // Auto-migrate existing workspace without stations doc into dynamic Workstations
+  // Auto-migrate legacy workspaces that predate dynamic Workstations (never re-seed reset workspaces)
   useEffect(() => {
     if (
       !canManage ||
       !workspace?.id ||
+      workspace.seeded ||
       !stationsLoaded ||
       !itemsLoaded ||
       stations.length > 0 ||
@@ -457,6 +458,12 @@ export function useStationData(params: {
   // Manager mode: load entries for recent 7-day history + selectedDate 7-day consumption average
   useEffect(() => {
     if (!authReady || !user || !workspace?.id || !canManage || !userEmail || !reportsLoaded) {
+      return;
+    }
+
+    if (allReports.length === 0) {
+      setHistoricalEntriesByReportId({});
+      fetchedHistoryVersionRef.current = {};
       return;
     }
 

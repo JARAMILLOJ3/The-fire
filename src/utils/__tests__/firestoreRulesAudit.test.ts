@@ -66,4 +66,29 @@ describe('firestore.rules structural security audit', () => {
     expect(itemsBlock).toContain('canManageWorkspace(');
     expect(itemsBlock).not.toContain('isActiveStationWorker(');
   });
+
+  it('restricts destructive deletes on stations, items, reports, entries, and teamMembers strictly to the workspace owner', () => {
+    expect(rulesText).toContain('function isWorkspaceOwnerDoc(docData)');
+
+    const extractDeleteClause = (matchPrefix: RegExp): string => {
+      const section = rulesText.match(matchPrefix)?.[0] ?? '';
+      const delMatch = section.match(/allow delete:[^;]+;/);
+      return delMatch ? delMatch[0] : '';
+    };
+
+    const stationsDelete = extractDeleteClause(/match \/stations\/\{stationId\}[\s\S]*?allow delete:[^;]+;/);
+    const itemsDelete = extractDeleteClause(/match \/items\/\{itemId\}[\s\S]*?allow delete:[^;]+;/);
+    const reportsDelete = extractDeleteClause(/match \/dailyReports\/\{reportId\}[\s\S]*?allow delete:[^;]+;/);
+    const entriesDelete = extractDeleteClause(/match \/entries\/\{itemId\}[\s\S]*?allow delete:[^;]+;/);
+    const membersDelete = extractDeleteClause(/match \/teamMembers\/\{memberId\}[\s\S]*?allow delete:[^;]+;/);
+
+    [stationsDelete, itemsDelete, reportsDelete, entriesDelete, membersDelete].forEach((block) => {
+      expect(block).toContain('isWorkspaceOwnerDoc(existing())');
+      expect(block).not.toContain('canManageWorkspace(');
+      expect(block).not.toContain('isActiveStationWorker(');
+    });
+
+    // Entry delete requires 0 extra get/exists reads so owner batch reset works cleanly across reports
+    expect(entriesDelete).not.toMatch(/\b(get|exists)\s*\(/);
+  });
 });

@@ -44,6 +44,14 @@ import type {
   Workstation,
 } from '../types';
 import { sanitizeStockQuantity } from '../utils/inventory';
+import {
+  executeChunkedResetTasks,
+  sortResetTasks,
+  type ResetExecutionProgress,
+  type ResetScope,
+  type ResetTaskItem,
+  type RestaurantBackupPayload,
+} from '../utils/reset';
 import { validateShiftSchedule } from '../utils/schedule';
 
 export interface ResolvedSession {
@@ -586,7 +594,7 @@ export async function ensureWorkstationsForExistingWorkspace(
   existingStations: Workstation[],
   existingItems: InventoryItem[],
 ): Promise<void> {
-  if (existingStations.length > 0) return;
+  if (workspace.seeded || existingStations.length > 0) return;
 
   const batch = writeBatch(db);
   const slotCounters: Record<string, number> = {};
@@ -1957,3 +1965,251 @@ export async function updateTeamMemberAccess(
     handleFirestoreError(error, OperationType.UPDATE, `teamMembers/${memberId}`);
   }
 }
+
+function assertWorkspaceOwner(workspace: Workspace, callerUid: string): void {
+  if (!callerUid || workspace.ownerUid !== callerUid) {
+    throw new Error('Solo el dueño del restaurante puede ejecutar esta acción.');
+  }
+}
+
+function clearWorkspaceDraftStorage(workspaceId: string): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const prefix = `thefire_draft:${workspaceId}:`;
+    const keysToRemove: string[] = [];
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const key = window.localStorage.key(i);
+      if (key && key.startsWith(prefix)) {
+        keysToRemove.push(key);
+      }
+    }
+    keysToRemove.forEach((key) => window.localStorage.removeItem(key));
+  } catch {
+    // Ignore restricted storage environments
+  }
+}
+
+function resolveDocRefFromPath(path: string) {
+  const parts = path.split('/').filter(Boolean);
+  if (parts.length === 2) {
+    return doc(db, parts[0], parts[1]);
+  }
+  if (parts.length === 4) {
+    return doc(db, parts[0], parts[1], parts[2], parts[3]);
+  }
+  throw new Error(`Ruta inválida para reinicio: ${path}`);
+}
+
+async function fetchEntriesForReports(
+  reports: DailyReport[],
+  ownerUid: string,
+): Promise<Record<string, Record<string, DailyReportEntry>>> {
+  const entriesByReportId: Record<string, Record<string, DailyReportEntry>> = {};
+  const CONCURRENCY = 8;
+
+  for (let i = 0; i < reports.length; i += CONCURRENCY) {
+    const slice = reports.slice(i, i + CONCURRENCY);
+    await Promise.all(
+      slice.map(async (rep) => {
+        const snap = await getDocs(
+          query(
+            collection(db, 'dailyReports', rep.id, 'entries'),
+            where('ownerUid', '==', ownerUid),
+          ),
+        );
+        const map: Record<string, DailyReportEntry> = {};
+        snap.forEach((d) => {
+          const entry = { id: d.id, ...d.data() } as DailyReportEntry;
+          map[d.id] = entry;
+        });
+        entriesByReportId[rep.id] = map;
+      }),
+    );
+  }
+
+  return entriesByReportId;
+}
+
+export async function fetchWorkspaceBackupData(
+  workspace: Workspace,
+  callerUid: string,
+): Promise<RestaurantBackupPayload> {
+  assertWorkspaceOwner(workspace, callerUid);
+
+  const [stationsSnap, itemsSnap, reportsSnap] = await Promise.all([
+    getDocs(query(collection(db, 'stations'), where('ownerUid', '==', workspace.ownerUid))),
+    getDocs(query(collection(db, 'items'), where('ownerUid', '==', workspace.ownerUid))),
+    getDocs(query(collection(db, 'dailyReports'), where('ownerUid', '==', workspace.ownerUid))),
+  ]);
+
+  const stations: Workstation[] = [];
+  stationsSnap.forEach((d) => {
+    const st = { id: d.id, ...d.data() } as Workstation;
+    if (st.workspaceId === workspace.id) stations.push(st);
+  });
+
+  const items: InventoryItem[] = [];
+  itemsSnap.forEach((d) => {
+    const it = { id: d.id, ...d.data() } as InventoryItem;
+    if (it.workspaceId === workspace.id) items.push(it);
+  });
+
+  const reports: DailyReport[] = [];
+  reportsSnap.forEach((d) => {
+    const rep = { id: d.id, ...d.data() } as DailyReport;
+    if (rep.workspaceId === workspace.id) reports.push(rep);
+  });
+
+  const entriesByReportId = await fetchEntriesForReports(reports, workspace.ownerUid);
+
+  return {
+    workspaceName: workspace.name,
+    stations,
+    items,
+    reports,
+    entriesByReportId,
+  };
+}
+
+export async function collectWorkspaceResetTasks(
+  workspace: Workspace,
+  scope: ResetScope,
+  callerUid: string,
+): Promise<ResetTaskItem[]> {
+  assertWorkspaceOwner(workspace, callerUid);
+
+  const reportsSnap = await getDocs(
+    query(collection(db, 'dailyReports'), where('ownerUid', '==', workspace.ownerUid)),
+  );
+
+  const reports: DailyReport[] = [];
+  reportsSnap.forEach((d) => {
+    const rep = { id: d.id, ...d.data() } as DailyReport;
+    if (rep.workspaceId === workspace.id) reports.push(rep);
+  });
+
+  const tasks: ResetTaskItem[] = [];
+  const entriesByReportId = await fetchEntriesForReports(reports, workspace.ownerUid);
+
+  reports.forEach((rep) => {
+    const entries = entriesByReportId[rep.id] ?? {};
+    Object.keys(entries).forEach((entryId) => {
+      tasks.push({
+        category: 'entries',
+        path: `dailyReports/${rep.id}/entries/${entryId}`,
+        label: entries[entryId]?.itemName || entryId,
+      });
+    });
+    tasks.push({
+      category: 'reports',
+      path: `dailyReports/${rep.id}`,
+      label: `${rep.date} (${rep.station})`,
+    });
+  });
+
+  if (scope === 'all') {
+    const [itemsSnap, linksSnap, stationsSnap, invitesSnap, membersSnap] = await Promise.all([
+      getDocs(query(collection(db, 'items'), where('ownerUid', '==', workspace.ownerUid))),
+      getDocs(query(collection(db, 'stationLinks'), where('ownerUid', '==', workspace.ownerUid))),
+      getDocs(query(collection(db, 'stations'), where('ownerUid', '==', workspace.ownerUid))),
+      getDocs(query(collection(db, 'invites'), where('ownerUid', '==', workspace.ownerUid))),
+      getDocs(query(collection(db, 'teamMembers'), where('ownerUid', '==', workspace.ownerUid))),
+    ]);
+
+    itemsSnap.forEach((d) => {
+      const it = d.data() as Partial<InventoryItem>;
+      if (it.workspaceId === workspace.id) {
+        tasks.push({
+          category: 'items',
+          path: `items/${d.id}`,
+          label: it.name || d.id,
+        });
+      }
+    });
+
+    linksSnap.forEach((d) => {
+      const link = d.data() as Partial<StationLink>;
+      if (link.workspaceId === workspace.id) {
+        tasks.push({
+          category: 'stationLinks',
+          path: `stationLinks/${d.id}`,
+          label: link.stationName || d.id,
+        });
+      }
+    });
+
+    stationsSnap.forEach((d) => {
+      const st = d.data() as Partial<Workstation>;
+      if (st.workspaceId === workspace.id) {
+        tasks.push({
+          category: 'stations',
+          path: `stations/${d.id}`,
+          label: st.name || d.id,
+        });
+      }
+    });
+
+    invitesSnap.forEach((d) => {
+      const inv = d.data() as Partial<Invite>;
+      if (inv.workspaceId === workspace.id) {
+        tasks.push({
+          category: 'invites',
+          path: `invites/${d.id}`,
+          label: inv.email || d.id,
+        });
+      }
+    });
+
+    membersSnap.forEach((d) => {
+      const mem = d.data() as Partial<TeamMember>;
+      if (
+        mem.workspaceId === workspace.id &&
+        d.id !== workspace.ownerUid &&
+        d.id !== callerUid
+      ) {
+        tasks.push({
+          category: 'teamMembers',
+          path: `teamMembers/${d.id}`,
+          label: mem.displayName || mem.email || d.id,
+        });
+      }
+    });
+  }
+
+  return sortResetTasks(tasks);
+}
+
+export async function runWorkspaceResetTasks(params: {
+  workspace: Workspace;
+  callerUid: string;
+  scope: ResetScope;
+  tasks: ResetTaskItem[];
+  onProgress?: (progress: ResetExecutionProgress) => void;
+}): Promise<{ deletedCount: number; totalCount: number }> {
+  assertWorkspaceOwner(params.workspace, params.callerUid);
+
+  const result = await executeChunkedResetTasks({
+    tasks: params.tasks,
+    onProgress: params.onProgress,
+    commitChunk: async (chunk) => {
+      const batch = writeBatch(db);
+      chunk.forEach((task) => {
+        batch.delete(resolveDocRefFromPath(task.path));
+      });
+      await batch.commit();
+    },
+  });
+
+  clearWorkspaceDraftStorage(params.workspace.id);
+
+  if (params.scope === 'all') {
+    await updateDoc(doc(db, 'workspaces', params.workspace.id), {
+      authorizedEmails: [params.workspace.ownerEmail].filter(Boolean),
+      seeded: true,
+      updatedAt: serverTimestamp(),
+    });
+  }
+
+  return result;
+}
+

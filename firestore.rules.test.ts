@@ -8,6 +8,7 @@ import {
 } from '@firebase/rules-unit-testing';
 import {
   collection,
+  deleteDoc,
   doc,
   getDoc,
   getDocs,
@@ -858,5 +859,66 @@ describe('Firestore Security Rules (Emulator Suite)', () => {
         updatedAt: serverTimestamp(),
       }),
     );
+  });
+
+  it('allows only workspace owner to delete reports, entries, stations, items, and teamMembers (blocks co-managers and workers)', async () => {
+    const opDate = getBogotaDateForNow();
+    const reportId = `${WS_ID}_${opDate}_mesera`;
+    const coAdminUid = 'coadmin_uid';
+    const coAdminEmail = 'coadmin@thefire.co';
+
+    await testEnv.withSecurityRulesDisabled(async (ctx) => {
+      const db = ctx.firestore();
+      const nowTs = Timestamp.now();
+
+      await updateDoc(doc(db, 'workspaces', WS_ID), {
+        authorizedEmails: [OWNER_EMAIL, coAdminEmail],
+      });
+
+      await setDoc(doc(db, 'teamMembers', coAdminUid), {
+        workspaceId: WS_ID,
+        ownerUid: OWNER_UID,
+        uid: coAdminUid,
+        email: coAdminEmail,
+        displayName: 'Co-Admin',
+        station: 'jefe',
+        inviteId: 'inv_coadmin',
+        active: true,
+        createdAt: nowTs,
+        updatedAt: nowTs,
+      });
+    });
+
+    const coAdminDb = testEnv
+      .authenticatedContext(coAdminUid, { email: coAdminEmail, email_verified: true })
+      .firestore();
+    const workerDb = testEnv
+      .authenticatedContext(WORKER_UID, { email: WORKER_EMAIL, email_verified: true })
+      .firestore();
+    const bossDb = testEnv
+      .authenticatedContext(OWNER_UID, { email: OWNER_EMAIL, email_verified: true })
+      .firestore();
+
+    // Workers cannot delete anything
+    await assertFails(deleteDoc(doc(workerDb, 'dailyReports', reportId, 'entries', 'mesera_1')));
+    await assertFails(deleteDoc(doc(workerDb, 'dailyReports', reportId)));
+    await assertFails(deleteDoc(doc(workerDb, 'items', 'mesera_1')));
+    await assertFails(deleteDoc(doc(workerDb, 'stations', 'mesera')));
+
+    // Non-owner co-manager cannot delete reports, entries, items, stations, or teamMembers
+    await assertFails(deleteDoc(doc(coAdminDb, 'dailyReports', reportId, 'entries', 'mesera_1')));
+    await assertFails(deleteDoc(doc(coAdminDb, 'dailyReports', reportId)));
+    await assertFails(deleteDoc(doc(coAdminDb, 'items', 'mesera_1')));
+    await assertFails(deleteDoc(doc(coAdminDb, 'stations', 'mesera')));
+    await assertFails(deleteDoc(doc(coAdminDb, 'teamMembers', WORKER_UID)));
+
+    // Owner CAN batch-delete entries first, then report, items, stations, and teamMembers
+    const batch = writeBatch(bossDb);
+    batch.delete(doc(bossDb, 'dailyReports', reportId, 'entries', 'mesera_1'));
+    batch.delete(doc(bossDb, 'dailyReports', reportId));
+    batch.delete(doc(bossDb, 'items', 'mesera_1'));
+    batch.delete(doc(bossDb, 'stations', 'mesera'));
+    batch.delete(doc(bossDb, 'teamMembers', WORKER_UID));
+    await assertSucceeds(batch.commit());
   });
 });

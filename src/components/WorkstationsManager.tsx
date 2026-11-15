@@ -38,6 +38,7 @@ import { hasTargetBelowMin, normalizeCatalogItemName } from '../utils/inventory'
 
 interface WorkstationsManagerProps {
   workspace: Workspace;
+  isOwner?: boolean;
   stations: Workstation[];
   items: InventoryItem[];
   stationLinksByCode?: Record<string, StationLink>;
@@ -54,6 +55,7 @@ interface DraftNewItem {
 
 export function WorkstationsManager({
   workspace,
+  isOwner = false,
   stations,
   items,
   stationLinksByCode = {},
@@ -285,7 +287,30 @@ export function WorkstationsManager({
         </button>
       </div>
 
-      {/* Stations Grid */}
+      {/* Stations Grid or Empty State */}
+      {stations.length === 0 ? (
+        <div className="bg-white border border-stone-200 rounded-2xl p-8 sm:p-10 text-center space-y-4">
+          <div className="w-12 h-12 rounded-2xl bg-orange-50 border border-orange-200 flex items-center justify-center mx-auto">
+            <QrCode className="w-6 h-6 text-orange-600" />
+          </div>
+          <div className="space-y-1.5 max-w-md mx-auto">
+            <h2 className="font-display text-lg font-bold text-stone-900">
+              Aún no hay puestos de trabajo
+            </h2>
+            <p className="text-sm text-stone-600">
+              Crea tu primer puesto de trabajo (ej. Mesera, Asados o Cocina) para agregarle sus primeros insumos y generar su código QR.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={openCreateModal}
+            className="min-h-[44px] inline-flex items-center gap-2 px-5 py-2.5 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 transition-colors cursor-pointer"
+          >
+            <Plus className="w-4 h-4" />
+            Crear primer puesto de trabajo
+          </button>
+        </div>
+      ) : (
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-5">
         {stations.map((st, idx) => {
           const stationItems = items.filter((i) => i.active && i.station === st.id);
@@ -334,14 +359,16 @@ export function WorkstationsManager({
                     >
                       <Pencil className="w-4 h-4" />
                     </button>
-                    <button
-                      type="button"
-                      onClick={() => setConfirmDelete(st)}
-                      aria-label={`Eliminar ${st.name}`}
-                      className="p-2 text-stone-500 hover:text-red-700 hover:bg-red-50 rounded-lg cursor-pointer"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
+                    {isOwner && (
+                      <button
+                        type="button"
+                        onClick={() => setConfirmDelete(st)}
+                        aria-label={`Eliminar ${st.name}`}
+                        className="p-2 text-stone-500 hover:text-red-700 hover:bg-red-50 rounded-lg cursor-pointer"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    )}
                   </div>
                 </div>
 
@@ -442,6 +469,7 @@ export function WorkstationsManager({
           );
         })}
       </div>
+      )}
 
       {/* Create / Edit Workstation Modal */}
       <AnimatePresence>

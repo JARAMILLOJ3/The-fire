@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
-import { AlertTriangle, Archive, ArchiveRestore, Pencil, Plus, Sparkles, X } from 'lucide-react';
+import { AlertTriangle, Archive, ArchiveRestore, Pencil, Plus, X } from 'lucide-react';
 import {
   MAX_NAME_LENGTH,
   MAX_PACK_LABEL_LENGTH,
@@ -12,7 +12,6 @@ import {
 } from '../constants';
 import {
   createInventoryItem,
-  seedDefaultWorkstationsAndCatalog,
   setInventoryItemActive,
   updateInventoryItem,
 } from '../services/inventoryService';
@@ -37,6 +36,7 @@ interface CatalogManagerProps {
   stations: Workstation[];
   items: InventoryItem[];
   initialFilterStation?: string;
+  onGoToWorkstations?: () => void;
 }
 
 export function CatalogManager({
@@ -44,6 +44,7 @@ export function CatalogManager({
   stations,
   items,
   initialFilterStation = 'all',
+  onGoToWorkstations,
 }: CatalogManagerProps) {
   const [stationFilter, setStationFilter] = useState<'all' | StationId>(initialFilterStation);
   const [statusFilter, setStatusFilter] = useState<'active' | 'archived'>('active');
@@ -51,7 +52,6 @@ export function CatalogManager({
   const [editingItem, setEditingItem] = useState<InventoryItem | null>(null);
   const [confirmArchive, setConfirmArchive] = useState<InventoryItem | null>(null);
   const [submitting, setSubmitting] = useState(false);
-  const [seeding, setSeeding] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
 
@@ -267,15 +267,6 @@ export function CatalogManager({
     }
   };
 
-  const handleSeedDefaults = async () => {
-    setSeeding(true);
-    try {
-      await seedDefaultWorkstationsAndCatalog(workspace);
-    } finally {
-      setSeeding(false);
-    }
-  };
-
   const misconfiguredActiveCount = activeItems.filter((it) =>
     hasTargetBelowMin(it.minStock, it.targetStock),
   ).length;
@@ -296,17 +287,6 @@ export function CatalogManager({
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          {items.length === 0 && stations.length === 0 && (
-            <button
-              type="button"
-              onClick={handleSeedDefaults}
-              disabled={seeding}
-              className="min-h-[42px] inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-orange-700 bg-orange-50 border border-orange-200 rounded-xl hover:bg-orange-100 disabled:opacity-60 whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              <Sparkles className="w-4 h-4" />
-              {seeding ? 'Cargando...' : 'Cargar catálogo base The Fire'}
-            </button>
-          )}
           <button
             type="button"
             onClick={openCreateForm}
@@ -410,21 +390,31 @@ export function CatalogManager({
       {/* Responsive Table / Mobile Cards */}
       <div className="bg-white border border-stone-200 rounded-2xl overflow-hidden">
         {filteredItems.length === 0 ? (
-          <div className="p-10 text-center space-y-2">
+          <div className="p-10 text-center space-y-3">
             <p className="text-sm font-medium text-stone-700">
-              {statusFilter === 'archived'
-                ? 'No hay insumos archivados en este filtro.'
-                : 'No hay insumos activos en esta vista.'}
+              {stations.length === 0
+                ? 'Primero crea tu primer puesto de trabajo para poder agregar insumos.'
+                : statusFilter === 'archived'
+                  ? 'No hay insumos archivados en este filtro.'
+                  : 'No hay insumos activos en esta vista.'}
             </p>
-            {statusFilter === 'active' && stations.length > 0 && (
+            {stations.length === 0 && onGoToWorkstations ? (
+              <button
+                type="button"
+                onClick={onGoToWorkstations}
+                className="min-h-[40px] px-4 py-2 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 cursor-pointer"
+              >
+                Crear primer puesto de trabajo
+              </button>
+            ) : statusFilter === 'active' && stations.length > 0 ? (
               <button
                 type="button"
                 onClick={openCreateForm}
                 className="text-sm font-semibold text-orange-600 hover:text-orange-700 cursor-pointer"
               >
-                + Agregar insumo
+                + Agregar primer insumo
               </button>
-            )}
+            ) : null}
           </div>
         ) : (
           <>

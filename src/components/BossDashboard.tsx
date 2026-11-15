@@ -19,7 +19,9 @@ import {
   QrCode,
   Search,
   Settings,
+  ShieldAlert,
   ShoppingBag,
+  Trash2,
   TrendingUp,
   Users,
 } from 'lucide-react';
@@ -31,6 +33,7 @@ import type {
   InventoryItem,
   ShiftSchedule,
   StationId,
+  Workspace,
   Workstation,
 } from '../types';
 import {
@@ -46,13 +49,18 @@ import {
   hasTargetBelowMin,
 } from '../utils/inventory';
 import { BOGOTA_TIME_ZONE, getBogotaNowParts } from '../utils/date';
+import type { ResetScope } from '../utils/reset';
 import {
   formatTime12h,
   hasClosingDeadlinePassed,
   normalizeShiftSchedule,
 } from '../utils/schedule';
+import { RestaurantResetModal } from './RestaurantResetModal';
 
 interface BossDashboardProps {
+  workspace: Workspace;
+  callerUid: string;
+  isOwner: boolean;
   workspaceName: string;
   ownerName?: string;
   shiftSchedule?: ShiftSchedule;
@@ -73,6 +81,7 @@ interface BossDashboardProps {
   onGoToCatalog: () => void;
   onGoToTeam: () => void;
   onOpenScheduleModal: () => void;
+  onResetComplete: (scope: ResetScope) => void;
 }
 
 type ViewTab = 'compras' | 'completo';
@@ -127,6 +136,9 @@ function formatShortDayHeader(dateStr: string): { weekday: string; dayNum: strin
 }
 
 export function BossDashboard({
+  workspace,
+  callerUid,
+  isOwner,
   workspaceName,
   ownerName,
   shiftSchedule,
@@ -147,6 +159,7 @@ export function BossDashboard({
   onGoToCatalog,
   onGoToTeam,
   onOpenScheduleModal,
+  onResetComplete,
 }: BossDashboardProps) {
   const [viewTab, setViewTab] = useState<ViewTab>('compras');
   const [stationFilter, setStationFilter] = useState<'all' | StationId>('all');
@@ -154,6 +167,9 @@ export function BossDashboard({
   const [searchTerm, setSearchTerm] = useState('');
   const [copiedToast, setCopiedToast] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
+  const [resetModalOpen, setResetModalOpen] = useState(false);
+
+  const isRestaurantEmpty = stations.length === 0 && items.length === 0;
 
   const normalizedSchedule = useMemo(
     () => normalizeShiftSchedule(shiftSchedule),
@@ -585,14 +601,53 @@ export function BossDashboard({
         </motion.div>
       ) : null}
 
-      {/* Semáforo KPI Summary Strip using gap-px */}
-      <motion.section
-        initial={{ opacity: 0, y: 8 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
-        aria-label="Resumen semáforo del día"
-        className="grid grid-cols-2 lg:grid-cols-4 gap-px bg-stone-200 border border-stone-200 rounded-2xl overflow-hidden"
-      >
+      {isRestaurantEmpty ? (
+        <motion.section
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }}
+          className="bg-white border border-stone-200 rounded-2xl p-6 sm:p-8 text-center space-y-5"
+        >
+          <div className="w-12 h-12 rounded-2xl bg-orange-50 border border-orange-200 flex items-center justify-center mx-auto">
+            <QrCode className="w-6 h-6 text-orange-600" />
+          </div>
+          <div className="space-y-2 max-w-lg mx-auto">
+            <h2 className="font-display text-xl sm:text-2xl font-bold text-stone-900">
+              Restaurante sin datos · Listo para empezar
+            </h2>
+            <p className="text-sm text-stone-600 leading-relaxed">
+              No hay puestos de trabajo, insumos, reportes ni alertas activas. Crea primero tu primer puesto de trabajo y luego agrega su primer insumo.
+            </p>
+          </div>
+          <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-1">
+            <button
+              type="button"
+              onClick={onGoToWorkstations}
+              className="w-full sm:w-auto min-h-[44px] inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 transition-colors cursor-pointer"
+            >
+              <QrCode className="w-4 h-4" />
+              1. Crear primer puesto
+            </button>
+            <button
+              type="button"
+              onClick={onGoToCatalog}
+              className="w-full sm:w-auto min-h-[44px] inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-semibold text-stone-800 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 transition-colors cursor-pointer"
+            >
+              <Package className="w-4 h-4 text-orange-600" />
+              2. Crear primer insumo
+            </button>
+          </div>
+        </motion.section>
+      ) : (
+        <>
+          {/* Semáforo KPI Summary Strip using gap-px */}
+          <motion.section
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
+            aria-label="Resumen semáforo del día"
+            className="grid grid-cols-2 lg:grid-cols-4 gap-px bg-stone-200 border border-stone-200 rounded-2xl overflow-hidden"
+          >
         <div className="bg-white p-4 sm:p-5">
           <div className="flex items-center justify-between gap-2">
             <p className="text-xs font-semibold text-stone-600">
@@ -1481,6 +1536,8 @@ export function BossDashboard({
           </div>
         </section>
       )}
+        </>
+      )}
 
       {/* Collapsible Bottom Configuration Section */}
       <section className="bg-white border border-stone-200 rounded-2xl overflow-hidden no-print">
@@ -1560,10 +1617,50 @@ export function BossDashboard({
                   </div>
                 </button>
               </div>
+
+              {isOwner && (
+                <div className="border-t border-red-200 bg-red-50/60 p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-3.5">
+                  <div className="flex items-start gap-3 min-w-0">
+                    <div className="p-2 rounded-xl bg-white border border-red-200 text-red-700 shrink-0">
+                      <ShieldAlert className="w-4 h-4" />
+                    </div>
+                    <div className="min-w-0">
+                      <p className="text-xs font-bold uppercase tracking-wider text-red-700">
+                        Zona de peligro
+                      </p>
+                      <p className="text-sm font-bold text-stone-900 mt-0.5">
+                        Reiniciar datos del restaurante
+                      </p>
+                      <p className="text-xs text-stone-600 mt-0.5 leading-relaxed">
+                        Descarga un respaldo CSV y elimina el historial de reportes o todos los datos para empezar desde cero. Solo disponible para el dueño.
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setResetModalOpen(true)}
+                    className="min-h-[42px] inline-flex items-center justify-center gap-2 px-4 py-2 text-xs sm:text-sm font-semibold text-white bg-red-600 rounded-xl hover:bg-red-700 active:scale-[0.98] transition-all whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                    Reiniciar datos del restaurante
+                  </button>
+                </div>
+              )}
             </motion.div>
           )}
         </AnimatePresence>
       </section>
+
+      {isOwner && (
+        <RestaurantResetModal
+          open={resetModalOpen}
+          workspace={workspace}
+          callerUid={callerUid}
+          todayStr={todayStr}
+          onClose={() => setResetModalOpen(false)}
+          onResetComplete={onResetComplete}
+        />
+      )}
     </div>
   );
 }

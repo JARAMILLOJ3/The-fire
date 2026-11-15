@@ -88,6 +88,7 @@ export default function App() {
     authError,
     workspace,
     role,
+    isOwner,
     canManage,
     sessionLoading,
     sessionError,
@@ -231,6 +232,13 @@ export default function App() {
     setActiveSection(section);
     setMobileNavOpen(false);
   }, []);
+
+  const handleResetComplete = useCallback(() => {
+    manualDatePickedRef.current = false;
+    autoDateCheckedRef.current = null;
+    setAutoSelectedYesterday(false);
+    setSelectedDate(todayStr);
+  }, [todayStr]);
 
   if (!authReady) {
     return (
@@ -610,6 +618,9 @@ export default function App() {
                   >
                     {activeSection === 'jefe' && canManage ? (
                       <BossDashboard
+                        workspace={workspace}
+                        callerUid={user.uid}
+                        isOwner={isOwner}
                         workspaceName={workspace.name}
                         ownerName={workspace.ownerName}
                         shiftSchedule={workspace.shiftSchedule}
@@ -633,10 +644,12 @@ export default function App() {
                         }}
                         onGoToTeam={() => navigateTo('equipo')}
                         onOpenScheduleModal={() => setScheduleModalOpen(true)}
+                        onResetComplete={handleResetComplete}
                       />
                     ) : activeSection === 'puestos' && canManage ? (
                       <WorkstationsManager
                         workspace={workspace}
+                        isOwner={isOwner}
                         stations={effectiveStations}
                         items={effectiveItems}
                         stationLinksByCode={stationLinksByCode}
@@ -652,6 +665,7 @@ export default function App() {
                         stations={effectiveStations}
                         items={effectiveItems}
                         initialFilterStation={catalogFilterStation}
+                        onGoToWorkstations={() => navigateTo('puestos')}
                       />
                     ) : activeSection === 'equipo' && canManage ? (
                       <TeamManager
