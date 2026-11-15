@@ -695,7 +695,14 @@ export async function createWorkstation(
     workerName: string;
     description: string;
     sortOrder: number;
-    initialItems?: Array<{ name: string; unit: string; minStock: number; targetStock: number }>;
+    initialItems?: Array<
+      {
+        name: string;
+        unit: string;
+        minStock: number;
+        targetStock: number;
+      } & InventoryItemCapturePayload
+    >;
   },
 ): Promise<Workstation> {
   const stationId = makeCleanId('puesto');
@@ -714,6 +721,7 @@ export async function createWorkstation(
       unit: clampString(item.unit, MAX_UNIT_LENGTH),
       minStock: clampNumber(item.minStock),
       targetStock: clampNumber(item.targetStock),
+      ...buildItemCapturePayload(item, false),
       active: true,
       sortOrder: (idx + 1) * 10,
       createdAt: serverTimestamp(),
@@ -759,25 +767,83 @@ export async function createWorkstation(
 }
 
 export async function updateWorkstation(
+  workspace: Workspace,
   station: Workstation,
   payload: {
     name: string;
     area: string;
     workerName: string;
     description: string;
+    items?: Array<
+      {
+        id?: string;
+        name: string;
+        unit: string;
+        minStock: number;
+        targetStock: number;
+      } & InventoryItemCapturePayload
+    >;
+    archivedItemIds?: string[];
   },
 ): Promise<void> {
   const cleanName = clampString(payload.name, MAX_NAME_LENGTH);
   const cleanWorker = clampString(payload.workerName, MAX_NAME_LENGTH);
   const batch = writeBatch(db);
 
-  batch.update(doc(db, 'stations', station.id), {
+  let nextSlot = Math.max(1, station.nextItemSlot || 1);
+
+  (payload.archivedItemIds ?? []).forEach((archivedId) => {
+    batch.update(doc(db, 'items', archivedId), {
+      active: false,
+      updatedAt: serverTimestamp(),
+    });
+  });
+
+  (payload.items ?? []).forEach((item) => {
+    if (item.id) {
+      batch.update(doc(db, 'items', item.id), {
+        name: clampString(item.name, MAX_NAME_LENGTH),
+        unit: clampString(item.unit, MAX_UNIT_LENGTH),
+        minStock: clampNumber(item.minStock),
+        targetStock: clampNumber(item.targetStock),
+        ...buildItemCapturePayload(item, true),
+        active: true,
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      const slot = nextSlot;
+      nextSlot += 1;
+      const itemId = `${station.id}_${slot}`;
+      batch.set(doc(db, 'items', itemId), {
+        workspaceId: workspace.id,
+        ownerUid: workspace.ownerUid,
+        authorizedEmails: workspace.authorizedEmails.slice(0, 15),
+        station: station.id,
+        name: clampString(item.name, MAX_NAME_LENGTH),
+        unit: clampString(item.unit, MAX_UNIT_LENGTH),
+        minStock: clampNumber(item.minStock),
+        targetStock: clampNumber(item.targetStock),
+        ...buildItemCapturePayload(item, false),
+        active: true,
+        sortOrder: slot * 10,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    }
+  });
+
+  const stationUpdate: Record<string, unknown> = {
     name: cleanName,
     area: clampString(payload.area, MAX_AREA_LENGTH),
     workerName: cleanWorker,
     description: clampString(payload.description, MAX_DESC_LENGTH),
     updatedAt: serverTimestamp(),
-  });
+  };
+  if (nextSlot !== station.nextItemSlot) {
+    stationUpdate.nextItemSlot = nextSlot;
+  }
+
+  batch.update(doc(db, 'stations', station.id), stationUpdate);
 
   if (station.accessCode) {
     batch.update(doc(db, 'stationLinks', station.accessCode), {

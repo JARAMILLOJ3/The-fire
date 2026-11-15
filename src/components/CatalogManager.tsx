@@ -3,11 +3,7 @@ import { AnimatePresence, motion } from 'motion/react';
 import { AlertTriangle, Archive, ArchiveRestore, Pencil, Plus, X } from 'lucide-react';
 import {
   MAX_NAME_LENGTH,
-  MAX_PACK_LABEL_LENGTH,
-  MAX_PACK_SIZE,
   MAX_UNIT_LENGTH,
-  PACK_LABEL_OPTIONS,
-  UNIT_LABEL_OPTIONS,
   UNIT_OPTIONS,
 } from '../constants';
 import {
@@ -23,13 +19,14 @@ import type {
   Workstation,
 } from '../types';
 import {
-  formatLevelApproximate,
+  buildItemCaptureFields,
   getItemInputType,
-  getPacksFieldLabels,
   hasTargetBelowMin,
+  parseCaptureDecimalInput,
   pluralizeSpanishLabel,
   validateCatalogItemInput,
 } from '../utils/inventory';
+import { ItemCaptureFields } from './ItemCaptureFields';
 
 interface CatalogManagerProps {
   workspace: Workspace;
@@ -83,17 +80,15 @@ export function CatalogManager({
     stationFilter === 'all' ? true : it.station === stationFilter,
   );
 
-  const parsedPackSize = useMemo(() => {
-    const normalized = packSizeInput.trim().replace(',', '.');
-    if (!normalized) return Number.NaN;
-    return Number(normalized);
-  }, [packSizeInput]);
+  const parsedPackSize = useMemo(
+    () => parseCaptureDecimalInput(packSizeInput),
+    [packSizeInput],
+  );
 
-  const parsedCapacity = useMemo(() => {
-    const normalized = capacityInput.trim().replace(',', '.');
-    if (!normalized) return Number.NaN;
-    return Number(normalized);
-  }, [capacityInput]);
+  const parsedCapacity = useMemo(
+    () => parseCaptureDecimalInput(capacityInput),
+    [capacityInput],
+  );
 
   const formValidation = useMemo(
     () =>
@@ -173,22 +168,13 @@ export function CatalogManager({
     try {
       const cleanName = name.trim();
       const cleanUnit = unit.trim();
-      const capturePayload =
-        inputType === 'packs'
-          ? {
-              inputType: 'packs' as const,
-              packSize: parsedPackSize,
-              packLabel: packLabel.trim(),
-              unitLabel: unitLabel.trim(),
-            }
-          : inputType === 'level'
-            ? {
-                inputType: 'level' as const,
-                capacity: parsedCapacity,
-              }
-            : {
-                inputType: 'count' as const,
-              };
+      const capturePayload = buildItemCaptureFields({
+        inputType,
+        packSizeInput,
+        packLabel,
+        unitLabel,
+        capacityInput,
+      });
 
       if (editingItem) {
         await updateInventoryItem(editingItem.id, {
@@ -690,182 +676,22 @@ export function CatalogManager({
                 </div>
 
                 {/* Capture type selector */}
-                <div className="space-y-2 pt-1">
-                  <label className="block text-xs font-semibold text-stone-700">
-                    Cómo lo cuenta la trabajadora
-                  </label>
-                  <div className="grid grid-cols-3 gap-1.5 p-1 bg-stone-100 rounded-xl">
-                    {(
-                      [
-                        { id: 'count', title: 'Conteo', sub: '− / +' },
-                        { id: 'packs', title: 'Paquetes', sub: '+ sueltos' },
-                        { id: 'level', title: 'Nivel', sub: '0 a lleno' },
-                      ] as const
-                    ).map((opt) => (
-                      <button
-                        key={opt.id}
-                        type="button"
-                        onClick={() => {
-                          setInputType(opt.id);
-                          if (errorMsg) setErrorMsg(null);
-                        }}
-                        className={`px-2 py-2 rounded-lg text-center transition-all cursor-pointer ${
-                          inputType === opt.id
-                            ? 'bg-white text-stone-900 shadow-xs font-bold'
-                            : 'text-stone-600 hover:text-stone-900 font-medium'
-                        }`}
-                      >
-                        <div className="text-xs leading-tight">{opt.title}</div>
-                        <div className="text-[10px] text-stone-500 leading-tight mt-0.5">{opt.sub}</div>
-                      </button>
-                    ))}
-                  </div>
-
-                  {inputType === 'packs' && (
-                    <div className="p-3.5 rounded-xl bg-stone-50 border border-stone-200 space-y-3">
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                        <div>
-                          <label className="block text-xs font-semibold text-stone-700 mb-1">
-                            Nombre del paquete <span className="text-red-600">*</span>
-                          </label>
-                          <input
-                            type="text"
-                            list="pack-label-suggestions"
-                            required
-                            maxLength={MAX_PACK_LABEL_LENGTH}
-                            value={packLabel}
-                            onChange={(e) => {
-                              setPackLabel(e.target.value);
-                              if (errorMsg) setErrorMsg(null);
-                            }}
-                            placeholder="Ej: paquete, kilo, caja"
-                            className="w-full min-h-[40px] px-3 py-1.5 text-sm bg-white border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
-                          />
-                          <datalist id="pack-label-suggestions">
-                            {PACK_LABEL_OPTIONS.map((opt) => (
-                              <option key={opt} value={opt} />
-                            ))}
-                          </datalist>
-                        </div>
-
-                        <div>
-                          <label className="block text-xs font-semibold text-stone-700 mb-1">
-                            Nombre de la unidad suelta <span className="text-red-600">*</span>
-                          </label>
-                          <input
-                            type="text"
-                            list="unit-label-suggestions"
-                            required
-                            maxLength={MAX_PACK_LABEL_LENGTH}
-                            value={unitLabel}
-                            onChange={(e) => {
-                              setUnitLabel(e.target.value);
-                              if (errorMsg) setErrorMsg(null);
-                            }}
-                            placeholder="Ej: pan, loncha, und"
-                            className="w-full min-h-[40px] px-3 py-1.5 text-sm bg-white border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
-                          />
-                          <datalist id="unit-label-suggestions">
-                            {UNIT_LABEL_OPTIONS.map((opt) => (
-                              <option key={opt} value={opt} />
-                            ))}
-                          </datalist>
-                        </div>
-                      </div>
-
-                      <div>
-                        <label className="block text-xs font-semibold text-stone-700 mb-1">
-                          Unidades por cada {packLabel.trim() || 'paquete'}{' '}
-                          <span className="text-red-600">*</span>
-                        </label>
-                        <input
-                          type="number"
-                          min={2}
-                          max={MAX_PACK_SIZE}
-                          step={1}
-                          required
-                          value={packSizeInput}
-                          onChange={(e) => {
-                            setPackSizeInput(e.target.value);
-                            if (errorMsg) setErrorMsg(null);
-                          }}
-                          className="w-full min-h-[40px] px-3 py-1.5 text-sm font-mono tabular-nums bg-white border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
-                        />
-                        <p className="text-[11px] text-stone-600 mt-1">
-                          Es un promedio; ajústalo si notas que no coincide
-                        </p>
-                      </div>
-
-                      {Number.isInteger(parsedPackSize) && parsedPackSize > 1 && (
-                        <p className="text-xs text-stone-700 bg-white border border-stone-200 rounded-lg px-2.5 py-2">
-                          Vista trabajadora:{' '}
-                          <strong>
-                            {
-                              getPacksFieldLabels({
-                                packLabel,
-                                unitLabel,
-                                unit,
-                              }).packsFieldLabel
-                            }
-                          </strong>{' '}
-                          y{' '}
-                          <strong>
-                            {
-                              getPacksFieldLabels({
-                                packLabel,
-                                unitLabel,
-                                unit,
-                              }).looseFieldLabel
-                            }
-                          </strong>{' '}
-                          (1 {packLabel.trim() || 'paquete'} = {parsedPackSize}{' '}
-                          {pluralizeSpanishLabel(
-                            unitLabel.trim() || unit.trim() || 'und',
-                            parsedPackSize,
-                          )}
-                          )
-                        </p>
-                      )}
-                    </div>
-                  )}
-
-                  {inputType === 'level' && (
-                    <div className="p-3.5 rounded-xl bg-stone-50 border border-stone-200 space-y-2">
-                      <div>
-                        <label className="block text-xs font-semibold text-stone-700 mb-1">
-                          Capacidad total del envase lleno ({unit.trim() || 'unidad base'}){' '}
-                          <span className="text-red-600">*</span>
-                        </label>
-                        <input
-                          type="number"
-                          min={0.1}
-                          step="any"
-                          required
-                          value={capacityInput}
-                          onChange={(e) => {
-                            setCapacityInput(e.target.value);
-                            if (errorMsg) setErrorMsg(null);
-                          }}
-                          placeholder="Ej: 5"
-                          className="w-full min-h-[40px] px-3 py-1.5 text-sm font-mono tabular-nums bg-white border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
-                        />
-                      </div>
-                      {Number.isFinite(parsedCapacity) && parsedCapacity > 0 && (
-                        <p className="text-xs text-stone-700 bg-white border border-stone-200 rounded-lg px-2.5 py-2">
-                          Barra de 0 a lleno en pasos de ⅛ (ej: ⅛ ={' '}
-                          <strong>
-                            {formatLevelApproximate(parsedCapacity / 8, unit.trim() || 'und')}
-                          </strong>
-                          , ½ ={' '}
-                          <strong>
-                            {formatLevelApproximate(parsedCapacity / 2, unit.trim() || 'und')}
-                          </strong>
-                          )
-                        </p>
-                      )}
-                    </div>
-                  )}
-                </div>
+                <ItemCaptureFields
+                  inputType={inputType}
+                  onInputTypeChange={setInputType}
+                  unit={unit}
+                  packSizeInput={packSizeInput}
+                  onPackSizeInputChange={setPackSizeInput}
+                  packLabel={packLabel}
+                  onPackLabelChange={setPackLabel}
+                  unitLabel={unitLabel}
+                  onUnitLabelChange={setUnitLabel}
+                  capacityInput={capacityInput}
+                  onCapacityInputChange={setCapacityInput}
+                  onClearError={() => {
+                    if (errorMsg) setErrorMsg(null);
+                  }}
+                />
 
                 <div className="grid grid-cols-2 gap-3">
                   <div>

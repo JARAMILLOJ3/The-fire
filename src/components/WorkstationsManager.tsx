@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import QRCode from 'qrcode';
 import { AnimatePresence, motion } from 'motion/react';
 import {
@@ -34,7 +34,13 @@ import {
   updateWorkstation,
 } from '../services/inventoryService';
 import type { InventoryItem, StationLink, Workspace, Workstation } from '../types';
-import { hasTargetBelowMin, normalizeCatalogItemName } from '../utils/inventory';
+import {
+  createDefaultStationItemDraft,
+  inventoryItemToDraft,
+  type StationItemDraft,
+  validateStationItemsDraft,
+} from '../utils/inventory';
+import { ItemCaptureFields } from './ItemCaptureFields';
 
 interface WorkstationsManagerProps {
   workspace: Workspace;
@@ -46,12 +52,6 @@ interface WorkstationsManagerProps {
   onOpenStationCatalog: (stationId: string) => void;
 }
 
-interface DraftNewItem {
-  name: string;
-  unit: string;
-  minStock: number;
-  targetStock: number;
-}
 
 export function WorkstationsManager({
   workspace,
@@ -72,7 +72,8 @@ export function WorkstationsManager({
   const [area, setArea] = useState('');
   const [workerName, setWorkerName] = useState('');
   const [description, setDescription] = useState('');
-  const [draftItems, setDraftItems] = useState<DraftNewItem[]>([]);
+  const [draftItems, setDraftItems] = useState<StationItemDraft[]>([]);
+  const [editingInitialItemIds, setEditingInitialItemIds] = useState<string[]>([]);
 
   const [submitting, setSubmitting] = useState(false);
   const [regenerating, setRegenerating] = useState(false);
@@ -95,47 +96,59 @@ export function WorkstationsManager({
       .catch(() => setQrDataUrl(''));
   }, [qrStation, qrStation?.accessCode]);
 
+  const itemsValidation = useMemo(
+    () =>
+      validateStationItemsDraft({
+        drafts: draftItems,
+        stationId: editingStation?.id ?? 'new_station',
+      }),
+    [draftItems, editingStation?.id],
+  );
+
   const openCreateModal = () => {
     setEditingStation(null);
+    setEditingInitialItemIds([]);
     setName('');
     setArea('');
     setWorkerName('');
     setDescription('');
-    setDraftItems([{ name: '', unit: 'und', minStock: 5, targetStock: 15 }]);
+    setDraftItems([createDefaultStationItemDraft()]);
     setErrorMsg(null);
     setShowModal(true);
   };
 
   const openEditModal = (st: Workstation) => {
+    const stationActiveItems = items.filter((it) => it.active && it.station === st.id);
     setEditingStation(st);
+    setEditingInitialItemIds(stationActiveItems.map((it) => it.id));
     setName(st.name);
     setArea(st.area);
     setWorkerName(st.workerName);
     setDescription(st.description);
-    setDraftItems([]);
+    setDraftItems(stationActiveItems.map(inventoryItemToDraft));
     setErrorMsg(null);
     setShowModal(true);
   };
 
   const handleAddDraftItemRow = () => {
-    setDraftItems((prev) => [
-      ...prev,
-      { name: '', unit: 'und', minStock: 5, targetStock: 15 },
-    ]);
+    setDraftItems((prev) => [...prev, createDefaultStationItemDraft()]);
+    if (errorMsg) setErrorMsg(null);
   };
 
-  const handleUpdateDraftItem = (
+  const handleUpdateDraftItem = <K extends keyof StationItemDraft>(
     idx: number,
-    field: keyof DraftNewItem,
-    val: string | number,
+    field: K,
+    val: StationItemDraft[K],
   ) => {
     setDraftItems((prev) =>
       prev.map((row, i) => (i === idx ? { ...row, [field]: val } : row)),
     );
+    if (errorMsg) setErrorMsg(null);
   };
 
   const handleRemoveDraftItem = (idx: number) => {
     setDraftItems((prev) => prev.filter((_, i) => i !== idx));
+    if (errorMsg) setErrorMsg(null);
   };
 
   const handleSubmit = async (e: FormEvent) => {
@@ -145,48 +158,37 @@ export function WorkstationsManager({
       return;
     }
 
-    if (!editingStation) {
-      const filledItems = draftItems.filter((d) => d.name.trim().length > 0);
-      const seenNames = new Set<string>();
-      for (const item of filledItems) {
-        if (!item.unit.trim()) {
-          setErrorMsg(`El insumo "${item.name.trim()}" debe tener una unidad de medida.`);
-          return;
-        }
-        const norm = normalizeCatalogItemName(item.name);
-        if (seenNames.has(norm)) {
-          setErrorMsg(`El insumo "${item.name.trim()}" está repetido en la lista.`);
-          return;
-        }
-        seenNames.add(norm);
-      }
+    if (!itemsValidation.valid) {
+      setErrorMsg(itemsValidation.error ?? 'Revisa los datos de los insumos del puesto.');
+      return;
     }
 
     setSubmitting(true);
     setErrorMsg(null);
     try {
       if (editingStation) {
-        await updateWorkstation(editingStation, {
+        const keptIds = new Set(
+          itemsValidation.preparedItems
+            .map((item) => item.id)
+            .filter((id): id is string => Boolean(id)),
+        );
+        const archivedItemIds = editingInitialItemIds.filter((id) => !keptIds.has(id));
+        await updateWorkstation(workspace, editingStation, {
           name,
           area,
           workerName,
           description,
+          items: itemsValidation.preparedItems,
+          archivedItemIds,
         });
       } else {
-        const validItems = draftItems
-          .filter((d) => d.name.trim().length > 0)
-          .map((d) => ({
-            ...d,
-            name: d.name.trim(),
-            unit: d.unit.trim(),
-          }));
         await createWorkstation(workspace, {
           name,
           area,
           workerName,
           description,
           sortOrder: (stations.length + 1) * 10,
-          initialItems: validItems,
+          initialItems: itemsValidation.preparedItems,
         });
       }
       setShowModal(false);
@@ -568,107 +570,163 @@ export function WorkstationsManager({
                   </div>
                 </div>
 
-                {!editingStation && (
-                  <div className="pt-2 border-t border-stone-200 space-y-3">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-xs font-semibold text-stone-700">
-                        Insumos a registrar en este puesto
-                      </span>
-                      <button
-                        type="button"
-                        onClick={handleAddDraftItemRow}
-                        className="text-xs font-semibold text-orange-600 hover:text-orange-700 whitespace-nowrap cursor-pointer"
-                      >
-                        + Agregar otro insumo
-                      </button>
-                    </div>
+                <div className="pt-2 border-t border-stone-200 space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-stone-700">
+                      Insumos de este puesto ({draftItems.length})
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleAddDraftItemRow}
+                      className="text-xs font-semibold text-orange-600 hover:text-orange-700 whitespace-nowrap cursor-pointer"
+                    >
+                      + Agregar otro insumo
+                    </button>
+                  </div>
 
-                    <div className="space-y-2.5 max-h-56 overflow-y-auto pr-1">
+                  {draftItems.length === 0 ? (
+                    <p className="text-xs text-stone-500 bg-stone-50 border border-stone-200 rounded-xl px-3 py-3 text-center">
+                      Este puesto aún no tiene insumos. Usa &quot;+ Agregar otro insumo&quot; para añadir uno.
+                    </p>
+                  ) : (
+                    <div className="space-y-3 max-h-[45vh] overflow-y-auto pr-1">
                       {draftItems.map((row, idx) => (
                         <div
-                          key={idx}
-                          className="p-2.5 sm:p-0 bg-stone-50 sm:bg-transparent border border-stone-200 sm:border-0 rounded-xl grid grid-cols-1 sm:grid-cols-12 gap-2 items-center"
+                          key={row.id ?? `new_${idx}`}
+                          className="p-3 bg-stone-50 border border-stone-200 rounded-xl space-y-2.5"
                         >
-                          <input
-                            type="text"
-                            maxLength={MAX_NAME_LENGTH}
-                            value={row.name}
-                            onChange={(e) => handleUpdateDraftItem(idx, 'name', e.target.value)}
-                            placeholder="Nombre del insumo"
-                            className="sm:col-span-5 px-2.5 py-2 text-xs bg-white border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500"
-                          />
-                          <div className="grid grid-cols-4 sm:contents gap-2 items-center">
-                            <input
-                              type="text"
-                              list="ws-unit-list"
-                              maxLength={MAX_UNIT_LENGTH}
-                              value={row.unit}
-                              onChange={(e) => handleUpdateDraftItem(idx, 'unit', e.target.value)}
-                              placeholder="und"
-                              aria-label="Unidad"
-                              className="sm:col-span-2 px-2 py-2 text-xs bg-white border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500"
-                            />
-                            <input
-                              type="number"
-                              min={0}
-                              value={row.minStock}
-                              onChange={(e) =>
-                                handleUpdateDraftItem(
-                                  idx,
-                                  'minStock',
-                                  parseFloat(e.target.value) || 0,
-                                )
-                              }
-                              title="Stock mínimo"
-                              placeholder="Mín"
-                              aria-label="Stock mínimo"
-                              className="sm:col-span-2 px-2 py-2 text-xs font-mono bg-white border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500"
-                            />
-                            <input
-                              type="number"
-                              min={0}
-                              value={row.targetStock}
-                              onChange={(e) =>
-                                handleUpdateDraftItem(
-                                  idx,
-                                  'targetStock',
-                                  parseFloat(e.target.value) || 0,
-                                )
-                              }
-                              title="Stock ideal"
-                              placeholder="Ideal"
-                              aria-label="Stock ideal"
-                              className="sm:col-span-2 px-2 py-2 text-xs font-mono bg-white border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500"
-                            />
+                          <div className="flex items-end gap-2">
+                            <div className="flex-1 min-w-0">
+                              <label className="block text-[11px] font-semibold text-stone-700 mb-1">
+                                Insumo
+                              </label>
+                              <input
+                                type="text"
+                                maxLength={MAX_NAME_LENGTH}
+                                value={row.name}
+                                onChange={(e) => handleUpdateDraftItem(idx, 'name', e.target.value)}
+                                placeholder="Nombre del insumo"
+                                className="w-full min-h-[38px] px-2.5 py-1.5 text-xs sm:text-sm bg-white border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500"
+                              />
+                            </div>
+                            <div className="w-24 shrink-0">
+                              <label className="block text-[11px] font-semibold text-stone-700 mb-1">
+                                Unidad
+                              </label>
+                              <input
+                                type="text"
+                                list="ws-unit-list"
+                                maxLength={MAX_UNIT_LENGTH}
+                                value={row.unit}
+                                onChange={(e) => handleUpdateDraftItem(idx, 'unit', e.target.value)}
+                                placeholder="und"
+                                aria-label="Unidad"
+                                className="w-full min-h-[38px] px-2.5 py-1.5 text-xs sm:text-sm bg-white border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500"
+                              />
+                            </div>
                             <button
                               type="button"
                               onClick={() => handleRemoveDraftItem(idx)}
-                              aria-label="Quitar fila"
-                              className="sm:col-span-1 p-2 flex items-center justify-center text-stone-400 hover:text-red-600 cursor-pointer"
+                              aria-label="Quitar insumo"
+                              title="Quitar insumo"
+                              className="min-h-[38px] px-2 flex items-center justify-center text-stone-400 hover:text-red-600 rounded-lg cursor-pointer shrink-0"
                             >
                               <Trash2 className="w-4 h-4" />
                             </button>
                           </div>
+
+                          <div className="grid grid-cols-2 gap-2">
+                            <div>
+                              <label className="block text-[11px] font-semibold text-stone-700 mb-1">
+                                Mínimo ({row.unit.trim() || 'und'})
+                              </label>
+                              <input
+                                type="number"
+                                min={0}
+                                step="any"
+                                value={row.minStock}
+                                onChange={(e) =>
+                                  handleUpdateDraftItem(
+                                    idx,
+                                    'minStock',
+                                    parseFloat(e.target.value) || 0,
+                                  )
+                                }
+                                aria-label="Mínimo"
+                                className="w-full min-h-[38px] px-2.5 py-1.5 text-xs sm:text-sm font-mono tabular-nums bg-white border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[11px] font-semibold text-stone-700 mb-1">
+                                Ideal ({row.unit.trim() || 'und'})
+                              </label>
+                              <input
+                                type="number"
+                                min={0}
+                                step="any"
+                                value={row.targetStock}
+                                onChange={(e) =>
+                                  handleUpdateDraftItem(
+                                    idx,
+                                    'targetStock',
+                                    parseFloat(e.target.value) || 0,
+                                  )
+                                }
+                                aria-label="Ideal"
+                                className="w-full min-h-[38px] px-2.5 py-1.5 text-xs sm:text-sm font-mono tabular-nums bg-white border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500"
+                              />
+                            </div>
+                          </div>
+
+                          <ItemCaptureFields
+                            compact
+                            requireCaptureFields={Boolean(row.id || row.name.trim().length > 0)}
+                            inputType={row.inputType}
+                            onInputTypeChange={(next) =>
+                              handleUpdateDraftItem(idx, 'inputType', next)
+                            }
+                            unit={row.unit}
+                            packSizeInput={row.packSizeInput}
+                            onPackSizeInputChange={(val) =>
+                              handleUpdateDraftItem(idx, 'packSizeInput', val)
+                            }
+                            packLabel={row.packLabel}
+                            onPackLabelChange={(val) =>
+                              handleUpdateDraftItem(idx, 'packLabel', val)
+                            }
+                            unitLabel={row.unitLabel}
+                            onUnitLabelChange={(val) =>
+                              handleUpdateDraftItem(idx, 'unitLabel', val)
+                            }
+                            capacityInput={row.capacityInput}
+                            onCapacityInputChange={(val) =>
+                              handleUpdateDraftItem(idx, 'capacityInput', val)
+                            }
+                            onClearError={() => {
+                              if (errorMsg) setErrorMsg(null);
+                            }}
+                          />
                         </div>
                       ))}
                     </div>
-                    <datalist id="ws-unit-list">
-                      {UNIT_OPTIONS.map((u) => (
-                        <option key={u} value={u} />
-                      ))}
-                    </datalist>
-                    {draftItems.some(
-                      (row) => row.name.trim().length > 0 && hasTargetBelowMin(row.minStock, row.targetStock),
-                    ) && (
-                      <div className="p-2.5 text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-2">
-                        <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
-                        <span>
-                          Uno o más insumos tienen stock ideal menor que el mínimo. Ajusta el stock ideal para evitar compras incompletas.
-                        </span>
-                      </div>
-                    )}
-                  </div>
-                )}
+                  )}
+
+                  <datalist id="ws-unit-list">
+                    {UNIT_OPTIONS.map((u) => (
+                      <option key={u} value={u} />
+                    ))}
+                  </datalist>
+
+                  {!errorMsg && itemsValidation.warning && (
+                    <div
+                      role="alert"
+                      className="p-2.5 text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-2"
+                    >
+                      <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                      <span>{itemsValidation.warning}</span>
+                    </div>
+                  )}
+                </div>
 
                 <div className="flex items-center justify-end gap-2 pt-2">
                   <button

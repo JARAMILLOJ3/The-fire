@@ -8,12 +8,17 @@ import type {
 } from '../../types';
 import {
   buildConsolidatedRows,
+  buildItemCaptureFields,
   buildWhatsAppShoppingList,
+  createDefaultStationItemDraft,
   detectEntryAnomalies,
   getStockLevel,
   getSuggestedPurchase,
+  inventoryItemToDraft,
+  parseCaptureDecimalInput,
   parseQuantityInput,
   sanitizeStockQuantity,
+  validateStationItemsDraft,
 } from '../inventory';
 
 function makeItem(overrides: Partial<InventoryItem> = {}): InventoryItem {
@@ -835,5 +840,195 @@ describe('inventory.ts (sanitización, sin_dato, anomalías y compras)', () => {
         existingItems: [],
       }).valid,
     ).toBe(true);
+  });
+
+  it('validates workstation item drafts using the shared catalog rules without duplication', () => {
+    const validResult = validateStationItemsDraft({
+      stationId: 'comida_rapida',
+      drafts: [
+        createDefaultStationItemDraft({
+          name: 'Pan perro',
+          unit: 'pan',
+          minStock: 16,
+          targetStock: 40,
+          inputType: 'packs',
+          packSizeInput: '8',
+          packLabel: 'paquete',
+          unitLabel: 'pan',
+        }),
+        createDefaultStationItemDraft({
+          name: 'Aceite freidora',
+          unit: 'L',
+          minStock: 2,
+          targetStock: 6,
+          inputType: 'level',
+          capacityInput: '5,5',
+        }),
+        // Blank unsaved template row is ignored cleanly
+        createDefaultStationItemDraft({ name: '   ' }),
+      ],
+    });
+
+    expect(validResult.valid).toBe(true);
+    expect(validResult.error).toBeNull();
+    expect(validResult.warning).toBeNull();
+    expect(validResult.preparedItems).toEqual([
+      {
+        name: 'Pan perro',
+        unit: 'pan',
+        minStock: 16,
+        targetStock: 40,
+        inputType: 'packs',
+        packSize: 8,
+        packLabel: 'paquete',
+        unitLabel: 'pan',
+      },
+      {
+        name: 'Aceite freidora',
+        unit: 'L',
+        minStock: 2,
+        targetStock: 6,
+        inputType: 'level',
+        capacity: 5.5,
+      },
+    ]);
+
+    // Rejects blank name when editing an existing item
+    const missingExistingName = validateStationItemsDraft({
+      stationId: 'comida_rapida',
+      drafts: [
+        createDefaultStationItemDraft({
+          id: 'comida_rapida_1',
+          name: '   ',
+        }),
+      ],
+    });
+    expect(missingExistingName.valid).toBe(false);
+
+    // Rejects duplicate normalized names within the same workstation draft
+    const dupResult = validateStationItemsDraft({
+      stationId: 'comida_rapida',
+      drafts: [
+        createDefaultStationItemDraft({ name: 'Tocineta', unit: 'loncha' }),
+        createDefaultStationItemDraft({ name: '  tocineta  ', unit: 'loncha' }),
+      ],
+    });
+    expect(dupResult.valid).toBe(false);
+
+    // Enforces packs and level validation rules from validateCatalogItemInput
+    expect(
+      validateStationItemsDraft({
+        stationId: 'comida_rapida',
+        drafts: [
+          createDefaultStationItemDraft({
+            name: 'Pan',
+            unit: 'pan',
+            inputType: 'packs',
+            packSizeInput: '1',
+            packLabel: 'paquete',
+            unitLabel: 'pan',
+          }),
+        ],
+      }).valid,
+    ).toBe(false);
+
+    expect(
+      validateStationItemsDraft({
+        stationId: 'comida_rapida',
+        drafts: [
+          createDefaultStationItemDraft({
+            name: 'Pan',
+            unit: 'pan',
+            inputType: 'packs',
+            packSizeInput: '8',
+            packLabel: 'etiqueta_de_mas_de_20_caracteres',
+            unitLabel: 'pan',
+          }),
+        ],
+      }).valid,
+    ).toBe(false);
+
+    expect(
+      validateStationItemsDraft({
+        stationId: 'comida_rapida',
+        drafts: [
+          createDefaultStationItemDraft({
+            name: 'Salsa',
+            unit: 'L',
+            inputType: 'level',
+            capacityInput: '0',
+          }),
+        ],
+      }).valid,
+    ).toBe(false);
+
+    // Propagates non-blocking warning when ideal < mínimo
+    const warningResult = validateStationItemsDraft({
+      stationId: 'comida_rapida',
+      drafts: [
+        createDefaultStationItemDraft({
+          name: 'Queso',
+          unit: 'und',
+          minStock: 10,
+          targetStock: 4,
+        }),
+      ],
+    });
+    expect(warningResult.valid).toBe(true);
+    expect(warningResult.warning).toMatch(/ideal/i);
+  });
+
+  it('round-trips InventoryItem capture fields to draft and payload helpers', () => {
+    const packsDraft = inventoryItemToDraft(
+      makeItem({
+        id: 'comida_rapida_2',
+        station: 'comida_rapida',
+        name: 'Tocineta',
+        unit: 'loncha',
+        minStock: 20,
+        targetStock: 80,
+        inputType: 'packs',
+        packSize: 40,
+        packLabel: 'kilo',
+        unitLabel: 'loncha',
+      }),
+    );
+
+    expect(packsDraft).toEqual({
+      id: 'comida_rapida_2',
+      name: 'Tocineta',
+      unit: 'loncha',
+      minStock: 20,
+      targetStock: 80,
+      inputType: 'packs',
+      packSizeInput: '40',
+      packLabel: 'kilo',
+      unitLabel: 'loncha',
+      capacityInput: '5',
+    });
+
+    expect(buildItemCaptureFields(packsDraft)).toEqual({
+      inputType: 'packs',
+      packSize: 40,
+      packLabel: 'kilo',
+      unitLabel: 'loncha',
+    });
+
+    const levelDraft = inventoryItemToDraft(
+      makeItem({
+        id: 'comida_rapida_3',
+        inputType: 'level',
+        capacity: 3.5,
+      }),
+    );
+    expect(levelDraft.inputType).toBe('level');
+    expect(levelDraft.capacityInput).toBe('3.5');
+    expect(buildItemCaptureFields(levelDraft)).toEqual({
+      inputType: 'level',
+      capacity: 3.5,
+    });
+
+    expect(parseCaptureDecimalInput(' 4,25 ')).toBe(4.25);
+    expect(parseCaptureDecimalInput('   ')).toBeNaN();
   });
 });

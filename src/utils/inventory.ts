@@ -571,6 +571,198 @@ export function validateCatalogItemInput(params: {
   return { valid: true, error: null, warning };
 }
 
+export interface StationItemDraft {
+  id?: string;
+  name: string;
+  unit: string;
+  minStock: number;
+  targetStock: number;
+  inputType: CaptureInputType;
+  packSizeInput: string;
+  packLabel: string;
+  unitLabel: string;
+  capacityInput: string;
+}
+
+export interface PreparedStationItemPayload {
+  id?: string;
+  name: string;
+  unit: string;
+  minStock: number;
+  targetStock: number;
+  inputType: CaptureInputType;
+  packSize?: number;
+  packLabel?: string;
+  unitLabel?: string;
+  capacity?: number;
+}
+
+export function parseCaptureDecimalInput(rawValue: string): number {
+  const normalized = rawValue.trim().replace(',', '.');
+  if (!normalized) return Number.NaN;
+  return Number(normalized);
+}
+
+export function buildItemCaptureFields(draft: {
+  inputType: CaptureInputType;
+  packSizeInput: string;
+  packLabel: string;
+  unitLabel: string;
+  capacityInput: string;
+}): {
+  inputType: CaptureInputType;
+  packSize?: number;
+  packLabel?: string;
+  unitLabel?: string;
+  capacity?: number;
+} {
+  if (draft.inputType === 'packs') {
+    return {
+      inputType: 'packs',
+      packSize: parseCaptureDecimalInput(draft.packSizeInput),
+      packLabel: draft.packLabel.trim(),
+      unitLabel: draft.unitLabel.trim(),
+    };
+  }
+  if (draft.inputType === 'level') {
+    return {
+      inputType: 'level',
+      capacity: parseCaptureDecimalInput(draft.capacityInput),
+    };
+  }
+  return { inputType: 'count' };
+}
+
+export function createDefaultStationItemDraft(
+  overrides: Partial<StationItemDraft> = {},
+): StationItemDraft {
+  return {
+    name: '',
+    unit: 'und',
+    minStock: 5,
+    targetStock: 15,
+    inputType: 'count',
+    packSizeInput: '8',
+    packLabel: 'paquete',
+    unitLabel: 'und',
+    capacityInput: '5',
+    ...overrides,
+  };
+}
+
+export function inventoryItemToDraft(item: InventoryItem): StationItemDraft {
+  return {
+    id: item.id,
+    name: item.name,
+    unit: item.unit,
+    minStock: item.minStock,
+    targetStock: item.targetStock,
+    inputType: getItemInputType(item),
+    packSizeInput: typeof item.packSize === 'number' ? String(item.packSize) : '8',
+    packLabel: item.packLabel ?? 'paquete',
+    unitLabel: item.unitLabel ?? (item.unit || 'und'),
+    capacityInput: typeof item.capacity === 'number' ? String(item.capacity) : '5',
+  };
+}
+
+export interface StationDraftItemsValidationResult {
+  valid: boolean;
+  error: string | null;
+  warning: string | null;
+  preparedItems: PreparedStationItemPayload[];
+}
+
+export function validateStationItemsDraft(params: {
+  drafts: StationItemDraft[];
+  stationId: StationId;
+}): StationDraftItemsValidationResult {
+  const preparedItems: PreparedStationItemPayload[] = [];
+  const accumulatedActiveItems: InventoryItem[] = [];
+  const warnings: string[] = [];
+
+  for (let i = 0; i < params.drafts.length; i++) {
+    const row = params.drafts[i];
+    const cleanName = row.name.trim();
+
+    if (!cleanName) {
+      if (row.id) {
+        return {
+          valid: false,
+          error: 'Escribe el nombre de cada insumo existente o quítalo de la lista.',
+          warning: null,
+          preparedItems: [],
+        };
+      }
+      continue;
+    }
+
+    const captureFields = buildItemCaptureFields(row);
+    const check = validateCatalogItemInput({
+      name: cleanName,
+      unit: row.unit,
+      station: params.stationId,
+      minStock: row.minStock,
+      targetStock: row.targetStock,
+      inputType: captureFields.inputType,
+      packSize: captureFields.packSize,
+      packLabel: captureFields.packLabel,
+      unitLabel: captureFields.unitLabel,
+      capacity: captureFields.capacity,
+      existingItems: accumulatedActiveItems,
+      editingItemId: row.id,
+    });
+
+    if (!check.valid) {
+      return {
+        valid: false,
+        error: `${cleanName}: ${check.error ?? 'Revisa los datos del insumo.'}`,
+        warning: null,
+        preparedItems: [],
+      };
+    }
+
+    if (check.warning) {
+      warnings.push(`${cleanName}: ${check.warning}`);
+    }
+
+    const prepared: PreparedStationItemPayload = {
+      ...(row.id ? { id: row.id } : {}),
+      name: cleanName,
+      unit: row.unit.trim(),
+      minStock: row.minStock,
+      targetStock: row.targetStock,
+      ...captureFields,
+    };
+    preparedItems.push(prepared);
+
+    accumulatedActiveItems.push({
+      id: row.id ?? `draft_${i}`,
+      workspaceId: '',
+      ownerUid: '',
+      authorizedEmails: [],
+      station: params.stationId,
+      name: prepared.name,
+      unit: prepared.unit,
+      minStock: prepared.minStock,
+      targetStock: prepared.targetStock,
+      inputType: prepared.inputType,
+      packSize: prepared.packSize,
+      packLabel: prepared.packLabel,
+      unitLabel: prepared.unitLabel,
+      capacity: prepared.capacity,
+      active: true,
+      sortOrder: (i + 1) * 10,
+    });
+  }
+
+  return {
+    valid: true,
+    error: null,
+    warning: warnings.length > 0 ? warnings[0] : null,
+    preparedItems,
+  };
+}
+
 export function getStockLevelMeta(level: StockLevel): {
   label: string;
   textClass: string;
