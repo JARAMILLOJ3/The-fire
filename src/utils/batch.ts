@@ -1,4 +1,5 @@
 export const MAX_BATCH_SIZE = 8;
+export const WORKER_ENTRY_BATCH_SIZE = 4;
 
 export function chunkArrayWithLimit<T>(
   items: readonly T[],

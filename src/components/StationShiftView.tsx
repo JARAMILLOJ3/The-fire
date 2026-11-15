@@ -27,7 +27,9 @@ import {
   ConcurrencyConflictError,
   DiagnosticSaveError,
   fetchStationEntriesWithStatusOnce,
+  PartialBatchSaveError,
   saveStationReportBatch,
+  type WorkerSaveProgress,
 } from '../services/workerService';
 import type {
   DailyReport,
@@ -57,6 +59,7 @@ import {
   sanitizeStockQuantity,
   summarizeStationCatalogDiff,
   type EntryAnomaly,
+  type SavedItemOutcome,
   type StationSaveErrorInfo,
 } from '../utils/inventory';
 import { formatTime12h, type WorkerScheduleStatus } from '../utils/schedule';
@@ -302,6 +305,13 @@ export function StationShiftView({
   const [notes, setNotes] = useState('');
   const [savingMode, setSavingMode] = useState<'opening' | 'closing' | null>(null);
   const [savingStatusText, setSavingStatusText] = useState<string | null>(null);
+  const [savingProgress, setSavingProgress] = useState<WorkerSaveProgress | null>(null);
+  const [partiallySavedEntries, setPartiallySavedEntries] = useState<Record<string, DailyReportEntry>>({});
+  const [failedRetryContext, setFailedRetryContext] = useState<{
+    mode: 'opening' | 'closing';
+    pendingItemIds: string[];
+    previousSavedItems: SavedItemOutcome[];
+  } | null>(null);
   const [yesterdayStatus, setYesterdayStatus] = useState<YesterdayLoadStatus>('idle');
   const [yesterdayDateStr, setYesterdayDateStr] = useState<string>(() =>
     getPreviousDateStr(selectedDate),
@@ -505,6 +515,9 @@ export function StationShiftView({
     setSubmittedOfflineQueued(false);
     setFeedback(null);
     setSaveError(null);
+    setSavingProgress(null);
+    setPartiallySavedEntries({});
+    setFailedRetryContext(null);
   }, [workspace.id, station.id, selectedDate, report?.id, draftMode, storageKey]);
 
   useEffect(() => {
@@ -1169,15 +1182,34 @@ export function StationShiftView({
 
   const executeSave = async (
     mode: 'opening' | 'closing',
-    options?: { forceOverwrite?: boolean },
+    options?: { forceOverwrite?: boolean; pendingOnly?: boolean },
   ) => {
     if (stationItems.length === 0) return;
 
-    const rows = buildRowsForSubmit();
+    const allRows = buildRowsForSubmit();
+    const isPendingRetry =
+      Boolean(options?.pendingOnly) &&
+      Boolean(failedRetryContext) &&
+      failedRetryContext?.mode === mode;
+    const pendingIdSet = isPendingRetry ? new Set(failedRetryContext!.pendingItemIds) : null;
+    const rows = pendingIdSet
+      ? allRows.filter((r) => pendingIdSet.has(r.itemId))
+      : allRows;
+    const previousSavedItems = isPendingRetry ? failedRetryContext!.previousSavedItems : [];
+    const mergedExistingEntries = {
+      ...entriesByItemId,
+      ...partiallySavedEntries,
+    };
+
     setConfirmModalState(null);
     setPendingConflict(null);
     setSavingMode(mode);
     setSavingStatusText(null);
+    setSavingProgress({
+      savedCount: previousSavedItems.length,
+      totalCount: previousSavedItems.length + rows.length,
+      phase: 'preparing',
+    });
     setFeedback(null);
     setSaveError(null);
     setSaveErrorModalOpen(false);
@@ -1194,10 +1226,16 @@ export function StationShiftView({
         notes,
         rows,
         existingReport: report,
-        existingEntries: entriesByItemId,
+        existingEntries: mergedExistingEntries,
         expectedUpdatedAtMs: baselineUpdatedAtRef.current,
-        forceOverwrite: options?.forceOverwrite,
+        forceOverwrite: options?.forceOverwrite || isPendingRetry,
+        previousSavedItems,
+        skipEmptyOpeningGuard: isPendingRetry && previousSavedItems.length > 0,
         onStatusMessage: (msg) => setSavingStatusText(msg),
+        onProgress: (progress) => setSavingProgress(progress),
+        onPartialSaved: (newlySaved) => {
+          setPartiallySavedEntries((prev) => ({ ...prev, ...newlySaved }));
+        },
         onCatalogSynced: (freshItems) => {
           onCatalogSynced?.(freshItems);
         },
@@ -1210,6 +1248,8 @@ export function StationShiftView({
       setRemoteChangedBy(null);
       setSaveError(null);
       setSaveErrorModalOpen(false);
+      setFailedRetryContext(null);
+      setPartiallySavedEntries({});
 
       if (!canManage) {
         setSubmittedOfflineQueued(saveResult.queuedOffline);
@@ -1228,6 +1268,25 @@ export function StationShiftView({
       }
       onSaved?.();
     } catch (err) {
+      if (err instanceof PartialBatchSaveError) {
+        setFailedRetryContext({
+          mode,
+          pendingItemIds: err.failedItems.map((f) => f.itemId),
+          previousSavedItems: err.savedItems,
+        });
+        setSaveError({
+          title: err.title,
+          detail: err.detail,
+          code: err.code,
+          rawDetail: err.rawDetail,
+          failedDocumentPath: err.failedDocumentPath,
+          savedItems: err.savedItems,
+          failedItems: err.failedItems,
+        });
+        setSaveErrorModalOpen(true);
+        return;
+      }
+
       if (err instanceof DiagnosticSaveError) {
         setSaveError({
           title: err.title,
@@ -1269,6 +1328,7 @@ export function StationShiftView({
     } finally {
       setSavingMode(null);
       setSavingStatusText(null);
+      setSavingProgress(null);
     }
   };
 
@@ -2400,6 +2460,44 @@ export function StationShiftView({
             </div>
           )}
 
+          {/* Live batch save progress ("Guardando X de Y…") */}
+          {savingMode !== null && savingProgress && (
+            <div
+              role="status"
+              aria-live="polite"
+              className="p-3.5 rounded-xl bg-orange-50/90 border border-orange-200 space-y-2"
+            >
+              <div className="flex items-center justify-between gap-2 text-xs sm:text-sm font-semibold text-orange-950">
+                <span className="flex items-center gap-2 min-w-0">
+                  <RefreshCw className="w-4 h-4 text-orange-600 animate-spin shrink-0" />
+                  <span className="truncate">
+                    {savingProgress.phase === 'report'
+                      ? `Finalizando reporte (${savingProgress.savedCount} de ${savingProgress.totalCount})…`
+                      : `Guardando ${savingProgress.savedCount} de ${savingProgress.totalCount}…`}
+                  </span>
+                </span>
+                <span className="font-mono tabular-nums text-xs text-orange-800 shrink-0">
+                  {savingProgress.totalCount > 0
+                    ? Math.round((savingProgress.savedCount / savingProgress.totalCount) * 100)
+                    : 0}
+                  %
+                </span>
+              </div>
+              <div className="w-full h-2 bg-orange-200/80 rounded-full overflow-hidden">
+                <div
+                  style={{
+                    width: `${
+                      savingProgress.totalCount > 0
+                        ? Math.round((savingProgress.savedCount / savingProgress.totalCount) * 100)
+                        : 0
+                    }%`,
+                  }}
+                  className="h-full bg-orange-600 rounded-full transition-[width] duration-200 ease-out"
+                />
+              </div>
+            </div>
+          )}
+
           {/* Retry-once live catalog sync notice during save */}
           {savingMode !== null && savingStatusText && (
             <div
@@ -2432,6 +2530,22 @@ export function StationShiftView({
                     {saveError.detail}
                   </p>
                   <div className="flex flex-wrap items-center gap-2 pt-1">
+                    {saveError.failedItems && saveError.failedItems.length > 0 && failedRetryContext && (
+                      <button
+                        type="button"
+                        disabled={savingMode !== null}
+                        onClick={() =>
+                          void executeSave(failedRetryContext.mode, {
+                            pendingOnly: true,
+                            forceOverwrite: true,
+                          })
+                        }
+                        className="min-h-[36px] inline-flex items-center gap-1.5 px-3 py-1 text-xs font-semibold text-white bg-orange-600 rounded-lg hover:bg-orange-700 disabled:opacity-50 cursor-pointer"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5 shrink-0" />
+                        Reintentar los que faltan ({saveError.failedItems.length})
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => setSaveErrorModalOpen(true)}
@@ -2484,7 +2598,9 @@ export function StationShiftView({
               >
                 {isWorkerOpeningPhase ? <Save className="w-4 h-4" /> : <CheckCircle2 className="w-4 h-4" />}
                 {savingMode !== null
-                  ? 'Guardando...'
+                  ? savingProgress
+                    ? `Guardando ${savingProgress.savedCount} de ${savingProgress.totalCount}…`
+                    : 'Guardando...'
                   : counts.pendingConfirm > 0
                     ? `${counts.pendingConfirm} por confirmar`
                     : counts.missingCount > 0
@@ -2507,7 +2623,9 @@ export function StationShiftView({
               >
                 <Save className="w-5 h-5" />
                 {savingMode === 'opening'
-                  ? 'Guardando apertura...'
+                  ? savingProgress
+                    ? `Guardando ${savingProgress.savedCount} de ${savingProgress.totalCount}…`
+                    : 'Guardando apertura...'
                   : counts.pendingConfirm > 0
                     ? `${counts.pendingConfirm} por confirmar`
                     : counts.missingOpening > 0
@@ -2536,7 +2654,9 @@ export function StationShiftView({
                 >
                   <CheckCircle2 className="w-5 h-5" />
                   {savingMode === 'closing'
-                    ? 'Enviando cierre...'
+                    ? savingProgress
+                      ? `Guardando ${savingProgress.savedCount} de ${savingProgress.totalCount}…`
+                      : 'Enviando cierre...'
                     : counts.pendingConfirm > 0
                       ? `${counts.pendingConfirm} por confirmar`
                       : counts.missingClosing > 0
@@ -2577,6 +2697,45 @@ export function StationShiftView({
             </div>
           )}
 
+          {savingMode !== null && savingProgress && (
+            <div
+              role="status"
+              aria-live="polite"
+              className="px-4 py-2 bg-orange-50 border-b border-orange-200 text-orange-950"
+            >
+              <div className="max-w-lg mx-auto space-y-1.5">
+                <div className="flex items-center justify-between gap-2 text-xs font-semibold">
+                  <span className="flex items-center gap-1.5 min-w-0">
+                    <RefreshCw className="w-3.5 h-3.5 text-orange-600 animate-spin shrink-0" />
+                    <span className="truncate">
+                      {savingProgress.phase === 'report'
+                        ? `Finalizando reporte (${savingProgress.savedCount} de ${savingProgress.totalCount})…`
+                        : `Guardando ${savingProgress.savedCount} de ${savingProgress.totalCount}…`}
+                    </span>
+                  </span>
+                  <span className="font-mono tabular-nums text-[11px] text-orange-800 shrink-0">
+                    {savingProgress.totalCount > 0
+                      ? Math.round((savingProgress.savedCount / savingProgress.totalCount) * 100)
+                      : 0}
+                    %
+                  </span>
+                </div>
+                <div className="w-full h-1.5 bg-orange-200 rounded-full overflow-hidden">
+                  <div
+                    style={{
+                      width: `${
+                        savingProgress.totalCount > 0
+                          ? Math.round((savingProgress.savedCount / savingProgress.totalCount) * 100)
+                          : 0
+                      }%`,
+                    }}
+                    className="h-full bg-orange-600 rounded-full transition-[width] duration-200 ease-out"
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+
           {savingMode !== null && savingStatusText && (
             <div
               role="status"
@@ -2606,6 +2765,21 @@ export function StationShiftView({
                     </p>
                     <p className="text-red-900 leading-snug break-words">{saveError.detail}</p>
                     <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                      {saveError.failedItems && saveError.failedItems.length > 0 && failedRetryContext && (
+                        <button
+                          type="button"
+                          disabled={savingMode !== null}
+                          onClick={() =>
+                            void executeSave(failedRetryContext.mode, {
+                              pendingOnly: true,
+                              forceOverwrite: true,
+                            })
+                          }
+                          className="min-h-[34px] inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-semibold text-white bg-orange-600 rounded-lg cursor-pointer disabled:opacity-50"
+                        >
+                          Reintentar faltantes ({saveError.failedItems.length})
+                        </button>
+                      )}
                       <button
                         type="button"
                         onClick={() => setSaveErrorModalOpen(true)}
@@ -2642,13 +2816,15 @@ export function StationShiftView({
             <div className="max-w-lg mx-auto flex items-center gap-3">
               <div className="min-w-0 flex-1">
                 <p className="text-xs font-mono tabular-nums font-bold text-stone-900 truncate">
-                  {savingMode !== null && savingStatusText
-                    ? savingStatusText
-                    : counts.pendingConfirm > 0
-                      ? `${counts.pendingConfirm} por confirmar`
-                      : counts.missingCount > 0
-                        ? `Faltan ${counts.missingCount} por contar`
-                        : `${counts.total} de ${counts.total} listos`}
+                  {savingMode !== null && savingProgress
+                    ? `Guardando ${savingProgress.savedCount} de ${savingProgress.totalCount}…`
+                    : savingMode !== null && savingStatusText
+                      ? savingStatusText
+                      : counts.pendingConfirm > 0
+                        ? `${counts.pendingConfirm} por confirmar`
+                        : counts.missingCount > 0
+                          ? `Faltan ${counts.missingCount} por contar`
+                          : `${counts.total} de ${counts.total} listos`}
                 </p>
                 <p className="text-[11px] text-stone-500 truncate">
                   {isWorkerOpeningPhase ? 'Apertura del día' : 'Cierre del día'}
@@ -2662,7 +2838,9 @@ export function StationShiftView({
                 className="min-h-[46px] px-4 py-2.5 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed transition-all whitespace-nowrap shrink-0 cursor-pointer"
               >
                 {savingMode !== null
-                  ? 'Guardando...'
+                  ? savingProgress
+                    ? `${savingProgress.savedCount}/${savingProgress.totalCount}…`
+                    : 'Guardando...'
                   : counts.pendingConfirm > 0
                     ? `${counts.pendingConfirm} por confirmar`
                     : counts.missingCount > 0
@@ -2696,10 +2874,20 @@ export function StationShiftView({
         }
       />
 
-      {/* Full Uncut Save Error Modal with Copy button */}
+      {/* Full Uncut Save Error Modal with Copy & Retry Pending buttons */}
       <ShiftSaveErrorModal
         open={saveError !== null && saveErrorModalOpen}
         error={saveError}
+        retrying={savingMode !== null}
+        onRetryFailed={
+          failedRetryContext
+            ? () =>
+                void executeSave(failedRetryContext.mode, {
+                  pendingOnly: true,
+                  forceOverwrite: true,
+                })
+            : undefined
+        }
         onClose={() => setSaveErrorModalOpen(false)}
       />
       </div>

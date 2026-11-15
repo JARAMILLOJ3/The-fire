@@ -4,6 +4,7 @@ import { DEFAULT_SHIFT_SCHEDULE } from '../../constants';
 import type { DraftEntryRow, InventoryItem, Workspace } from '../../types';
 import {
   DiagnosticSaveError,
+  PartialBatchSaveError,
   reconcileRowsWithServerCatalog,
   saveStationReportBatch,
   type BatchChunkCommitInput,
@@ -140,8 +141,10 @@ describe('worker catalog pre-save sync and catalog-mismatch retry', () => {
     });
 
     expect(result.catalogUpdatedDuringSave).toBe(true);
+    expect(result.savedCount).toBe(1);
     expect(io.fetchServerItems).toHaveBeenCalledTimes(1);
-    expect(io.commitChunks).toHaveBeenCalledTimes(1);
+    // 1) open report header, 2) entry chunk, 3) final opening_saved report update
+    expect(io.commitChunks).toHaveBeenCalledTimes(3);
     expect(committedPayloads).toEqual([
       {
         itemId: 'asados_1',
@@ -169,9 +172,9 @@ describe('worker catalog pre-save sync and catalog-mismatch retry', () => {
     });
 
     let serverItemFetchCount = 0;
-    let commitCount = 0;
-    let simulatedHeaderCreatedBySelfDiagnostic = false;
+    let entryCommitAttempt = 0;
     const committedUnits: unknown[] = [];
+    const committedReportStatuses: unknown[] = [];
     const onStatusMessage = vi.fn();
     const onCatalogSynced = vi.fn();
 
@@ -188,38 +191,32 @@ describe('worker catalog pre-save sync and catalog-mismatch retry', () => {
           offlineFallback: false,
         };
       }),
-      fetchServerReport: vi.fn(async (): Promise<ServerReportReadResult> => {
-        if (!simulatedHeaderCreatedBySelfDiagnostic) {
-          return { exists: false, updatedAtMs: null };
-        }
-        return {
-          exists: true,
-          updatedAtMs: 1700000000000,
-          data: {
-            status: 'opening_saved',
-            reportedByUid: user.uid,
-            reportedByName: 'Ana',
-          },
-        };
-      }),
+      fetchServerReport: vi.fn(async (): Promise<ServerReportReadResult> => ({
+        exists: false,
+        updatedAtMs: null,
+      })),
       fetchServerEntries: vi.fn(async () => ({})),
       commitChunks: vi.fn(async (chunks: BatchChunkCommitInput[]) => {
-        commitCount += 1;
-        if (commitCount === 1) {
-          const permErr = new Error('Missing or insufficient permissions.');
-          (permErr as Error & { code: string }).code = 'permission-denied';
-          throw permErr;
+        const hasEntries = chunks.some((c) => c.entryOps.length > 0);
+        if (hasEntries) {
+          entryCommitAttempt += 1;
+          if (entryCommitAttempt === 1) {
+            const permErr = new Error('Missing or insufficient permissions.');
+            (permErr as Error & { code: string }).code = 'permission-denied';
+            throw permErr;
+          }
         }
-        chunks.forEach((c) =>
+        chunks.forEach((c) => {
+          if (c.reportWrite) {
+            committedReportStatuses.push(c.reportWrite.payload.status);
+          }
           c.entryOps.forEach((op) => {
             committedUnits.push(op.createFields.unit);
-          }),
-        );
+          });
+        });
         return { queuedOffline: false };
       }),
       diagnoseChunkFailure: vi.fn(async () => {
-        // Real diagnoseChunkFailure writes dailyReports/{id} before testing each entry
-        simulatedHeaderCreatedBySelfDiagnostic = true;
         throw new DiagnosticSaveError({
           title: 'El catálogo de "Queso" cambió en el servidor',
           detail:
@@ -250,16 +247,20 @@ describe('worker catalog pre-save sync and catalog-mismatch retry', () => {
       io,
     });
 
-    expect(result).toEqual({ queuedOffline: false, catalogUpdatedDuringSave: true });
+    expect(result).toEqual({
+      queuedOffline: false,
+      catalogUpdatedDuringSave: true,
+      savedCount: 1,
+    });
     expect(onStatusMessage).toHaveBeenCalledTimes(1);
     expect(onStatusMessage).toHaveBeenCalledWith('El jefe actualizó los insumos, actualizando…');
     expect(io.fetchServerItems).toHaveBeenCalledTimes(2);
-    expect(io.commitChunks).toHaveBeenCalledTimes(2);
     expect(committedUnits).toEqual(['loncha']);
+    expect(committedReportStatuses).toEqual(['open', 'opening_saved']);
     expect(onCatalogSynced).toHaveBeenCalledWith([updatedServerItem]);
   });
 
-  it('retries at most once and throws full uncut DiagnosticSaveError if second attempt still fails', async () => {
+  it('retries at most once and throws PartialBatchSaveError with full uncut diagnostic if second attempt still fails', async () => {
     const workspace = makeWorkspace();
     const user = makeWorkerUser();
     const row = makeDraftRow();
@@ -276,6 +277,7 @@ describe('worker catalog pre-save sync and catalog-mismatch retry', () => {
     });
 
     const onStatusMessage = vi.fn();
+    let finalReportCommitted = false;
     const io: Partial<WorkerSaveIO> = {
       syncClock: vi.fn(async () => {}),
       getServerTimestampValue: () => 'SERVER_TS',
@@ -286,10 +288,16 @@ describe('worker catalog pre-save sync and catalog-mismatch retry', () => {
       })),
       fetchServerReport: vi.fn(async () => ({ exists: false, updatedAtMs: null })),
       fetchServerEntries: vi.fn(async () => ({})),
-      commitChunks: vi.fn(async () => {
-        const permErr = new Error('Missing or insufficient permissions.');
-        (permErr as Error & { code: string }).code = 'permission-denied';
-        throw permErr;
+      commitChunks: vi.fn(async (chunks: BatchChunkCommitInput[]) => {
+        if (chunks.some((c) => c.entryOps.length > 0)) {
+          const permErr = new Error('Missing or insufficient permissions.');
+          (permErr as Error & { code: string }).code = 'permission-denied';
+          throw permErr;
+        }
+        if (chunks.some((c) => c.reportWrite?.payload.status === 'opening_saved')) {
+          finalReportCommitted = true;
+        }
+        return { queuedOffline: false };
       }),
       diagnoseChunkFailure: vi.fn(async () => {
         throw fullDiagnostic;
@@ -318,14 +326,24 @@ describe('worker catalog pre-save sync and catalog-mismatch retry', () => {
       caught = err;
     }
 
-    expect(io.commitChunks).toHaveBeenCalledTimes(2);
     expect(io.diagnoseChunkFailure).toHaveBeenCalledTimes(2);
     expect(onStatusMessage).toHaveBeenCalledTimes(1);
-    expect(caught).toBeInstanceOf(DiagnosticSaveError);
-    expect((caught as DiagnosticSaveError).rawDetail).toBe(fullDiagnostic.rawDetail);
-    expect((caught as DiagnosticSaveError).failedDocumentPath).toBe(
-      fullDiagnostic.failedDocumentPath,
-    );
+    expect(finalReportCommitted).toBe(false);
+    expect(caught).toBeInstanceOf(PartialBatchSaveError);
+    const partial = caught as PartialBatchSaveError;
+    expect(partial.rawDetail).toBe(fullDiagnostic.rawDetail);
+    expect(partial.failedDocumentPath).toBe(fullDiagnostic.failedDocumentPath);
+    expect(partial.savedItems).toEqual([]);
+    expect(partial.failedItems).toHaveLength(1);
+    expect(partial.failedItems[0].attemptedValues).toEqual({
+      unit: 'kg',
+      minStock: 2,
+      targetStock: 5,
+      opening: 40,
+      added: 20,
+      closing: 0,
+      notApplicable: false,
+    });
   });
 
   it('reconcileRowsWithServerCatalog drops unassigned or moved items that have no existing entry', () => {

@@ -25,11 +25,12 @@ describe('firestore.rules structural security audit', () => {
     expect(rulesText).toContain('isWorkerWithinSchedule(');
   });
 
-  it('blocks entry creation when parent dailyReport is completed and locks catalog fields', () => {
-    expect(rulesText).toContain("get(/databases/$(database)/documents/dailyReports/$(reportId)).data.status != 'completed'");
-    expect(rulesText).toContain('incoming().itemName == existing().itemName');
-    expect(rulesText).toContain('incoming().minStock == existing().minStock');
-    expect(rulesText).toContain('incoming().targetStock == existing().targetStock');
+  it('blocks entry creation/update when parent dailyReport is completed and locks catalog fields', () => {
+    expect(rulesText).toContain("reportAfterSnap.data.status != 'completed'");
+    expect(rulesText).toContain("reportSnap.data.status != 'completed'");
+    expect(rulesText).toContain('incomingData.itemName == existingData.itemName');
+    expect(rulesText).toContain('incomingData.minStock == existingData.minStock');
+    expect(rulesText).toContain('incomingData.targetStock == existingData.targetStock');
     expect(rulesText).toContain('incoming().station == existing().station');
   });
 
@@ -41,15 +42,26 @@ describe('firestore.rules structural security audit', () => {
     });
   });
 
-  it('uses single-get helpers for worker report/entry creation and handles legacy hamburguesas station IDs', () => {
+  it('uses single-get helpers without duplicate exists+get on worker report/entry creation and handles legacy hamburguesas station IDs', () => {
     expect(rulesText).toContain('function isActiveStationWorker(wsId, station)');
     expect(rulesText).toContain('function validWorkerMember(wsId, station, memberData)');
+    expect(rulesText).toContain('function validWorkerMemberDoc(wsId, station, memberSnap)');
     expect(rulesText).toContain('function validWorkerReportCreate(wsData, report)');
     expect(rulesText).toContain('function reportAfterMatchesEntry(reportData, entry)');
     expect(rulesText).toContain('function entryMatchesItem(entry, itemData)');
+    expect(rulesText).toContain('function canCreateDailyReportEntry(reportAfterSnap, entry, itemId)');
+    expect(rulesText).toContain('function canWorkerUpdateEntry(reportSnap, incomingData, existingData)');
     expect(rulesText).toContain("itemData.station == 'hamburguesas' && entry.station == 'comida_rapida'");
-    expect(rulesText).toContain('entryMatchesItem(\n                incoming(),\n                get(/databases/$(database)/documents/items/$(itemId)).data');
+    expect(rulesText).toContain('entryMatchesItem(\n              entry,\n              get(/databases/$(database)/documents/items/$(itemId)).data');
     expect(rulesText).not.toContain('exists(/databases/$(database)/documents/items/$(itemId))');
+
+    // Worker entry create reuses single getAfter(dailyReports) and never reads dailyReports via exists/get separately
+    const createHelperMatch = rulesText.match(
+      /function canCreateDailyReportEntry\(reportAfterSnap, entry, itemId\) \{[\s\S]*?\n    \}/,
+    );
+    expect(createHelperMatch).not.toBeNull();
+    expect(createHelperMatch![0]).not.toContain('exists(/databases/$(database)/documents/dailyReports/');
+    expect(createHelperMatch![0]).not.toContain('get(/databases/$(database)/documents/dailyReports/');
   });
 
   it('validates capture type fields on items (inputType, int packSize > 1, labels <= 20, capacity > 0) without widening worker writes', () => {

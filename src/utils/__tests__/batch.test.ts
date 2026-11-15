@@ -4,9 +4,31 @@ import {
   executeChunkedBatch,
   MAX_BATCH_SIZE,
   PartialBatchError,
+  WORKER_ENTRY_BATCH_SIZE,
 } from '../batch';
 
 describe('batch.ts (lotes pequeños de máximo 8 documentos y reintento)', () => {
+  it('chunks worker entry arrays with WORKER_ENTRY_BATCH_SIZE = 4 for 1, 4, 5, 25, and 60 items', () => {
+    expect(WORKER_ENTRY_BATCH_SIZE).toBe(4);
+    expect(chunkArrayWithLimit([1], WORKER_ENTRY_BATCH_SIZE)).toEqual([[1]]);
+
+    const four = Array.from({ length: 4 }, (_, i) => i + 1);
+    expect(chunkArrayWithLimit(four, WORKER_ENTRY_BATCH_SIZE).map((c) => c.length)).toEqual([4]);
+
+    const five = Array.from({ length: 5 }, (_, i) => i + 1);
+    expect(chunkArrayWithLimit(five, WORKER_ENTRY_BATCH_SIZE).map((c) => c.length)).toEqual([4, 1]);
+
+    const twentyFive = Array.from({ length: 25 }, (_, i) => i + 1);
+    const chunks25 = chunkArrayWithLimit(twentyFive, WORKER_ENTRY_BATCH_SIZE);
+    expect(chunks25.map((c) => c.length)).toEqual([4, 4, 4, 4, 4, 4, 1]);
+    expect(chunks25.every((c) => c.length <= 4)).toBe(true);
+
+    const sixty = Array.from({ length: 60 }, (_, i) => i + 1);
+    const chunks60 = chunkArrayWithLimit(sixty, WORKER_ENTRY_BATCH_SIZE);
+    expect(chunks60).toHaveLength(15);
+    expect(chunks60.every((c) => c.length === 4)).toBe(true);
+  });
+
   it('chunks arrays cleanly up to MAX_BATCH_SIZE = 8', () => {
     expect(MAX_BATCH_SIZE).toBe(8);
     expect(chunkArrayWithLimit([])).toEqual([]);

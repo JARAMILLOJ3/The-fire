@@ -1441,12 +1441,39 @@ export function detectDashboardConsumptionAnomalies(params: {
   return anomalies;
 }
 
+export interface SaveItemAttemptValues {
+  unit: string;
+  minStock: number;
+  targetStock: number;
+  opening: number;
+  added: number;
+  closing: number;
+  notApplicable?: boolean;
+}
+
+export interface SavedItemOutcome {
+  itemId: string;
+  itemName: string;
+}
+
+export interface FailedItemOutcome {
+  itemId: string;
+  itemName: string;
+  reason: string;
+  code?: string;
+  rawDetail?: string;
+  failedDocumentPath: string;
+  attemptedValues: SaveItemAttemptValues;
+}
+
 export interface StationSaveErrorInfo {
   title: string;
   detail: string;
   code?: string;
   rawDetail?: string;
   failedDocumentPath?: string;
+  savedItems?: SavedItemOutcome[];
+  failedItems?: FailedItemOutcome[];
 }
 
 export function formatStationSaveError(
@@ -1613,6 +1640,48 @@ export function formatStationSaveError(
     };
   }
 
+  const savedItems =
+    error &&
+    typeof error === 'object' &&
+    'savedItems' in error &&
+    Array.isArray((error as { savedItems?: unknown }).savedItems)
+      ? ((error as { savedItems: SavedItemOutcome[] }).savedItems)
+      : undefined;
+
+  const failedItems =
+    error &&
+    typeof error === 'object' &&
+    'failedItems' in error &&
+    Array.isArray((error as { failedItems?: unknown }).failedItems)
+      ? ((error as { failedItems: FailedItemOutcome[] }).failedItems)
+      : undefined;
+
+  if (failedItems && failedItems.length > 0) {
+    const explicitTitle =
+      error &&
+      typeof error === 'object' &&
+      'title' in error &&
+      typeof (error as { title?: unknown }).title === 'string'
+        ? (error as { title: string }).title
+        : `No se pudieron guardar ${failedItems.length} ${failedItems.length === 1 ? 'insumo' : 'insumos'}`;
+    const explicitDetail =
+      error &&
+      typeof error === 'object' &&
+      'detail' in error &&
+      typeof (error as { detail?: unknown }).detail === 'string'
+        ? (error as { detail: string }).detail
+        : rawMessage;
+    return {
+      title: explicitTitle,
+      detail: explicitDetail,
+      code: code ?? 'partial-save-failed',
+      rawDetail: fullRawDetail,
+      failedDocumentPath,
+      savedItems,
+      failedItems,
+    };
+  }
+
   return {
     title: 'No se pudo guardar el inventario',
     detail:
@@ -1621,6 +1690,23 @@ export function formatStationSaveError(
     rawDetail: fullRawDetail,
     failedDocumentPath,
   };
+}
+
+export function formatAttemptedValuesSummary(values: SaveItemAttemptValues): string {
+  const parts = [
+    `unidad="${values.unit}"`,
+    `mínimo=${values.minStock}`,
+    `ideal=${values.targetStock}`,
+    `apertura=${values.opening}`,
+  ];
+  if (values.added > 0) {
+    parts.push(`surtido=${values.added}`);
+  }
+  parts.push(`cierre=${values.closing}`);
+  if (values.notApplicable) {
+    parts.push('No aplica=sí');
+  }
+  return parts.join(', ');
 }
 
 export function buildStationSaveErrorCopyText(info: StationSaveErrorInfo): string {
@@ -1632,6 +1718,29 @@ export function buildStationSaveErrorCopyText(info: StationSaveErrorInfo): strin
     lines.push(`Documento: ${info.failedDocumentPath}`);
   }
   lines.push(`Motivo completo: ${info.detail}`);
+
+  if (info.savedItems && info.savedItems.length > 0) {
+    lines.push(
+      `Insumos guardados (${info.savedItems.length}): ${info.savedItems.map((s) => s.itemName).join(', ')}`,
+    );
+  }
+
+  if (info.failedItems && info.failedItems.length > 0) {
+    lines.push(`Insumos con error (${info.failedItems.length}):`);
+    info.failedItems.forEach((f, idx) => {
+      lines.push(
+        `${idx + 1}. ${f.itemName} [${f.itemId}]`,
+        `   Documento: ${f.failedDocumentPath}`,
+        ...(f.code ? [`   Código: ${f.code}`] : []),
+        `   Valores intentados: ${formatAttemptedValuesSummary(f.attemptedValues)}`,
+        `   Motivo: ${f.reason}`,
+        ...(f.rawDetail && f.rawDetail.trim() && f.rawDetail.trim() !== f.reason.trim()
+          ? [`   Detalle técnico: ${f.rawDetail.trim()}`]
+          : []),
+      );
+    });
+  }
+
   if (info.rawDetail && info.rawDetail.trim() && info.rawDetail.trim() !== info.detail.trim()) {
     lines.push(`Detalle técnico:\n${info.rawDetail.trim()}`);
   }

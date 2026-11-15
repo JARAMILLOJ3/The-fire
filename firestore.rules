@@ -170,13 +170,17 @@ service cloud.firestore {
         );
     }
 
+    function validWorkerMemberDoc(wsId, station, memberSnap) {
+      return memberSnap != null
+        && validWorkerMember(wsId, station, memberSnap.data);
+    }
+
     function isActiveStationWorker(wsId, station) {
       return isVerifiedUser()
-        && exists(/databases/$(database)/documents/teamMembers/$(request.auth.uid))
-        && validWorkerMember(
+        && validWorkerMemberDoc(
           wsId,
           station,
-          get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data
+          get(/databases/$(database)/documents/teamMembers/$(request.auth.uid))
         );
     }
 
@@ -202,6 +206,41 @@ service cloud.firestore {
         && itemData.unit == entry.unit
         && itemData.minStock == entry.minStock
         && itemData.targetStock == entry.targetStock;
+    }
+
+    function canCreateDailyReportEntry(reportAfterSnap, entry, itemId) {
+      return reportAfterSnap != null
+        && reportAfterMatchesEntry(reportAfterSnap.data, entry)
+        && (
+          (
+            isActiveStationWorker(entry.workspaceId, entry.station)
+            && reportAfterSnap.data.status != 'completed'
+            && isValidWorkerOperationalDate(entry.date)
+            && isWorkerWithinSchedule(entry.workspaceId)
+            && entryMatchesItem(
+              entry,
+              get(/databases/$(database)/documents/items/$(itemId)).data
+            )
+          )
+          || canManageWorkspace(entry.workspaceId)
+        );
+    }
+
+    function canWorkerUpdateEntry(reportSnap, incomingData, existingData) {
+      return isActiveStationWorker(existingData.workspaceId, existingData.station)
+        && reportSnap != null
+        && reportSnap.data.status != 'completed'
+        && isValidWorkerOperationalDate(existingData.date)
+        && isWorkerWithinSchedule(existingData.workspaceId)
+        && incomingData.itemName == existingData.itemName
+        && incomingData.unit == existingData.unit
+        && incomingData.minStock == existingData.minStock
+        && incomingData.targetStock == existingData.targetStock
+        && incomingData.diff(existingData).affectedKeys().hasOnly([
+          'opening', 'added', 'closing', 'hasOpening', 'hasClosing',
+          'notApplicable', 'previousClosing', 'openingStatus',
+          'updatedByUid', 'updatedByName', 'updatedAt'
+        ]);
     }
 
     function isWorkspaceOwnerDoc(docData) {
@@ -805,23 +844,10 @@ service cloud.firestore {
           && incoming().updatedByUid == request.auth.uid
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time
-          && reportAfterMatchesEntry(
-            getAfter(/databases/$(database)/documents/dailyReports/$(reportId)).data,
-            incoming()
-          )
-          && (
-            (
-              isActiveStationWorker(incoming().workspaceId, incoming().station)
-              && (!exists(/databases/$(database)/documents/dailyReports/$(reportId))
-                  || get(/databases/$(database)/documents/dailyReports/$(reportId)).data.status != 'completed')
-              && isValidWorkerOperationalDate(incoming().date)
-              && isWorkerWithinSchedule(incoming().workspaceId)
-              && entryMatchesItem(
-                incoming(),
-                get(/databases/$(database)/documents/items/$(itemId)).data
-              )
-            )
-            || canManageWorkspace(incoming().workspaceId)
+          && canCreateDailyReportEntry(
+            getAfter(/databases/$(database)/documents/dailyReports/$(reportId)),
+            incoming(),
+            itemId
           );
 
         allow update: if isValidId(reportId)
@@ -838,20 +864,10 @@ service cloud.firestore {
           && incoming().updatedAt == request.time
           && incoming().updatedByUid == request.auth.uid
           && (
-            (
-              isActiveStationWorker(existing().workspaceId, existing().station)
-              && get(/databases/$(database)/documents/dailyReports/$(reportId)).data.status != 'completed'
-              && isValidWorkerOperationalDate(existing().date)
-              && isWorkerWithinSchedule(existing().workspaceId)
-              && incoming().itemName == existing().itemName
-              && incoming().unit == existing().unit
-              && incoming().minStock == existing().minStock
-              && incoming().targetStock == existing().targetStock
-              && incoming().diff(existing()).affectedKeys().hasOnly([
-                'opening', 'added', 'closing', 'hasOpening', 'hasClosing',
-                'notApplicable', 'previousClosing', 'openingStatus',
-                'updatedByUid', 'updatedByName', 'updatedAt'
-              ])
+            canWorkerUpdateEntry(
+              get(/databases/$(database)/documents/dailyReports/$(reportId)),
+              incoming(),
+              existing()
             )
             || (
               canManageWorkspace(existing().workspaceId)
