@@ -5,15 +5,19 @@ import type { InventoryItem } from '../../types';
 import {
   LEVEL_STEP_LABELS,
   computeLevelTotal,
+  computeLevelWithContainersTotal,
   computePacksTotal,
   formatLevelApproximate,
+  formatPacksQuantityWithUnit,
   formatSpanishDecimal,
+  getEffectiveItemUnit,
   getItemInputType,
   getPacksFieldLabels,
   parseQuantityInput,
   pluralizeSpanishLabel,
   sanitizeStockQuantity,
   snapQuantityToLevelStep,
+  splitLevelWithContainers,
   splitTotalToPacks,
 } from '../../utils/inventory';
 
@@ -30,7 +34,15 @@ export type CaptureControlTone =
 export interface QuantityCaptureControlProps {
   item: Pick<
     InventoryItem,
-    'id' | 'name' | 'unit' | 'inputType' | 'packSize' | 'packLabel' | 'unitLabel' | 'capacity'
+    | 'id'
+    | 'name'
+    | 'unit'
+    | 'inputType'
+    | 'packSize'
+    | 'packLabel'
+    | 'unitLabel'
+    | 'capacity'
+    | 'allowClosedContainers'
   >;
   field: 'opening' | 'added' | 'closing';
   fieldLabel: string;
@@ -47,6 +59,13 @@ export interface QuantityCaptureControlProps {
 interface LocalPacksSplit {
   packs: number;
   loose: number;
+  forValue: number;
+  hadValue: boolean;
+}
+
+interface LocalLevelSplit {
+  closed: number;
+  step: number;
   forValue: number;
   hadValue: boolean;
 }
@@ -112,6 +131,7 @@ export const QuantityCaptureControl = memo(function QuantityCaptureControl({
     inputType === 'level' && typeof item.capacity === 'number' && item.capacity > 0;
 
   const [localSplit, setLocalSplit] = useState<LocalPacksSplit | null>(null);
+  const [localLevelSplit, setLocalLevelSplit] = useState<LocalLevelSplit | null>(null);
 
   // ---------------------------------------------------------------------------
   // 1. PACKS + LOOSE MODE
@@ -182,7 +202,6 @@ export const QuantityCaptureControl = memo(function QuantityCaptureControl({
     const isMobile = variant === 'mobile';
     const boxToneClass = getCountInputToneClasses(tone, disabled);
     const btnToneClass = getStepperButtonToneClasses(tone);
-    const unitText = pluralizeSpanishLabel(labels.unitSingular, totalCount);
 
     return (
       <div className={isMobile ? 'space-y-2 min-w-0' : 'space-y-1.5 min-w-[205px]'}>
@@ -306,7 +325,7 @@ export const QuantityCaptureControl = memo(function QuantityCaptureControl({
                 tone === 'pending' ? 'text-sky-800' : 'text-stone-900'
               }`}
             >
-              = {formatSpanishDecimal(totalCount, 2)} {unitText}
+              = {formatPacksQuantityWithUnit(totalCount, item)}
             </span>
           )}
         </div>
@@ -343,20 +362,71 @@ export const QuantityCaptureControl = memo(function QuantityCaptureControl({
   }
 
   // ---------------------------------------------------------------------------
-  // 2. LEVEL SLIDER MODE (0 to 8/8 in 1/8 steps)
+  // 2. LEVEL SLIDER MODE (0 to 8/8 in 1/8 steps, optional closed containers)
   // ---------------------------------------------------------------------------
   if (isLevelConfigured) {
     const capacity = item.capacity as number;
-    const step = hasValue ? snapQuantityToLevelStep(value, capacity) : 0;
-    const stepLabel = LEVEL_STEP_LABELS[step] ?? '0';
-    const totalEquivalent = hasValue ? computeLevelTotal(step, capacity) : 0;
-    const approxText = hasValue
-      ? formatLevelApproximate(totalEquivalent, item.unit)
-      : `0 a ${formatSpanishDecimal(capacity, 2)} ${item.unit}`;
+    const effectiveUnit = getEffectiveItemUnit(item);
+    const supportsClosedContainers = Boolean(item.allowClosedContainers);
 
-    const commitStep = (nextStep: number) => {
-      const clamped = Math.max(0, Math.min(LEVEL_STEPS, Math.round(nextStep)));
-      onCommitValue(computeLevelTotal(clamped, capacity));
+    const derivedLevel = hasValue
+      ? supportsClosedContainers
+        ? splitLevelWithContainers(value, capacity)
+        : { closed: 0, step: snapQuantityToLevelStep(value, capacity) }
+      : { closed: 0, step: 0 };
+
+    const activeLevelSplit =
+      supportsClosedContainers &&
+      localLevelSplit &&
+      localLevelSplit.hadValue === hasValue &&
+      localLevelSplit.forValue === value
+        ? { closed: localLevelSplit.closed, step: localLevelSplit.step }
+        : derivedLevel;
+
+    const closedCount = supportsClosedContainers && hasValue ? activeLevelSplit.closed : 0;
+    const step = hasValue ? activeLevelSplit.step : 0;
+    const stepLabel = LEVEL_STEP_LABELS[step] ?? '0';
+    const totalEquivalent = hasValue
+      ? supportsClosedContainers
+        ? computeLevelWithContainersTotal(closedCount, step, capacity)
+        : computeLevelTotal(step, capacity)
+      : 0;
+    const approxText = hasValue
+      ? formatLevelApproximate(totalEquivalent, effectiveUnit)
+      : `0 a ${formatSpanishDecimal(capacity, 2)} ${effectiveUnit}`;
+
+    const commitLevelState = (nextClosed: number, nextStep: number) => {
+      const clampedStep = Math.max(0, Math.min(LEVEL_STEPS, Math.round(nextStep)));
+      if (!supportsClosedContainers) {
+        onCommitValue(computeLevelTotal(clampedStep, capacity));
+        return;
+      }
+      const safeClosed = Math.max(0, Math.floor(nextClosed));
+      const nextTotal = computeLevelWithContainersTotal(safeClosed, clampedStep, capacity);
+      setLocalLevelSplit({
+        closed: safeClosed,
+        step: clampedStep,
+        forValue: nextTotal,
+        hadValue: true,
+      });
+      onCommitValue(nextTotal);
+    };
+
+    const handleClosedInputChange = (raw: string, badInput: boolean) => {
+      if (badInput) return;
+      const trimmed = raw.trim();
+      if (trimmed === '') {
+        if (!hasValue || (step === 0 && onClearValue && field !== 'added')) {
+          setLocalLevelSplit(null);
+          onClearValue?.();
+          return;
+        }
+        commitLevelState(0, step);
+        return;
+      }
+      const parsed = parseQuantityInput(trimmed);
+      if (!parsed.valid) return;
+      commitLevelState(Math.floor(parsed.value), step);
     };
 
     const segmentActiveColor =
@@ -393,12 +463,64 @@ export const QuantityCaptureControl = memo(function QuantityCaptureControl({
                 : 'bg-stone-50/70 border-stone-200'
         } ${isMobile ? '' : 'min-w-[215px]'}`}
       >
+        {supportsClosedContainers && (
+          <div className="flex items-center justify-between gap-2 pb-2 border-b border-stone-200/80">
+            <label
+              htmlFor={inputId ? `${inputId}-closed` : undefined}
+              className="text-[11px] font-semibold text-stone-700"
+            >
+              Envases cerrados ({formatSpanishDecimal(capacity, 2)} {effectiveUnit})
+            </label>
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                disabled={disabled || (hasValue && closedCount <= 0)}
+                onClick={() => commitLevelState(Math.max(0, closedCount - 1), step)}
+                aria-label={`Restar envase cerrado (${fieldLabel}) ${item.name}`}
+                className={`${
+                  isMobile ? 'w-10 h-10 rounded-xl' : 'w-7 h-8 rounded-lg'
+                } border border-stone-200 bg-white text-stone-700 hover:bg-stone-100 flex items-center justify-center disabled:opacity-40 cursor-pointer`}
+              >
+                <Minus className={isMobile ? 'w-4 h-4' : 'w-3 h-3'} />
+              </button>
+              <input
+                id={inputId ? `${inputId}-closed` : undefined}
+                type="number"
+                inputMode="numeric"
+                min={0}
+                step={1}
+                disabled={disabled}
+                placeholder="0"
+                aria-label={`Envases cerrados (${fieldLabel}) de ${item.name}`}
+                value={hasValue && !disabled ? closedCount : ''}
+                onChange={(e) =>
+                  handleClosedInputChange(e.target.value, e.target.validity.badInput)
+                }
+                className={`${
+                  isMobile ? 'w-14 h-10 text-base rounded-xl' : 'w-12 h-8 text-sm rounded-lg'
+                } text-center font-mono tabular-nums font-bold bg-white border border-stone-200 text-stone-900 placeholder:text-stone-300 focus:outline-none focus:ring-2 focus:ring-orange-500`}
+              />
+              <button
+                type="button"
+                disabled={disabled}
+                onClick={() => commitLevelState(closedCount + 1, step)}
+                aria-label={`Sumar envase cerrado (${fieldLabel}) ${item.name}`}
+                className={`${
+                  isMobile ? 'w-10 h-10 rounded-xl' : 'w-7 h-8 rounded-lg'
+                } border border-stone-200 bg-white text-stone-700 hover:bg-stone-100 flex items-center justify-center disabled:opacity-40 cursor-pointer`}
+              >
+                <Plus className={isMobile ? 'w-4 h-4' : 'w-3 h-3'} />
+              </button>
+            </div>
+          </div>
+        )}
+
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-1.5">
             <button
               type="button"
               disabled={disabled || (hasValue && step <= 0)}
-              onClick={() => commitStep(hasValue ? step - 1 : 0)}
+              onClick={() => commitLevelState(closedCount, hasValue ? step - 1 : 0)}
               aria-label={`Bajar 1/8 nivel (${fieldLabel}) ${item.name}`}
               className={`${
                 isMobile ? 'w-11 h-11 rounded-xl' : 'w-8 h-8 rounded-lg'
@@ -422,7 +544,7 @@ export const QuantityCaptureControl = memo(function QuantityCaptureControl({
             <button
               type="button"
               disabled={disabled || (hasValue && step >= LEVEL_STEPS)}
-              onClick={() => commitStep(hasValue ? step + 1 : 1)}
+              onClick={() => commitLevelState(closedCount, hasValue ? step + 1 : 1)}
               aria-label={`Subir 1/8 nivel (${fieldLabel}) ${item.name}`}
               className={`${
                 isMobile ? 'w-11 h-11 rounded-xl' : 'w-8 h-8 rounded-lg'
@@ -467,7 +589,7 @@ export const QuantityCaptureControl = memo(function QuantityCaptureControl({
             disabled={disabled}
             aria-label={`${fieldLabel} (${item.name}) en fracciones de 0 a lleno`}
             value={hasValue ? step : 0}
-            onChange={(e) => commitStep(Number(e.target.value))}
+            onChange={(e) => commitLevelState(closedCount, Number(e.target.value))}
             className={`relative z-10 w-full ${
               isMobile
                 ? 'h-12 [&::-webkit-slider-thumb]:w-8 [&::-webkit-slider-thumb]:h-8 [&::-moz-range-thumb]:w-8 [&::-moz-range-thumb]:h-8'
@@ -489,7 +611,7 @@ export const QuantityCaptureControl = memo(function QuantityCaptureControl({
                 key={mark.step}
                 type="button"
                 disabled={disabled}
-                onClick={() => commitStep(mark.step)}
+                onClick={() => commitLevelState(closedCount, mark.step)}
                 className={`${
                   isMobile ? 'min-h-[44px] text-xs' : 'min-h-[32px] text-[11px]'
                 } font-mono font-bold rounded-lg border transition-colors cursor-pointer disabled:opacity-40 ${

@@ -35,6 +35,8 @@ import {
 } from '../services/bossService';
 import type { InventoryItem, StationLink, Workspace, Workstation } from '../types';
 import {
+  formatItemStockDisplay,
+  getEffectiveItemUnit,
   getItemInputType,
   pluralizeSpanishLabel,
   validateStationItemAssignment,
@@ -121,7 +123,7 @@ export function WorkstationsManager({
         (it) =>
           !term ||
           it.name.toLowerCase().includes(term) ||
-          it.unit.toLowerCase().includes(term),
+          getEffectiveItemUnit(it).toLowerCase().includes(term),
       );
   }, [assignStation, assignInitialOrderIds, activeItems, assignSearch]);
 
@@ -749,11 +751,12 @@ export function WorkstationsManager({
                     {orderedAssignItems.map((item) => {
                       const checked = assignSelectedIds.includes(item.id);
                       const mode = getItemInputType(item);
+                      const effectiveUnit = getEffectiveItemUnit(item);
                       const captureLabel =
                         mode === 'packs' && item.packSize
-                          ? `${item.packLabel || 'paquete'} de ${item.packSize} ${pluralizeSpanishLabel(item.unitLabel || item.unit, item.packSize)}`
+                          ? `${item.packLabel || 'paquete'} de ${item.packSize} ${pluralizeSpanishLabel(effectiveUnit, item.packSize)}`
                           : mode === 'level' && item.capacity
-                            ? `Nivel (${item.capacity} ${item.unit})`
+                            ? `Nivel (${item.capacity} ${effectiveUnit}${item.allowClosedContainers ? ' + cerrados' : ''})`
                             : 'Conteo';
                       const isInOtherStation =
                         item.station !== assignStation.id &&
@@ -791,8 +794,8 @@ export function WorkstationsManager({
                               ) : null}
                             </div>
                             <p className="text-xs text-stone-500 mt-0.5 truncate">
-                              {item.unit} · {captureLabel} · Mín {item.minStock} / Ideal{' '}
-                              {item.targetStock}
+                              {effectiveUnit} · {captureLabel} · Mín {formatItemStockDisplay(item.minStock, item)} / Ideal{' '}
+                              {formatItemStockDisplay(item.targetStock, item)}
                             </p>
                           </div>
                         </label>

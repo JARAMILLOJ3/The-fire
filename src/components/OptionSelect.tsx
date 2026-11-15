@@ -19,6 +19,8 @@ interface OptionSelectProps {
   required?: boolean;
   size?: 'sm' | 'md';
   id?: string;
+  disabled?: boolean;
+  disabledNote?: string;
 }
 
 export function OptionSelect({
@@ -33,6 +35,8 @@ export function OptionSelect({
   required = true,
   size = 'md',
   id,
+  disabled = false,
+  disabledNote,
 }: OptionSelectProps) {
   const presetSet = useMemo(() => new Set(options.map((opt) => opt.value)), [options]);
   const [customSelected, setCustomSelected] = useState<boolean>(
@@ -49,8 +53,14 @@ export function OptionSelect({
     setCustomSelected(Boolean(value) && !presetSet.has(value));
   }, [value, presetSet]);
 
-  const isCustomMode = customSelected || (Boolean(value) && !presetSet.has(value));
-  const selectValue = isCustomMode ? OTHER_OPTION_VALUE : presetSet.has(value) ? value : '';
+  const isCustomMode = !disabled && (customSelected || (Boolean(value) && !presetSet.has(value)));
+  const selectValue = isCustomMode
+    ? OTHER_OPTION_VALUE
+    : presetSet.has(value)
+      ? value
+      : disabled && value
+        ? value
+        : '';
 
   const controlSizeClass =
     size === 'sm'
@@ -58,6 +68,7 @@ export function OptionSelect({
       : 'min-h-[44px] px-3 py-2 text-base sm:text-sm';
 
   const handleSelectChange = (next: string) => {
+    if (disabled) return;
     if (next === OTHER_OPTION_VALUE) {
       setCustomSelected(true);
       if (value !== '') {
@@ -78,6 +89,7 @@ export function OptionSelect({
   };
 
   const handleCustomInputChange = (next: string) => {
+    if (disabled) return;
     if (next !== value) {
       internalChangeRef.current = true;
       onChange(next);
@@ -89,15 +101,23 @@ export function OptionSelect({
       <select
         id={id}
         value={selectValue}
-        required={required && !isCustomMode}
+        disabled={disabled}
+        required={required && !isCustomMode && !disabled}
         aria-label={selectAriaLabel}
         onChange={(e) => handleSelectChange(e.target.value)}
-        className={`w-full max-w-full min-w-0 ${controlSizeClass} bg-white border border-stone-200 rounded-xl text-stone-900 focus:outline-none focus:ring-2 focus:ring-orange-500`}
+        className={`w-full max-w-full min-w-0 ${controlSizeClass} border rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 ${
+          disabled
+            ? 'bg-stone-100 border-stone-200 text-stone-600 cursor-not-allowed'
+            : 'bg-white border-stone-200 text-stone-900'
+        }`}
       >
         {selectValue === '' && (
           <option value="" disabled>
             Selecciona…
           </option>
+        )}
+        {disabled && value && !presetSet.has(value) && (
+          <option value={value}>{value}</option>
         )}
         {options.map((opt) => (
           <option key={opt.value} value={opt.value}>
@@ -119,6 +139,10 @@ export function OptionSelect({
           aria-label={customAriaLabel ?? customPlaceholder}
           className={`w-full max-w-full min-w-0 ${controlSizeClass} bg-white border border-orange-300 rounded-xl text-stone-900 focus:outline-none focus:ring-2 focus:ring-orange-500`}
         />
+      )}
+
+      {disabledNote && (
+        <p className="text-[11px] font-medium text-stone-600 leading-snug">{disabledNote}</p>
       )}
     </div>
   );

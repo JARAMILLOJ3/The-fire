@@ -1,6 +1,8 @@
 import type { Timestamp } from 'firebase/firestore';
 import {
+  INVALID_LEVEL_UNIT_NAMES,
   LEVEL_STEPS,
+  LEVEL_UNIT_OPTIONS,
   MAX_PACK_LABEL_LENGTH,
   MAX_PACK_SIZE,
   MAX_STOCK_VALUE,
@@ -15,6 +17,7 @@ import type {
   DailyReportEntry,
   DraftEntryRow,
   InventoryItem,
+  PacksUnitMigrationRecord,
   ShiftSchedule,
   StationId,
   StockLevel,
@@ -98,44 +101,69 @@ export function parseQuantityInput(rawValue: string): {
   };
 }
 
-export type EntryAnomalyType = 'closing_exceeds_available' | 'extreme_stock_spike';
+export type EntryAnomalyType =
+  | 'closing_exceeds_available'
+  | 'extreme_stock_spike'
+  | 'level_restock_hint';
 
 export interface EntryAnomaly {
   itemId: string;
   itemName: string;
   unit: string;
   type: EntryAnomalyType;
+  severity?: 'warning' | 'info';
   message: string;
 }
 
 export function detectEntryAnomalies(
   row: DraftEntryRow,
   mode: 'opening' | 'closing',
+  item?: Pick<
+    InventoryItem,
+    'inputType' | 'packSize' | 'packLabel' | 'unitLabel' | 'capacity' | 'allowClosedContainers' | 'unit'
+  >,
 ): EntryAnomaly[] {
   if (row.notApplicable) return [];
   const anomalies: EntryAnomaly[] = [];
   const spikeThreshold = Math.max(row.targetStock * 3, row.minStock * 5, 500);
+  const effectiveUnit = item ? getEffectiveItemUnit(item) : row.unit;
+  const isLevel = item ? getItemInputType(item) === 'level' : false;
+  const formatVal = (val: number): string =>
+    item ? formatItemStockDisplay(val, item) : `${formatSpanishDecimal(val, 2)} ${effectiveUnit}`;
 
   if (mode === 'closing' && row.hasClosing) {
     if (row.hasOpening) {
       const available = sanitizeStockQuantity(row.opening + row.added);
       if (row.closing > available) {
-        anomalies.push({
-          itemId: row.itemId,
-          itemName: row.itemName,
-          unit: row.unit,
-          type: 'closing_exceeds_available',
-          message: `Cierre (${row.closing}) mayor a inicio + surtido (${available} ${row.unit}). ¿Faltó anotar surtido?`,
-        });
+        if (isLevel) {
+          anomalies.push({
+            itemId: row.itemId,
+            itemName: row.itemName,
+            unit: effectiveUnit,
+            type: 'level_restock_hint',
+            severity: 'info',
+            message: '¿Llegó un envase nuevo? Anótalo en Surtido',
+          });
+        } else {
+          anomalies.push({
+            itemId: row.itemId,
+            itemName: row.itemName,
+            unit: effectiveUnit,
+            type: 'closing_exceeds_available',
+            severity: 'warning',
+            message: `Cierre (${formatVal(row.closing)}) mayor a inicio + surtido (${formatVal(available)}). ¿Faltó anotar surtido?`,
+          });
+        }
       }
     }
     if (row.closing > spikeThreshold) {
       anomalies.push({
         itemId: row.itemId,
         itemName: row.itemName,
-        unit: row.unit,
+        unit: effectiveUnit,
         type: 'extreme_stock_spike',
-        message: `Cantidad muy alta (${row.closing} ${row.unit}). Verifica si hubo un error de digitación.`,
+        severity: 'warning',
+        message: `Cantidad muy alta (${formatVal(row.closing)}). Verifica si hubo un error de digitación.`,
       });
     }
   } else if (mode === 'opening' && row.hasOpening) {
@@ -144,9 +172,10 @@ export function detectEntryAnomalies(
       anomalies.push({
         itemId: row.itemId,
         itemName: row.itemName,
-        unit: row.unit,
+        unit: effectiveUnit,
         type: 'extreme_stock_spike',
-        message: `Total disponible muy alto (${totalAvailable} ${row.unit}). Verifica si hubo un error de digitación.`,
+        severity: 'warning',
+        message: `Total disponible muy alto (${formatVal(totalAvailable)}). Verifica si hubo un error de digitación.`,
       });
     }
   }
@@ -157,8 +186,9 @@ export function detectEntryAnomalies(
 export function detectReportAnomalies(
   rows: DraftEntryRow[],
   mode: 'opening' | 'closing',
+  itemsById?: Record<string, InventoryItem>,
 ): EntryAnomaly[] {
-  return rows.flatMap((row) => detectEntryAnomalies(row, mode));
+  return rows.flatMap((row) => detectEntryAnomalies(row, mode, itemsById?.[row.itemId]));
 }
 
 export type OpeningRowState =
@@ -302,6 +332,40 @@ export function getItemInputType(
   return 'count';
 }
 
+export function getEffectiveItemUnit(
+  item: Pick<InventoryItem, 'inputType' | 'unitLabel' | 'unit'>,
+): string {
+  if (getItemInputType(item) === 'packs') {
+    const looseUnit = item.unitLabel?.trim();
+    if (looseUnit) return looseUnit;
+  }
+  return item.unit?.trim() || 'und';
+}
+
+export function isInvalidLevelUnit(unit: string): boolean {
+  const clean = unit.trim().toLocaleLowerCase('es');
+  if (!clean) return true;
+  return INVALID_LEVEL_UNIT_NAMES.has(clean);
+}
+
+export function getPacksItemsNeedingUnitMigration(items: InventoryItem[]): InventoryItem[] {
+  return items.filter((item) => {
+    if (getItemInputType(item) !== 'packs') return false;
+    const looseUnit = item.unitLabel?.trim();
+    if (!looseUnit) return false;
+    return item.unit.trim() !== looseUnit;
+  });
+}
+
+export function buildPacksUnitMigrationPlan(items: InventoryItem[]): PacksUnitMigrationRecord[] {
+  return getPacksItemsNeedingUnitMigration(items).map((item) => ({
+    id: item.id,
+    name: item.name,
+    oldUnit: item.unit,
+    newUnit: item.unitLabel!.trim(),
+  }));
+}
+
 export function getPacksFieldLabels(
   item: Pick<InventoryItem, 'packLabel' | 'unitLabel' | 'unit'>,
 ): {
@@ -355,6 +419,41 @@ export function splitTotalToPacks(
   return { packs, loose };
 }
 
+export function formatPackEquivalent(
+  units: number,
+  packSize: number,
+  packLabel: string,
+): string {
+  if (!Number.isFinite(units) || units < 0 || !Number.isFinite(packSize) || packSize <= 1) {
+    return '';
+  }
+  const packsCount = units / packSize;
+  const cleanPack = packLabel.trim() || 'paquete';
+  return `= ${formatSpanishDecimal(packsCount, 2)} ${pluralizeSpanishLabel(cleanPack, packsCount)}`;
+}
+
+export function formatPacksQuantityWithUnit(
+  qty: number,
+  item: Pick<InventoryItem, 'packSize' | 'packLabel' | 'unitLabel' | 'unit'>,
+): string {
+  const safeQty = sanitizeStockQuantity(qty);
+  const unitSingular = item.unitLabel?.trim() || item.unit?.trim() || 'und';
+  const looseText = `${formatSpanishDecimal(safeQty, 2)} ${pluralizeSpanishLabel(unitSingular, safeQty)}`;
+  const packSize = item.packSize;
+  if (!Number.isFinite(packSize) || !packSize || packSize <= 1) {
+    return looseText;
+  }
+
+  const { packs, loose } = splitTotalToPacks(safeQty, packSize);
+  const packSingular = item.packLabel?.trim() || 'paquete';
+  const packText = `${packs} ${pluralizeSpanishLabel(packSingular, packs)}`;
+  if (loose > 0) {
+    const remText = `${formatSpanishDecimal(loose, 2)} ${pluralizeSpanishLabel(unitSingular, loose)}`;
+    return `${looseText} (${packText} + ${remText})`;
+  }
+  return `${looseText} (${packText})`;
+}
+
 export function computeLevelTotal(stepIndex: number, capacity: number): number {
   const safeStep = Number.isFinite(stepIndex)
     ? Math.max(0, Math.min(LEVEL_STEPS, Math.round(stepIndex)))
@@ -363,11 +462,77 @@ export function computeLevelTotal(stepIndex: number, capacity: number): number {
   return sanitizeStockQuantity((safeStep / LEVEL_STEPS) * safeCapacity);
 }
 
+export function computeLevelWithContainersTotal(
+  closedContainers: number,
+  stepIndex: number,
+  capacity: number,
+): number {
+  const safeClosed = Number.isFinite(closedContainers) ? Math.max(0, Math.floor(closedContainers)) : 0;
+  const safeCapacity = Number.isFinite(capacity) ? Math.max(0, capacity) : 0;
+  return sanitizeStockQuantity(safeClosed * safeCapacity + computeLevelTotal(stepIndex, safeCapacity));
+}
+
 export function snapQuantityToLevelStep(value: number, capacity: number): number {
   if (!Number.isFinite(capacity) || capacity <= 0) return 0;
   const safeVal = Math.max(0, Number.isFinite(value) ? value : 0);
   const ratio = Math.min(1, safeVal / capacity);
   return Math.max(0, Math.min(LEVEL_STEPS, Math.round(ratio * LEVEL_STEPS)));
+}
+
+export function splitLevelWithContainers(
+  total: number,
+  capacity: number,
+): { closed: number; step: number } {
+  if (!Number.isFinite(capacity) || capacity <= 0) return { closed: 0, step: 0 };
+  const safeTotal = sanitizeStockQuantity(total);
+  let closed = Math.floor((safeTotal + 1e-6) / capacity);
+  const remainder = Math.max(0, safeTotal - closed * capacity);
+  let step = snapQuantityToLevelStep(remainder, capacity);
+  if (step >= LEVEL_STEPS) {
+    closed += 1;
+    step = 0;
+  }
+  return { closed, step };
+}
+
+export function formatContainerFractionLabel(
+  amount: number,
+  capacity: number,
+  unit: string,
+): string {
+  if (!Number.isFinite(amount) || amount < 0 || !Number.isFinite(capacity) || capacity <= 0) {
+    return '';
+  }
+  const cleanUnit = unit.trim() || 'und';
+  const amountLabel = `${formatSpanishDecimal(amount, 2)} ${cleanUnit}`;
+  if (amount === 0) return `${amountLabel} = 0 del envase`;
+
+  const ratio = amount / capacity;
+  const whole = Math.floor(ratio + 1e-4);
+  const fracRatio = Math.max(0, ratio - whole);
+  const nearestEighth = Math.round(fracRatio * LEVEL_STEPS);
+  const isCleanEighth = Math.abs(fracRatio - nearestEighth / LEVEL_STEPS) < 0.015;
+
+  if (isCleanEighth) {
+    const normalizedWhole = whole + (nearestEighth >= LEVEL_STEPS ? 1 : 0);
+    const normalizedStep = nearestEighth >= LEVEL_STEPS ? 0 : nearestEighth;
+    const stepSymbol = LEVEL_STEP_LABELS[normalizedStep] ?? '0';
+
+    if (normalizedWhole === 0) {
+      return `${amountLabel} = ${stepSymbol} del envase`;
+    }
+    if (normalizedStep === 0) {
+      return normalizedWhole === 1
+        ? `${amountLabel} = 1 envase lleno`
+        : `${amountLabel} = ${normalizedWhole} envases`;
+    }
+    return `${amountLabel} = ${normalizedWhole} ${normalizedWhole === 1 ? 'envase' : 'envases'} + ${stepSymbol}`;
+  }
+
+  if (ratio < 1) {
+    return `${amountLabel} ≈ ${formatSpanishDecimal(ratio, 2)} del envase`;
+  }
+  return `${amountLabel} ≈ ${formatSpanishDecimal(ratio, 2)} envases`;
 }
 
 export function formatSpanishDecimal(value: number, maxDecimals = 2): string {
@@ -387,30 +552,59 @@ export function formatLevelApproximate(value: number, unit: string): string {
   return `≈ ${formatSpanishDecimal(safeVal, maxDecimals)} ${unit}`;
 }
 
-export function formatPreviousClosingForItem(
-  previousClosing: number,
+export function formatItemStockDisplay(
+  qty: number,
   item: Pick<InventoryItem, 'inputType' | 'packSize' | 'packLabel' | 'unitLabel' | 'capacity' | 'unit'>,
 ): string {
   const inputType = getItemInputType(item);
+  const effectiveUnit = getEffectiveItemUnit(item);
+
+  if (inputType === 'packs') {
+    return formatPacksQuantityWithUnit(qty, item);
+  }
+  if (inputType === 'level') {
+    return formatLevelApproximate(qty, effectiveUnit);
+  }
+  return `${formatSpanishDecimal(qty, 2)} ${effectiveUnit}`;
+}
+
+export function formatPreviousClosingForItem(
+  previousClosing: number,
+  item: Pick<
+    InventoryItem,
+    'inputType' | 'packSize' | 'packLabel' | 'unitLabel' | 'capacity' | 'allowClosedContainers' | 'unit'
+  >,
+): string {
+  const inputType = getItemInputType(item);
+  const effectiveUnit = getEffectiveItemUnit(item);
+
   if (inputType === 'packs' && typeof item.packSize === 'number' && item.packSize > 1) {
     const { packs, loose } = splitTotalToPacks(previousClosing, item.packSize);
     const packLabel = pluralizeSpanishLabel(item.packLabel?.trim() || 'paquete', packs);
-    const unitBase = item.unitLabel?.trim() || item.unit;
-    const totalLabel = `${formatSpanishDecimal(previousClosing, 2)} ${pluralizeSpanishLabel(unitBase, previousClosing)}`;
+    const totalLabel = `${formatSpanishDecimal(previousClosing, 2)} ${pluralizeSpanishLabel(effectiveUnit, previousClosing)}`;
     if (loose > 0) {
-      const looseLabel = pluralizeSpanishLabel(unitBase, loose);
+      const looseLabel = pluralizeSpanishLabel(effectiveUnit, loose);
       return `${packs} ${packLabel} + ${formatSpanishDecimal(loose, 2)} ${looseLabel} (${totalLabel})`;
     }
     return `${packs} ${packLabel} (${totalLabel})`;
   }
 
   if (inputType === 'level' && typeof item.capacity === 'number' && item.capacity > 0) {
+    if (item.allowClosedContainers && previousClosing > item.capacity) {
+      const { closed, step } = splitLevelWithContainers(previousClosing, item.capacity);
+      const closedLabel = `${closed} ${closed === 1 ? 'cerrado' : 'cerrados'}`;
+      if (step === 0) {
+        return `${closedLabel} (${formatLevelApproximate(previousClosing, effectiveUnit)})`;
+      }
+      const mark = LEVEL_STEP_LABELS[step] ?? '0';
+      return `${closedLabel} + ${mark} (${formatLevelApproximate(previousClosing, effectiveUnit)})`;
+    }
     const step = snapQuantityToLevelStep(previousClosing, item.capacity);
     const mark = LEVEL_STEP_LABELS[step] ?? '0';
-    return `${mark} (${formatLevelApproximate(previousClosing, item.unit)})`;
+    return `${mark} (${formatLevelApproximate(previousClosing, effectiveUnit)})`;
   }
 
-  return `${formatSpanishDecimal(previousClosing, 2)} ${item.unit}`;
+  return `${formatSpanishDecimal(previousClosing, 2)} ${effectiveUnit}`;
 }
 
 export interface PacksPurchaseSummary {
@@ -433,7 +627,7 @@ export function getPacksPurchaseSummary(
   const packs = Math.ceil(suggestedUnits / packSize);
   const equivalentUnits = sanitizeStockQuantity(packs * packSize);
   const packLabelFormatted = pluralizeSpanishLabel(item.packLabel?.trim() || 'paquete', packs);
-  const unitBase = item.unitLabel?.trim() || item.unit || 'und';
+  const unitBase = getEffectiveItemUnit(item);
   const unitLabelFormatted = pluralizeSpanishLabel(unitBase, equivalentUnits);
 
   return {
@@ -443,6 +637,56 @@ export function getPacksPurchaseSummary(
     unitLabelFormatted,
     text: `Comprar: ${packs} ${packLabelFormatted} (${formatSpanishDecimal(equivalentUnits, 2)} ${unitLabelFormatted})`,
   };
+}
+
+export interface LevelPurchaseSummary {
+  roundedQty: number;
+  containers: number | null;
+  unit: string;
+  text: string;
+}
+
+export function getLevelPurchaseSummary(
+  suggestedUnits: number,
+  item: Pick<InventoryItem, 'inputType' | 'capacity' | 'unit' | 'unitLabel'>,
+): LevelPurchaseSummary | null {
+  if (getItemInputType(item) !== 'level') return null;
+  if (!Number.isFinite(suggestedUnits) || suggestedUnits <= 0) return null;
+
+  const unit = getEffectiveItemUnit(item);
+  const capacity = item.capacity;
+  if (typeof capacity === 'number' && Number.isFinite(capacity) && capacity > 0) {
+    const containers = Math.ceil(suggestedUnits / capacity);
+    const roundedQty = sanitizeStockQuantity(containers * capacity);
+    return {
+      roundedQty,
+      containers,
+      unit,
+      text: `Comprar: ${formatSpanishDecimal(roundedQty, 2)} ${unit} (aprox.)`,
+    };
+  }
+
+  const roundedQty = sanitizeStockQuantity(suggestedUnits);
+  return {
+    roundedQty,
+    containers: null,
+    unit,
+    text: `Comprar: ${formatSpanishDecimal(roundedQty, 2)} ${unit} (aprox.)`,
+  };
+}
+
+export function formatPurchaseRecommendation(
+  suggestedUnits: number,
+  item: Pick<InventoryItem, 'inputType' | 'packSize' | 'packLabel' | 'unitLabel' | 'capacity' | 'unit'>,
+): string {
+  const packsSummary = getPacksPurchaseSummary(suggestedUnits, item);
+  if (packsSummary) return packsSummary.text;
+  const levelSummary = getLevelPurchaseSummary(suggestedUnits, item);
+  if (levelSummary) return levelSummary.text;
+  if (suggestedUnits > 0) {
+    return `Pedir +${formatSpanishDecimal(suggestedUnits, 2)} ${getEffectiveItemUnit(item)}`;
+  }
+  return 'Revisar';
 }
 
 export function normalizeCatalogItemName(name: string): string {
@@ -522,6 +766,13 @@ export function validateCatalogItemInput(params: {
         warning: null,
       };
     }
+    if (cleanUnit !== cleanUnitLabel) {
+      return {
+        valid: false,
+        error: `En Paquetes + sueltas, la unidad base debe coincidir con "${cleanUnitLabel}".`,
+        warning: null,
+      };
+    }
     if (
       typeof params.packSize !== 'number' ||
       !Number.isFinite(params.packSize) ||
@@ -536,6 +787,13 @@ export function validateCatalogItemInput(params: {
       };
     }
   } else if (inputType === 'level') {
+    if (isInvalidLevelUnit(cleanUnit)) {
+      return {
+        valid: false,
+        error: 'En tipo Nivel (barra) usa una unidad de medida real (L, ml, kg, g); no se permite "und" ni empaques.',
+        warning: null,
+      };
+    }
     if (
       typeof params.capacity !== 'number' ||
       !Number.isFinite(params.capacity) ||
@@ -583,6 +841,13 @@ export function getUnitSelectOptions(): Array<{ value: string; label: string }> 
   }));
 }
 
+export function getLevelUnitSelectOptions(): Array<{ value: string; label: string }> {
+  return LEVEL_UNIT_OPTIONS.map((unit) => ({
+    value: unit,
+    label: unit === 'L' ? 'L (litros)' : unit === 'kg' ? 'kg (kilos)' : unit,
+  }));
+}
+
 export function parseCaptureDecimalInput(rawValue: string): number {
   const normalized = rawValue.trim().replace(',', '.');
   if (!normalized) return Number.NaN;
@@ -595,12 +860,14 @@ export function buildItemCaptureFields(draft: {
   packLabel: string;
   unitLabel: string;
   capacityInput: string;
+  allowClosedContainers?: boolean;
 }): {
   inputType: CaptureInputType;
   packSize?: number;
   packLabel?: string;
   unitLabel?: string;
   capacity?: number;
+  allowClosedContainers?: boolean;
 } {
   if (draft.inputType === 'packs') {
     return {
@@ -614,6 +881,7 @@ export function buildItemCaptureFields(draft: {
     return {
       inputType: 'level',
       capacity: parseCaptureDecimalInput(draft.capacityInput),
+      ...(draft.allowClosedContainers ? { allowClosedContainers: true } : {}),
     };
   }
   return { inputType: 'count' };
@@ -770,12 +1038,17 @@ export function buildWhatsAppShoppingList(
     lines.push(`*${station.name}* (${station.workerName})`);
     stationRows.forEach((r) => {
       const packsSummary = getPacksPurchaseSummary(r.suggestedBuy, r.item);
+      const levelSummary = getLevelPurchaseSummary(r.suggestedBuy, r.item);
+      const effectiveUnit = getEffectiveItemUnit(r.item);
       const qtyText = packsSummary
         ? packsSummary.text
-        : r.suggestedBuy > 0
-          ? `Pedir ${r.suggestedBuy} ${r.item.unit}`
-          : 'Revisar reposición';
-      lines.push(`- ${r.item.name}: queda ${r.currentStock} ${r.item.unit} (${qtyText})`);
+        : levelSummary
+          ? levelSummary.text
+          : r.suggestedBuy > 0
+            ? `Pedir ${r.suggestedBuy} ${effectiveUnit}`
+            : 'Revisar reposición';
+      const stockText = formatItemStockDisplay(r.currentStock ?? 0, r.item);
+      lines.push(`- ${r.item.name}: queda ${stockText} (${qtyText})`);
     });
     lines.push('');
   });
@@ -784,7 +1057,8 @@ export function buildWhatsAppShoppingList(
     lines.push('*Pronto a acabarse (Vigilar):*');
     lowSoon.forEach((r) => {
       const stName = stations.find((s) => s.id === r.item.station)?.name ?? r.item.station;
-      lines.push(`- ${r.item.name} (${stName}): queda ${r.currentStock} ${r.item.unit}`);
+      const stockText = formatItemStockDisplay(r.currentStock ?? 0, r.item);
+      lines.push(`- ${r.item.name} (${stName}): queda ${stockText}`);
     });
   }
 
@@ -827,18 +1101,37 @@ export function buildDailyCsvContent(
         ? 'Provisional (solo apertura)'
         : getStockLevelMeta(r.stockLevel).label;
 
+    const effectiveUnit = getEffectiveItemUnit(r.item);
+    const inputType = getItemInputType(r.item);
+    const formatCsvQty = (qty: number): string | number => {
+      if (inputType === 'packs' || inputType === 'level') {
+        return formatItemStockDisplay(qty, r.item);
+      }
+      return qty;
+    };
+
+    const suggestedCell = !r.hasCountedClosing
+      ? 0
+      : inputType === 'packs' || inputType === 'level'
+        ? r.suggestedBuy > 0
+          ? formatPurchaseRecommendation(r.suggestedBuy, r.item)
+          : 0
+        : r.suggestedBuy;
+
     return [
       escapeCsvCell(dateStr),
       escapeCsvCell(stationNameMap.get(r.item.station) ?? r.item.station),
       escapeCsvCell(r.item.name),
-      escapeCsvCell(r.item.unit),
-      escapeCsvCell(r.entry?.hasOpening && !r.isNotApplicable ? r.entry.opening : ''),
-      escapeCsvCell(r.entry && !r.isNotApplicable ? r.entry.added : ''),
-      escapeCsvCell(r.hasCountedClosing && r.currentStock !== null ? r.currentStock : ''),
-      escapeCsvCell(r.consumed !== null ? r.consumed : ''),
-      escapeCsvCell(r.item.minStock),
+      escapeCsvCell(effectiveUnit),
+      escapeCsvCell(r.entry?.hasOpening && !r.isNotApplicable ? formatCsvQty(r.entry.opening) : ''),
+      escapeCsvCell(r.entry && !r.isNotApplicable ? formatCsvQty(r.entry.added) : ''),
+      escapeCsvCell(
+        r.hasCountedClosing && r.currentStock !== null ? formatCsvQty(r.currentStock) : '',
+      ),
+      escapeCsvCell(r.consumed !== null ? formatCsvQty(r.consumed) : ''),
+      escapeCsvCell(formatCsvQty(r.item.minStock)),
       escapeCsvCell(statusLabel),
-      escapeCsvCell(r.hasCountedClosing ? r.suggestedBuy : 0),
+      escapeCsvCell(suggestedCell),
     ];
   });
 
@@ -939,7 +1232,7 @@ export function buildWeeklyStationHistory(params: {
         stationItems.forEach((item) => {
           const entry = entries[item.id];
           if (!entry || entry.notApplicable) return;
-          if (entry.hasOpening && entry.hasClosing) {
+          if (entry.hasOpening && entry.hasClosing && getItemInputType(item) !== 'level') {
             const available = sanitizeStockQuantity(entry.opening + entry.added);
             if (entry.closing > available) {
               anomalyCount += 1;
@@ -1021,13 +1314,22 @@ export function detectDashboardConsumptionAnomalies(params: {
 
     const stationName = stationNameMap.get(row.item.station) ?? row.item.station;
     const available = sanitizeStockQuantity(entry.opening + entry.added);
+    const inputType = getItemInputType(row.item);
+    const effectiveUnit = getEffectiveItemUnit(row.item);
 
     if (entry.hasOpening && entry.closing > available) {
+      if (inputType === 'level') {
+        // En tipo nivel, un incremento sin surtido se trata como reposición y no como anomalía
+        return;
+      }
       const excess = sanitizeStockQuantity(entry.closing - available);
+      const closingText = formatItemStockDisplay(entry.closing, row.item);
+      const availableText = formatItemStockDisplay(available, row.item);
+      const excessText = formatItemStockDisplay(excess, row.item);
       anomalies.push({
         itemId: row.item.id,
         itemName: row.item.name,
-        unit: row.item.unit,
+        unit: effectiveUnit,
         stationId: row.item.station,
         stationName,
         kind: 'closing_exceeds_available',
@@ -1035,7 +1337,7 @@ export function detectDashboardConsumptionAnomalies(params: {
         added: entry.added,
         closing: entry.closing,
         consumed: 0,
-        summary: `Cierre (${entry.closing} ${row.item.unit}) mayor que inicio + surtido (${available} ${row.item.unit}). Sobra +${excess} ${row.item.unit}.`,
+        summary: `Cierre (${closingText}) mayor que inicio + surtido (${availableText}). Sobra +${excessText}.`,
       });
       return;
     }
@@ -1062,10 +1364,12 @@ export function detectDashboardConsumptionAnomalies(params: {
       const roundedAvg = Math.round(avg * 10) / 10;
       if (avg > 0 && row.consumed >= avg * 1.8 && row.consumed - avg >= 2) {
         const ratio = Math.round((row.consumed / avg) * 10) / 10;
+        const consumedText = formatItemStockDisplay(row.consumed, row.item);
+        const avgText = formatItemStockDisplay(roundedAvg, row.item);
         anomalies.push({
           itemId: row.item.id,
           itemName: row.item.name,
-          unit: row.item.unit,
+          unit: effectiveUnit,
           stationId: row.item.station,
           stationName,
           kind: 'above_average_consumption',
@@ -1076,7 +1380,7 @@ export function detectDashboardConsumptionAnomalies(params: {
           averageConsumed: roundedAvg,
           ratioToAverage: ratio,
           sampleDays: priorSamples.length,
-          summary: `Consumo de ${row.consumed} ${row.item.unit} (${ratio}x su promedio de ${roundedAvg} ${row.item.unit} en ${priorSamples.length} días).`,
+          summary: `Consumo de ${consumedText} (${ratio}x su promedio de ${avgText} en ${priorSamples.length} días).`,
         });
       }
     }

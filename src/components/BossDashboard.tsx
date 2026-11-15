@@ -22,6 +22,7 @@ import {
   Trash2,
   TrendingUp,
   Users,
+  X,
 } from 'lucide-react';
 import { WORKER_GRACE_MINUTES } from '../constants';
 import type {
@@ -29,6 +30,7 @@ import type {
   DailyReport,
   DailyReportEntry,
   InventoryItem,
+  PacksUnitMigrationRecord,
   ShiftSchedule,
   StationId,
   Workspace,
@@ -41,10 +43,15 @@ import {
   detectDashboardConsumptionAnomalies,
   downloadDailyCsvReport,
   formatDateHuman,
+  formatItemStockDisplay,
+  formatPurchaseRecommendation,
   formatTimeShort,
-  getPacksPurchaseSummary,
+  getEffectiveItemUnit,
+  getItemInputType,
   getStockLevelMeta,
   hasTargetBelowMin,
+  pluralizeSpanishLabel,
+  sanitizeStockQuantity,
 } from '../utils/inventory';
 import { getBogotaNowParts } from '../utils/date';
 import type { ResetScope } from '../utils/reset';
@@ -86,12 +93,15 @@ interface BossDashboardProps {
   onGoToTeam: () => void;
   onOpenScheduleModal: () => void;
   onResetComplete: (scope: ResetScope) => void;
+  migratedPacksNotice?: PacksUnitMigrationRecord[];
+  onDismissMigratedPacksNotice?: () => void;
 }
 
 type ViewTab = 'compras' | 'completo';
 type StockFilter = 'todos' | 'comprar' | 'medio' | 'suficiente' | 'sin_dato';
 
 interface OpeningDiffItem {
+  item: InventoryItem;
   itemId: string;
   itemName: string;
   unit: string;
@@ -114,11 +124,6 @@ function getTimeGreeting(): string {
   if (hour < 12) return 'Buenos días';
   if (hour < 19) return 'Buenas tardes';
   return 'Buenas noches';
-}
-
-function formatQty(val: number): string {
-  const rounded = Math.round(val * 100) / 100;
-  return Number.isInteger(rounded) ? String(rounded) : String(rounded);
 }
 
 function formatSignedDelta(delta: number): string {
@@ -151,6 +156,8 @@ export function BossDashboard({
   onGoToTeam,
   onOpenScheduleModal,
   onResetComplete,
+  migratedPacksNotice = [],
+  onDismissMigratedPacksNotice,
 }: BossDashboardProps) {
   const [viewTab, setViewTab] = useState<ViewTab>('compras');
   const [stationFilter, setStationFilter] = useState<'all' | StationId>('all');
@@ -246,9 +253,10 @@ export function BossDashboard({
         const prev = entry.previousClosing as number;
         byStation[row.item.station].adjusted += 1;
         adjustedItems.push({
+          item: row.item,
           itemId: row.item.id,
           itemName: row.item.name,
-          unit: row.item.unit,
+          unit: getEffectiveItemUnit(row.item),
           stationId: row.item.station,
           stationName: stationMap[row.item.station]?.name ?? row.item.station,
           previousClosing: prev,
@@ -545,6 +553,39 @@ export function BossDashboard({
         </div>
       )}
 
+      {migratedPacksNotice.length > 0 && (
+        <div
+          role="status"
+          className="bg-sky-50 border border-sky-200 rounded-2xl px-4 sm:px-5 py-3.5 flex items-start justify-between gap-3 text-xs sm:text-sm text-sky-950 no-print"
+        >
+          <div className="space-y-1 min-w-0">
+            <p className="font-bold">
+              Unidad actualizada en {migratedPacksNotice.length}{' '}
+              {migratedPacksNotice.length === 1 ? 'insumo por paquetes' : 'insumos por paquetes'} (cantidades conservadas)
+            </p>
+            <p className="text-xs text-sky-900">
+              {migratedPacksNotice
+                .map(
+                  (rec) =>
+                    `${rec.name} (${rec.oldUnit} → ${pluralizeSpanishLabel(rec.newUnit, 2)})`,
+                )
+                .join(' · ')}
+              . Verifica que el mínimo y el ideal estén en unidades sueltas.
+            </p>
+          </div>
+          {onDismissMigratedPacksNotice && (
+            <button
+              type="button"
+              onClick={onDismissMigratedPacksNotice}
+              aria-label="Cerrar aviso de actualización"
+              className="min-w-[36px] min-h-[36px] flex items-center justify-center text-sky-700 hover:bg-sky-100 rounded-lg shrink-0 cursor-pointer"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Catalog threshold warning if any item has targetStock < minStock */}
       {targetBelowMinCount > 0 && (
         <div
@@ -833,11 +874,11 @@ export function BossDashboard({
                     <p className="text-xs text-stone-600 truncate">
                       {diff.stationName} · Ayer quedó{' '}
                       <span className="font-mono tabular-nums font-semibold text-stone-800">
-                        {formatQty(diff.previousClosing)}
+                        {formatItemStockDisplay(diff.previousClosing, diff.item)}
                       </span>{' '}
                       → Hoy abrió{' '}
                       <span className="font-mono tabular-nums font-semibold text-stone-900">
-                        {formatQty(diff.opening)} {diff.unit}
+                        {formatItemStockDisplay(diff.opening, diff.item)}
                       </span>
                     </p>
                   </div>
@@ -1177,7 +1218,6 @@ export function BossDashboard({
                   <div className="divide-y divide-stone-100">
                     {group.rows.map((row) => {
                       const meta = getStockLevelMeta(row.stockLevel);
-                      const packsSummary = getPacksPurchaseSummary(row.suggestedBuy, row.item);
                       return (
                         <div
                           key={row.item.id}
@@ -1201,18 +1241,16 @@ export function BossDashboard({
                             <p className="text-xs text-stone-600 font-mono tabular-nums mt-0.5">
                               Queda:{' '}
                               <strong className="text-stone-900">
-                                {row.currentStock} {row.item.unit}
+                                {formatItemStockDisplay(row.currentStock ?? 0, row.item)}
                               </strong>{' '}
-                              · Mínimo: {row.item.minStock} {row.item.unit}
+                              · Mínimo: {formatItemStockDisplay(row.item.minStock, row.item)}
                             </p>
                           </div>
 
                           <div className="flex items-center justify-between sm:justify-end gap-3 shrink-0 font-mono tabular-nums">
                             {row.suggestedBuy > 0 ? (
                               <span className="text-sm font-bold text-red-700 whitespace-nowrap">
-                                {packsSummary
-                                  ? packsSummary.text
-                                  : `Pedir +${row.suggestedBuy} ${row.item.unit}`}
+                                {formatPurchaseRecommendation(row.suggestedBuy, row.item)}
                               </span>
                             ) : hasTargetBelowMin(row.item.minStock, row.item.targetStock) ? (
                               <span className="text-xs font-semibold text-amber-800 whitespace-nowrap">
@@ -1271,8 +1309,9 @@ export function BossDashboard({
 
                     {hasOpeningDiff && row.entry && (
                       <p className="text-xs text-amber-800 font-mono tabular-nums">
-                        Apertura corregida: ayer {formatQty(row.entry.previousClosing as number)} → hoy{' '}
-                        {formatQty(row.entry.opening)}
+                        Apertura corregida: ayer{' '}
+                        {formatItemStockDisplay(row.entry.previousClosing as number, row.item)} → hoy{' '}
+                        {formatItemStockDisplay(row.entry.opening, row.item)}
                       </p>
                     )}
 
@@ -1283,24 +1322,22 @@ export function BossDashboard({
                           {row.isNotApplicable
                             ? 'No aplica'
                             : row.hasCountedClosing && row.currentStock !== null
-                              ? `${row.currentStock} ${row.item.unit}`
+                              ? formatItemStockDisplay(row.currentStock, row.item)
                               : row.isProvisional && row.provisionalStock !== null
-                                ? `${row.provisionalStock} ${row.item.unit} (Provisional)`
+                                ? `${formatItemStockDisplay(row.provisionalStock, row.item)} (Provisional)`
                                 : 'Pendiente de contar'}
                         </strong>
-                        <span className="text-stone-500 text-xs"> (Mín {row.item.minStock})</span>
+                        <span className="text-stone-500 text-xs">
+                          {' '}
+                          (Mín {formatItemStockDisplay(row.item.minStock, row.item)})
+                        </span>
                       </span>
 
-                      {row.hasCountedClosing && row.suggestedBuy > 0 && (() => {
-                        const packsSummary = getPacksPurchaseSummary(row.suggestedBuy, row.item);
-                        return (
-                          <span className="font-bold text-red-700 shrink-0 text-xs sm:text-sm">
-                            {packsSummary
-                              ? packsSummary.text
-                              : `Pedir +${row.suggestedBuy} ${row.item.unit}`}
-                          </span>
-                        );
-                      })()}
+                      {row.hasCountedClosing && row.suggestedBuy > 0 && (
+                        <span className="font-bold text-red-700 shrink-0 text-xs sm:text-sm">
+                          {formatPurchaseRecommendation(row.suggestedBuy, row.item)}
+                        </span>
+                      )}
                     </div>
                   </div>
                 );
@@ -1327,6 +1364,15 @@ export function BossDashboard({
                   {sortedShoppingRows.map((row) => {
                     const meta = getStockLevelMeta(row.stockLevel);
                     const stName = stationMap[row.item.station]?.name ?? row.item.station;
+                    const effectiveUnit = getEffectiveItemUnit(row.item);
+                    const isLevelRestock =
+                      getItemInputType(row.item) === 'level' &&
+                      Boolean(row.entry?.hasOpening) &&
+                      row.hasCountedClosing &&
+                      row.currentStock !== null &&
+                      row.entry !== null &&
+                      row.currentStock >
+                        sanitizeStockQuantity(row.entry.opening + row.entry.added);
                     const statusText = row.isNotApplicable
                       ? 'No aplica hoy'
                       : row.isProvisional
@@ -1344,7 +1390,7 @@ export function BossDashboard({
                       <tr key={row.item.id} className="hover:bg-stone-50/80 transition-colors">
                         <td className="py-3.5 px-5">
                           <div className="font-semibold text-stone-900">{row.item.name}</div>
-                          <div className="text-xs text-stone-500">{row.item.unit}</div>
+                          <div className="text-xs text-stone-500">{effectiveUnit}</div>
                         </td>
                         <td className="py-3.5 px-4 text-stone-600 whitespace-nowrap max-w-[200px] truncate">
                           {stName}
@@ -1352,10 +1398,14 @@ export function BossDashboard({
                         <td className="py-3.5 px-4 text-right font-mono tabular-nums text-stone-700">
                           {row.entry?.hasOpening && !row.isNotApplicable ? (
                             <div>
-                              <span>{row.entry.opening}</span>
+                              <span>{formatItemStockDisplay(row.entry.opening, row.item)}</span>
                               {isAdjustedOpening && hasPrev && (
                                 <div className="text-[11px] font-semibold text-amber-700">
-                                  Ayer: {row.entry.previousClosing}
+                                  Ayer:{' '}
+                                  {formatItemStockDisplay(
+                                    row.entry.previousClosing as number,
+                                    row.item,
+                                  )}
                                 </div>
                               )}
                             </div>
@@ -1365,20 +1415,20 @@ export function BossDashboard({
                         </td>
                         <td className="py-3.5 px-4 text-right font-mono tabular-nums text-stone-600">
                           {row.entry && !row.isNotApplicable && row.entry.added > 0
-                            ? `+${row.entry.added}`
+                            ? `+${formatItemStockDisplay(row.entry.added, row.item)}`
                             : '—'}
                         </td>
                         <td className="py-3.5 px-4 text-right font-mono tabular-nums font-semibold text-stone-900">
                           {row.isNotApplicable ? (
                             <span className="text-stone-500 font-normal">No aplica</span>
                           ) : row.hasCountedClosing && row.currentStock !== null ? (
-                            row.currentStock
+                            formatItemStockDisplay(row.currentStock, row.item)
                           ) : row.isProvisional && row.provisionalStock !== null ? (
                             <span
                               className="text-amber-700 font-medium"
                               title="Valor provisional de apertura; no entra en alertas de compra"
                             >
-                              {row.provisionalStock} (prov.)
+                              {formatItemStockDisplay(row.provisionalStock, row.item)} (prov.)
                             </span>
                           ) : (
                             <span className="text-stone-500 font-normal">Pendiente de contar</span>
@@ -1393,6 +1443,13 @@ export function BossDashboard({
                             >
                               Anómalo (sobra)
                             </span>
+                          ) : isLevelRestock ? (
+                            <span
+                              className="text-sky-700 font-semibold"
+                              title="¿Llegó un envase nuevo? Revisar Surtido"
+                            >
+                              Reposición
+                            </span>
                           ) : row.consumed !== null ? (
                             <span
                               className={
@@ -1401,33 +1458,26 @@ export function BossDashboard({
                                   : undefined
                               }
                             >
-                              {row.consumed}
+                              {formatItemStockDisplay(row.consumed, row.item)}
                             </span>
                           ) : (
                             '—'
                           )}
                         </td>
                         <td className="py-3.5 px-4 text-right font-mono tabular-nums text-stone-600">
-                          <div>{row.item.minStock}</div>
+                          <div>{formatItemStockDisplay(row.item.minStock, row.item)}</div>
                           {hasTargetBelowMin(row.item.minStock, row.item.targetStock) && (
                             <div className="text-[10px] font-semibold text-amber-700">
-                              Ideal {row.item.targetStock} &lt; mín
+                              Ideal {formatItemStockDisplay(row.item.targetStock, row.item)} &lt; mín
                             </div>
                           )}
                         </td>
                         <td className="py-3.5 px-4 text-right font-mono tabular-nums font-bold">
-                          {row.hasCountedClosing && row.suggestedBuy > 0 ? (() => {
-                            const packsSummary = getPacksPurchaseSummary(row.suggestedBuy, row.item);
-                            return packsSummary ? (
-                              <span className="text-red-700 whitespace-nowrap">
-                                {packsSummary.text}
-                              </span>
-                            ) : (
-                              <span className="text-red-700">
-                                +{row.suggestedBuy} {row.item.unit}
-                              </span>
-                            );
-                          })() : (
+                          {row.hasCountedClosing && row.suggestedBuy > 0 ? (
+                            <span className="text-red-700 whitespace-nowrap">
+                              {formatPurchaseRecommendation(row.suggestedBuy, row.item)}
+                            </span>
+                          ) : (
                             <span className="text-stone-400 font-normal">—</span>
                           )}
                         </td>

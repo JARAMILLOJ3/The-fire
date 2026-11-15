@@ -58,6 +58,7 @@ describe('firestore.rules structural security audit', () => {
     expect(rulesText).toContain('data.packLabel is string && data.packLabel.size() >= 1 && data.packLabel.size() <= 20');
     expect(rulesText).toContain('data.unitLabel is string && data.unitLabel.size() >= 1 && data.unitLabel.size() <= 20');
     expect(rulesText).toContain('data.capacity is number && data.capacity > 0 && data.capacity <= 100000');
+    expect(rulesText).toContain("data.allowClosedContainers is bool && (!data.allowClosedContainers || ('inputType' in data && data.inputType == 'level'))");
 
     const itemsBlockMatch = rulesText.match(/match \/items\/\{itemId\} \{[\s\S]*?\n    \}/);
     expect(itemsBlockMatch).not.toBeNull();

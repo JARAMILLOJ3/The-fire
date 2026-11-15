@@ -3,8 +3,7 @@ import { getAuth, GoogleAuthProvider } from 'firebase/auth';
 import {
   getFirestore,
   initializeFirestore,
-  persistentLocalCache,
-  persistentMultipleTabManager,
+  memoryLocalCache,
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 
@@ -12,12 +11,12 @@ const app = initializeApp(firebaseConfig);
 
 function createFirestoreDb() {
   try {
+    // Use memoryLocalCache to avoid stale IndexedDB target resumeTokens triggering
+    // ExistenceFilter BloomFilterError warnings on named Firestore databases across reloads.
     return initializeFirestore(
       app,
       {
-        localCache: persistentLocalCache({
-          tabManager: persistentMultipleTabManager(),
-        }),
+        localCache: memoryLocalCache(),
       },
       firebaseConfig.firestoreDatabaseId,
     );

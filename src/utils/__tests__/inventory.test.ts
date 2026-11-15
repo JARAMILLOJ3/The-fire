@@ -9,15 +9,32 @@ import type {
 import { UNASSIGNED_STATION_ID } from '../../constants';
 import {
   buildConsolidatedRows,
+  buildDailyCsvContent,
   buildItemCaptureFields,
+  buildPacksUnitMigrationPlan,
+  buildWeeklyStationHistory,
   buildWhatsAppShoppingList,
+  computeLevelWithContainersTotal,
+  detectDashboardConsumptionAnomalies,
   detectEntryAnomalies,
+  formatContainerFractionLabel,
+  formatItemStockDisplay,
+  formatPackEquivalent,
+  formatPacksQuantityWithUnit,
+  formatPreviousClosingForItem,
+  formatPurchaseRecommendation,
+  getEffectiveItemUnit,
+  getLevelPurchaseSummary,
+  getLevelUnitSelectOptions,
   getStockLevel,
   getSuggestedPurchase,
   getUnitSelectOptions,
+  isInvalidLevelUnit,
   parseCaptureDecimalInput,
   parseQuantityInput,
   sanitizeStockQuantity,
+  splitLevelWithContainers,
+  validateCatalogItemInput,
   validateStationItemAssignment,
 } from '../inventory';
 
@@ -946,5 +963,368 @@ describe('inventory.ts (sanitización, sin_dato, anomalías y compras)', () => {
     expect(opts.find((o) => o.value === 'L')).toEqual({ value: 'L', label: 'L (litros)' });
     expect(opts.find((o) => o.value === 'kg')).toEqual({ value: 'kg', label: 'kg (kilos)' });
     expect(opts.find((o) => o.value === 'und')).toEqual({ value: 'und', label: 'und' });
+
+    const levelOpts = getLevelUnitSelectOptions();
+    expect(levelOpts.map((o) => o.value)).toEqual(['L', 'ml', 'kg', 'g']);
+    expect(levelOpts.find((o) => o.value === 'L')).toEqual({ value: 'L', label: 'L (litros)' });
+  });
+
+  it('packs: locks base unit to unitLabel, converts/formats loose units + packs, compares against minStock, and builds non-destructive migration plan', () => {
+    const tocineta = makeItem({
+      id: 'toc_1',
+      name: 'Tocineta ahumada',
+      unit: 'kg',
+      inputType: 'packs',
+      packSize: 30,
+      packLabel: 'kilo',
+      unitLabel: 'loncha',
+      minStock: 60,
+      targetStock: 180,
+    });
+
+    // Effective unit always prefers loose unitLabel
+    expect(getEffectiveItemUnit(tocineta)).toBe('loncha');
+
+    // Catalog validation rejects base unit != unitLabel for packs, and accepts exact match
+    const mismatch = validateCatalogItemInput({
+      name: 'Tocineta ahumada',
+      unit: 'kg',
+      station: 'asados',
+      minStock: 60,
+      targetStock: 180,
+      inputType: 'packs',
+      packSize: 30,
+      packLabel: 'kilo',
+      unitLabel: 'loncha',
+      existingItems: [],
+    });
+    expect(mismatch.valid).toBe(false);
+    expect(mismatch.error).toContain('loncha');
+
+    expect(
+      validateCatalogItemInput({
+        name: 'Tocineta ahumada',
+        unit: 'loncha',
+        station: 'asados',
+        minStock: 60,
+        targetStock: 180,
+        inputType: 'packs',
+        packSize: 30,
+        packLabel: 'kilo',
+        unitLabel: 'loncha',
+        existingItems: [],
+      }).valid,
+    ).toBe(true);
+
+    // Pack equivalent & full display
+    expect(formatPackEquivalent(60, 30, 'kilo')).toBe('= 2 kilos');
+    expect(formatPackEquivalent(75, 30, 'kilo')).toBe('= 2,5 kilos');
+    expect(formatPacksQuantityWithUnit(180, tocineta)).toBe('180 lonchas (6 kilos)');
+
+    const tocineta40 = makeItem({
+      ...tocineta,
+      unit: 'loncha',
+      packSize: 40,
+    });
+    expect(formatPacksQuantityWithUnit(92, tocineta40)).toBe('92 lonchas (2 kilos + 12 lonchas)');
+    expect(formatItemStockDisplay(92, tocineta40)).toBe('92 lonchas (2 kilos + 12 lonchas)');
+
+    // Comparison against minStock and suggested purchase operate in loose units
+    expect(getStockLevel(55, tocineta40.minStock)).toBe('comprar');
+    expect(getStockLevel(61, tocineta40.minStock)).toBe('medio');
+    expect(getStockLevel(120, tocineta40.minStock)).toBe('suficiente');
+    expect(getSuggestedPurchase(55, 60, 180)).toBe(125);
+    expect(formatPurchaseRecommendation(125, tocineta40)).toBe('Comprar: 4 kilos (160 lonchas)');
+
+    // Non-destructive migration plan only targets packs items with mismatched unit
+    const alreadySynced = makeItem({
+      id: 'pan_1',
+      name: 'Pan perro',
+      unit: 'pan',
+      inputType: 'packs',
+      packSize: 8,
+      packLabel: 'paquete',
+      unitLabel: 'pan',
+      minStock: 16,
+      targetStock: 40,
+    });
+    const countItem = makeItem({ id: 'soda_1', inputType: 'count', unit: 'und' });
+
+    const plan = buildPacksUnitMigrationPlan([tocineta, alreadySynced, countItem]);
+    expect(plan).toEqual([
+      {
+        id: 'toc_1',
+        name: 'Tocineta ahumada',
+        oldUnit: 'kg',
+        newUnit: 'loncha',
+      },
+    ]);
+  });
+
+  it('level: enforces real measurement units, formats fractions/approximations, rounds purchases, and handles closed containers', () => {
+    expect(isInvalidLevelUnit('und')).toBe(true);
+    expect(isInvalidLevelUnit('paquete')).toBe(true);
+    expect(isInvalidLevelUnit('L')).toBe(false);
+    expect(isInvalidLevelUnit('ml')).toBe(false);
+    expect(isInvalidLevelUnit('kg')).toBe(false);
+    expect(isInvalidLevelUnit('g')).toBe(false);
+
+    // Rejects 'und' on level item in catalog validation
+    const invalidLevel = validateCatalogItemInput({
+      name: 'Salsa BBQ',
+      unit: 'und',
+      station: 'comida_rapida',
+      minStock: 1,
+      targetStock: 4,
+      inputType: 'level',
+      capacity: 4,
+      existingItems: [],
+    });
+    expect(invalidLevel.valid).toBe(false);
+    expect(invalidLevel.error).toContain('Nivel (barra)');
+
+    expect(
+      validateCatalogItemInput({
+        name: 'Salsa BBQ',
+        unit: 'L',
+        station: 'comida_rapida',
+        minStock: 1,
+        targetStock: 4,
+        inputType: 'level',
+        capacity: 4,
+        existingItems: [],
+      }).valid,
+    ).toBe(true);
+
+    // Container fractions for min/target helper
+    expect(formatContainerFractionLabel(1, 4, 'L')).toBe('1 L = ¼ del envase');
+    expect(formatContainerFractionLabel(2, 4, 'L')).toBe('2 L = ½ del envase');
+    expect(formatContainerFractionLabel(4, 4, 'L')).toBe('4 L = 1 envase lleno');
+    expect(formatContainerFractionLabel(6, 4, 'L')).toBe('6 L = 1 envase + ½');
+
+    // Approximate formatting & purchase rounding to full containers
+    const salsa = makeItem({
+      id: 'salsa_1',
+      name: 'Salsa BBQ',
+      unit: 'L',
+      inputType: 'level',
+      capacity: 3,
+      minStock: 1.5,
+      targetStock: 3,
+    });
+    expect(formatItemStockDisplay(2.5, salsa)).toBe('≈ 2,5 L');
+    expect(getLevelPurchaseSummary(2.1, salsa)).toEqual({
+      roundedQty: 3,
+      containers: 1,
+      unit: 'L',
+      text: 'Comprar: 3 L (aprox.)',
+    });
+    expect(getLevelPurchaseSummary(4, salsa)?.text).toBe('Comprar: 6 L (aprox.)');
+    expect(formatPurchaseRecommendation(2.1, salsa)).toBe('Comprar: 3 L (aprox.)');
+
+    // Closed containers disabled by default, enabled preserves flag
+    expect(
+      buildItemCaptureFields({
+        inputType: 'level',
+        packSizeInput: '8',
+        packLabel: 'paquete',
+        unitLabel: 'und',
+        capacityInput: '5',
+        allowClosedContainers: false,
+      }),
+    ).toEqual({ inputType: 'level', capacity: 5 });
+
+    expect(
+      buildItemCaptureFields({
+        inputType: 'level',
+        packSizeInput: '8',
+        packLabel: 'paquete',
+        unitLabel: 'und',
+        capacityInput: '5',
+        allowClosedContainers: true,
+      }),
+    ).toEqual({ inputType: 'level', capacity: 5, allowClosedContainers: true });
+
+    // Closed containers math + previous closing display
+    expect(computeLevelWithContainersTotal(2, 4, 5)).toBe(12.5);
+    expect(splitLevelWithContainers(12.5, 5)).toEqual({ closed: 2, step: 4 });
+
+    const salsaWithClosed = makeItem({
+      ...salsa,
+      capacity: 5,
+      allowClosedContainers: true,
+    });
+    expect(formatPreviousClosingForItem(12.5, salsaWithClosed)).toBe('2 cerrados + ½ (≈ 12,5 L)');
+    expect(formatPreviousClosingForItem(1.5, salsa)).toBe('½ (≈ 1,5 L)');
+  });
+
+  it('level: treats closing > opening + added as restock info hint instead of error or dashboard anomaly', () => {
+    const aceite = makeItem({
+      id: 'aceite_1',
+      station: 'comida_rapida',
+      name: 'Aceite freidora',
+      unit: 'L',
+      inputType: 'level',
+      capacity: 5,
+      minStock: 2,
+      targetStock: 5,
+    });
+
+    const row: DraftEntryRow = {
+      itemId: 'aceite_1',
+      itemName: 'Aceite freidora',
+      unit: 'L',
+      minStock: 2,
+      targetStock: 5,
+      opening: 1.25,
+      added: 0,
+      closing: 5,
+      hasOpening: true,
+      hasClosing: true,
+      notApplicable: false,
+    };
+
+    const anomalies = detectEntryAnomalies(row, 'closing', aceite);
+    expect(anomalies).toHaveLength(1);
+    expect(anomalies[0]).toMatchObject({
+      itemId: 'aceite_1',
+      type: 'level_restock_hint',
+      severity: 'info',
+      message: '¿Llegó un envase nuevo? Anótalo en Surtido',
+    });
+
+    // Dashboard consumption anomalies & 7-day history do not flag level increase as negative consumption error
+    const station = makeStation({ id: 'comida_rapida', name: 'Comida Rápida' });
+    const entry = makeEntry({
+      id: 'aceite_1',
+      itemId: 'aceite_1',
+      station: 'comida_rapida',
+      itemName: 'Aceite freidora',
+      unit: 'L',
+      minStock: 2,
+      targetStock: 5,
+      opening: 1.25,
+      added: 0,
+      closing: 5,
+    });
+    const report: DailyReport = {
+      id: 'ws_1_2026-11-13_comida_rapida',
+      workspaceId: 'ws_1',
+      ownerUid: 'owner_1',
+      authorizedEmails: ['boss@example.com'],
+      date: '2026-11-13',
+      station: 'comida_rapida',
+      status: 'completed',
+      reportedByUid: 'worker_1',
+      reportedByName: 'Ana',
+      notes: '',
+    };
+
+    const consolidated = buildConsolidatedRows(
+      [aceite],
+      { [entry.itemId]: entry },
+      { comida_rapida: report },
+    );
+    expect(consolidated[0].consumed).toBe(0);
+
+    const dashAnomalies = detectDashboardConsumptionAnomalies({
+      selectedDate: '2026-11-13',
+      rows: consolidated,
+      stations: [station],
+      allReports: [report],
+      entriesByReportId: { [report.id]: { [entry.itemId]: entry } },
+    });
+    expect(dashAnomalies).toEqual([]);
+
+    const history = buildWeeklyStationHistory({
+      endDateStr: '2026-11-13',
+      stations: [station],
+      items: [aceite],
+      allReports: [report],
+      entriesByReportId: { [report.id]: { [entry.itemId]: entry } },
+    });
+    const todayCell = history.rows[0].days.find((d) => d.date === '2026-11-13');
+    expect(todayCell?.anomalyCount).toBe(0);
+  });
+
+  it('exports WhatsApp and CSV using loose units + packs for packs items and approximate/rounded values for level items', () => {
+    const station = makeStation({ id: 'asados', name: 'Asados', workerName: 'Luis' });
+    const tocineta = makeItem({
+      id: 'toc_1',
+      station: 'asados',
+      name: 'Tocineta',
+      unit: 'kg', // stale unit intentionally tested
+      inputType: 'packs',
+      packSize: 30,
+      packLabel: 'kilo',
+      unitLabel: 'loncha',
+      minStock: 60,
+      targetStock: 180,
+    });
+    const salsa = makeItem({
+      id: 'salsa_1',
+      station: 'asados',
+      name: 'Salsa',
+      unit: 'L',
+      inputType: 'level',
+      capacity: 4,
+      minStock: 1.5,
+      targetStock: 4,
+    });
+
+    const report: DailyReport = {
+      id: 'ws_1_2026-11-13_asados',
+      workspaceId: 'ws_1',
+      ownerUid: 'owner_1',
+      authorizedEmails: ['boss@example.com'],
+      date: '2026-11-13',
+      station: 'asados',
+      status: 'completed',
+      reportedByUid: 'worker_1',
+      reportedByName: 'Luis',
+      notes: '',
+    };
+
+    const tocEntry = makeEntry({
+      id: 'toc_1',
+      itemId: 'toc_1',
+      station: 'asados',
+      itemName: 'Tocineta',
+      unit: 'kg',
+      opening: 180,
+      added: 0,
+      closing: 60,
+    });
+    const salsaEntry = makeEntry({
+      id: 'salsa_1',
+      itemId: 'salsa_1',
+      station: 'asados',
+      itemName: 'Salsa',
+      unit: 'L',
+      opening: 4,
+      added: 0,
+      closing: 1.5,
+    });
+
+    const rows = buildConsolidatedRows(
+      [tocineta, salsa],
+      { toc_1: tocEntry, salsa_1: salsaEntry },
+      { asados: report },
+    );
+
+    const wa = buildWhatsAppShoppingList('2026-11-13', rows, [station]);
+    expect(wa).toContain('60 lonchas (2 kilos)');
+    expect(wa).toContain('Comprar: 4 kilos (120 lonchas)');
+    expect(wa).not.toContain('60 kg');
+    expect(wa).toContain('≈ 1,5 L');
+    expect(wa).toContain('Comprar: 4 L (aprox.)');
+
+    const csv = buildDailyCsvContent('2026-11-13', rows, [station]);
+    expect(csv).toContain('"loncha"');
+    expect(csv).toContain('"180 lonchas (6 kilos)"');
+    expect(csv).toContain('"Comprar: 4 kilos (120 lonchas)"');
+    expect(csv).not.toContain('"kg"');
+    expect(csv).toContain('"≈ 1,5 L"');
+    expect(csv).toContain('"Comprar: 4 L (aprox.)"');
   });
 });

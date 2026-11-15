@@ -1,4 +1,4 @@
-import { AlertTriangle, CheckCircle2, X } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Info, X } from 'lucide-react';
 import type { EntryAnomaly } from '../../utils/inventory';
 
 interface ShiftSubmitConfirmModalProps {
@@ -34,6 +34,8 @@ export function ShiftSubmitConfirmModal({
 
   const isOpening = mode === 'opening';
   const activeCounted = Math.max(0, totalItems - naCount);
+  const warningAnomalies = anomalies.filter((a) => a.severity !== 'info');
+  const infoAnomalies = anomalies.filter((a) => a.severity === 'info');
 
   return (
     <div
@@ -122,17 +124,36 @@ export function ShiftSubmitConfirmModal({
             </div>
           )}
 
-          {anomalies.length > 0 && (
+          {warningAnomalies.length > 0 && (
             <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-200 space-y-1.5">
               <div className="flex items-center gap-2 text-xs font-bold text-amber-950">
                 <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
                 <span>
-                  Revisa {anomalies.length}{' '}
-                  {anomalies.length === 1 ? 'cantidad inusual' : 'cantidades inusuales'}
+                  Revisa {warningAnomalies.length}{' '}
+                  {warningAnomalies.length === 1 ? 'cantidad inusual' : 'cantidades inusuales'}
                 </span>
               </div>
               <ul className="text-xs text-amber-900 space-y-1 list-disc pl-4">
-                {anomalies.slice(0, 4).map((a) => (
+                {warningAnomalies.slice(0, 4).map((a) => (
+                  <li key={`${a.itemId}-${a.type}`}>
+                    <strong>{a.itemName}:</strong> {a.message}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {infoAnomalies.length > 0 && (
+            <div className="p-3.5 rounded-xl bg-sky-50 border border-sky-200 space-y-1.5">
+              <div className="flex items-center gap-2 text-xs font-bold text-sky-950">
+                <Info className="w-4 h-4 text-sky-600 shrink-0" />
+                <span>
+                  Nota de nivel ({infoAnomalies.length}{' '}
+                  {infoAnomalies.length === 1 ? 'insumo' : 'insumos'})
+                </span>
+              </div>
+              <ul className="text-xs text-sky-900 space-y-1 list-disc pl-4">
+                {infoAnomalies.slice(0, 4).map((a) => (
                   <li key={`${a.itemId}-${a.type}`}>
                     <strong>{a.itemName}:</strong> {a.message}
                   </li>

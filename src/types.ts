@@ -72,10 +72,18 @@ export interface InventoryItem {
   packLabel?: string;
   unitLabel?: string;
   capacity?: number;
+  allowClosedContainers?: boolean;
   active: boolean;
   sortOrder: number;
   createdAt?: Timestamp;
   updatedAt?: Timestamp;
+}
+
+export interface PacksUnitMigrationRecord {
+  id: string;
+  name: string;
+  oldUnit: string;
+  newUnit: string;
 }
 
 export interface DailyReport {

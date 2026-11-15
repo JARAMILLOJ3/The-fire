@@ -1,11 +1,13 @@
 import { memo, useCallback } from 'react';
-import { AlertTriangle, Check } from 'lucide-react';
+import { AlertTriangle, Check, Info } from 'lucide-react';
 import {
   detectEntryAnomalies,
+  formatItemStockDisplay,
   formatPreviousClosingForItem,
-  formatSpanishDecimal,
+  formatPurchaseRecommendation,
+  getEffectiveItemUnit,
+  getItemInputType,
   getOpeningRowState,
-  getPacksPurchaseSummary,
   getStockLevel,
   getStockLevelMeta,
   getSuggestedPurchase,
@@ -52,6 +54,13 @@ export const ShiftDesktopItemRow = memo(function ShiftDesktopItemRow({
   const isPendingConfirm = openingState === 'pending_confirm';
   const showOpeningNumber = !isNA && (row.hasOpening || isPendingConfirm);
   const hasValue = row.hasClosing && !isNA;
+  const effectiveUnit = getEffectiveItemUnit(item);
+  const isLevel = getItemInputType(item) === 'level';
+  const isLevelRestock =
+    isLevel &&
+    row.hasOpening &&
+    hasValue &&
+    row.closing > sanitizeStockQuantity(row.opening + row.added);
   const consumed =
     row.hasOpening && hasValue
       ? sanitizeStockQuantity(Math.max(0, row.opening + row.added - row.closing))
@@ -59,8 +68,9 @@ export const ShiftDesktopItemRow = memo(function ShiftDesktopItemRow({
   const level = getStockLevel(row.closing, item.minStock);
   const meta = getStockLevelMeta(level);
   const suggestBuy = getSuggestedPurchase(row.closing, item.minStock, item.targetStock);
-  const packsPurchaseHint = getPacksPurchaseSummary(suggestBuy, item);
-  const rowAnomalies = detectEntryAnomalies(row, draftMode);
+  const rowAnomalies = detectEntryAnomalies(row, draftMode, item);
+  const warningAnomalies = rowAnomalies.filter((a) => a.severity !== 'info');
+  const infoAnomalies = rowAnomalies.filter((a) => a.severity === 'info');
   const openingTone = isPendingConfirm
     ? 'pending'
     : openingState === 'adjusted'
@@ -90,7 +100,7 @@ export const ShiftDesktopItemRow = memo(function ShiftDesktopItemRow({
         <div className="text-base font-semibold text-stone-900">{item.name}</div>
         <div className="text-xs text-stone-500 font-mono tabular-nums mt-0.5 flex flex-wrap items-center gap-x-1.5">
           <span>
-            {item.unit} · Mín: {item.minStock}
+            {effectiveUnit} · Mín: {formatItemStockDisplay(item.minStock, item)}
           </span>
           {typeof row.previousClosing === 'number' && (
             <span className="text-sky-800 font-semibold">
@@ -98,10 +108,16 @@ export const ShiftDesktopItemRow = memo(function ShiftDesktopItemRow({
             </span>
           )}
         </div>
-        {rowAnomalies.length > 0 && (
+        {warningAnomalies.length > 0 && (
           <div className="inline-flex items-center gap-1 mt-1 text-xs font-medium text-amber-700">
             <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-            <span>{rowAnomalies[0].message}</span>
+            <span>{warningAnomalies[0].message}</span>
+          </div>
+        )}
+        {infoAnomalies.length > 0 && (
+          <div className="inline-flex items-center gap-1 mt-1 text-xs font-medium text-sky-700">
+            <Info className="w-3.5 h-3.5 shrink-0" />
+            <span>{infoAnomalies[0].message}</span>
           </div>
         )}
       </td>
@@ -189,8 +205,7 @@ export const ShiftDesktopItemRow = memo(function ShiftDesktopItemRow({
               <span className="text-sky-700">Por confirmar</span>
             ) : row.hasOpening ? (
               <span className="text-stone-900">
-                {formatSpanishDecimal(sanitizeStockQuantity(row.opening + row.added), 2)}{' '}
-                {item.unit}
+                {formatItemStockDisplay(sanitizeStockQuantity(row.opening + row.added), item)}
               </span>
             ) : (
               <span className="text-stone-400 font-normal">Por contar</span>
@@ -244,7 +259,13 @@ export const ShiftDesktopItemRow = memo(function ShiftDesktopItemRow({
           </td>
 
           <td className="py-4 px-4 text-right font-mono tabular-nums text-stone-700 align-top">
-            {consumed !== null ? `${formatSpanishDecimal(consumed, 2)} ${item.unit}` : '—'}
+            {isLevelRestock ? (
+              <span className="text-xs font-semibold text-sky-700">Reposición</span>
+            ) : consumed !== null ? (
+              formatItemStockDisplay(consumed, item)
+            ) : (
+              '—'
+            )}
           </td>
 
           <td className="py-4 px-5 whitespace-nowrap align-top">
@@ -264,9 +285,7 @@ export const ShiftDesktopItemRow = memo(function ShiftDesktopItemRow({
                 </span>
                 {suggestBuy > 0 && (
                   <p className="text-xs font-mono tabular-nums text-red-700">
-                    {packsPurchaseHint
-                      ? packsPurchaseHint.text
-                      : `Sugerido pedir: +${suggestBuy} ${item.unit}`}
+                    {formatPurchaseRecommendation(suggestBuy, item)}
                   </p>
                 )}
               </div>

@@ -19,13 +19,20 @@ import type {
 } from '../types';
 import {
   buildItemCaptureFields,
+  formatContainerFractionLabel,
+  formatItemStockDisplay,
+  formatPackEquivalent,
+  getEffectiveItemUnit,
   getItemInputType,
+  getLevelUnitSelectOptions,
   getUnitSelectOptions,
   hasTargetBelowMin,
+  isInvalidLevelUnit,
   parseCaptureDecimalInput,
   pluralizeSpanishLabel,
   validateCatalogItemInput,
 } from '../utils/inventory';
+import type { PacksUnitMigrationRecord } from '../types';
 import { ItemCaptureFields } from './ItemCaptureFields';
 import { OptionSelect } from './OptionSelect';
 
@@ -35,6 +42,8 @@ interface CatalogManagerProps {
   items: InventoryItem[];
   initialFilterStation?: string;
   onGoToWorkstations?: () => void;
+  migratedPacksNotice?: PacksUnitMigrationRecord[];
+  onDismissMigratedPacksNotice?: () => void;
 }
 
 export function CatalogManager({
@@ -43,6 +52,8 @@ export function CatalogManager({
   items,
   initialFilterStation = 'all',
   onGoToWorkstations,
+  migratedPacksNotice = [],
+  onDismissMigratedPacksNotice,
 }: CatalogManagerProps) {
   const [stationFilter, setStationFilter] = useState<'all' | StationId>(initialFilterStation);
   const [statusFilter, setStatusFilter] = useState<'active' | 'archived'>('active');
@@ -65,6 +76,7 @@ export function CatalogManager({
   const [packLabel, setPackLabel] = useState('paquete');
   const [unitLabel, setUnitLabel] = useState('und');
   const [capacityInput, setCapacityInput] = useState('5');
+  const [allowClosedContainers, setAllowClosedContainers] = useState(false);
 
   useEffect(() => {
     setStationFilter(initialFilterStation);
@@ -88,6 +100,7 @@ export function CatalogManager({
   );
 
   const unitOptions = useMemo(() => getUnitSelectOptions(), []);
+  const levelUnitOptions = useMemo(() => getLevelUnitSelectOptions(), []);
 
   const parsedPackSize = useMemo(
     () => parseCaptureDecimalInput(packSizeInput),
@@ -99,11 +112,15 @@ export function CatalogManager({
     [capacityInput],
   );
 
+  const effectivePackLooseUnit = unitLabel.trim() || 'und';
+  const effectiveFormUnit =
+    inputType === 'packs' ? effectivePackLooseUnit : unit.trim() || 'und';
+
   const formValidation = useMemo(
     () =>
       validateCatalogItemInput({
         name,
-        unit,
+        unit: effectiveFormUnit,
         station: stationId,
         minStock,
         targetStock,
@@ -117,7 +134,7 @@ export function CatalogManager({
       }),
     [
       name,
-      unit,
+      effectiveFormUnit,
       stationId,
       minStock,
       targetStock,
@@ -147,26 +164,48 @@ export function CatalogManager({
     setPackLabel('paquete');
     setUnitLabel('und');
     setCapacityInput('5');
+    setAllowClosedContainers(false);
     setErrorMsg(null);
     setActionFeedback(null);
     setShowForm(true);
   };
 
   const openEditForm = (item: InventoryItem) => {
+    const mode = getItemInputType(item);
+    const nextUnitLabel = item.unitLabel ?? (item.unit || 'und');
     setEditingItem(item);
     setName(item.name);
     setStationId(item.station || UNASSIGNED_STATION_ID);
-    setUnit(item.unit);
+    setUnit(mode === 'packs' ? nextUnitLabel.trim() || 'und' : item.unit);
     setMinStock(item.minStock);
     setTargetStock(item.targetStock);
-    setInputType(getItemInputType(item));
+    setInputType(mode);
     setPackSizeInput(typeof item.packSize === 'number' ? String(item.packSize) : '8');
     setPackLabel(item.packLabel ?? 'paquete');
-    setUnitLabel(item.unitLabel ?? (item.unit || 'und'));
+    setUnitLabel(nextUnitLabel);
     setCapacityInput(typeof item.capacity === 'number' ? String(item.capacity) : '5');
+    setAllowClosedContainers(Boolean(item.allowClosedContainers));
     setErrorMsg(null);
     setActionFeedback(null);
     setShowForm(true);
+  };
+
+  const handleInputTypeChange = (nextType: CaptureInputType) => {
+    setInputType(nextType);
+    if (nextType === 'packs') {
+      setUnit(unitLabel.trim() || 'und');
+    } else if (nextType === 'level' && isInvalidLevelUnit(unit)) {
+      setUnit('L');
+    }
+    if (errorMsg) setErrorMsg(null);
+  };
+
+  const handleUnitLabelChange = (nextUnitLabel: string) => {
+    setUnitLabel(nextUnitLabel);
+    if (inputType === 'packs') {
+      setUnit(nextUnitLabel.trim() || 'und');
+    }
+    if (errorMsg) setErrorMsg(null);
   };
 
   const handleSubmit = async (e: FormEvent) => {
@@ -180,13 +219,15 @@ export function CatalogManager({
     setErrorMsg(null);
     try {
       const cleanName = name.trim();
-      const cleanUnit = unit.trim();
+      const cleanUnit =
+        inputType === 'packs' ? unitLabel.trim() || 'und' : unit.trim();
       const capturePayload = buildItemCaptureFields({
         inputType,
         packSizeInput,
         packLabel,
         unitLabel,
         capacityInput,
+        allowClosedContainers,
       });
 
       if (editingItem) {
@@ -256,7 +297,7 @@ export function CatalogManager({
     setActionFeedback(null);
     const check = validateCatalogItemInput({
       name: item.name,
-      unit: item.unit,
+      unit: getEffectiveItemUnit(item),
       station: item.station,
       minStock: item.minStock,
       targetStock: item.targetStock,
@@ -293,6 +334,55 @@ export function CatalogManager({
     hasTargetBelowMin(it.minStock, it.targetStock),
   ).length;
 
+  const invalidLevelActiveItems = activeItems.filter(
+    (it) => getItemInputType(it) === 'level' && isInvalidLevelUnit(it.unit),
+  );
+
+  const showPacksSwitchReviewWarning = Boolean(
+    editingItem &&
+      inputType === 'packs' &&
+      (getItemInputType(editingItem) !== 'packs' ||
+        editingItem.unit.trim() !== effectivePackLooseUnit),
+  );
+
+  const showLevelUnitSwitchWarning = Boolean(
+    editingItem &&
+      inputType === 'level' &&
+      isInvalidLevelUnit(editingItem.unit) &&
+      !isInvalidLevelUnit(unit),
+  );
+
+  const packsEquivalentMin =
+    inputType === 'packs' && Number.isInteger(parsedPackSize) && parsedPackSize > 1
+      ? formatPackEquivalent(minStock, parsedPackSize, packLabel)
+      : '';
+  const packsEquivalentTarget =
+    inputType === 'packs' && Number.isInteger(parsedPackSize) && parsedPackSize > 1
+      ? formatPackEquivalent(targetStock, parsedPackSize, packLabel)
+      : '';
+
+  const levelFractionMin =
+    inputType === 'level' && Number.isFinite(parsedCapacity) && parsedCapacity > 0
+      ? formatContainerFractionLabel(minStock, parsedCapacity, effectiveFormUnit)
+      : '';
+  const levelFractionTarget =
+    inputType === 'level' && Number.isFinite(parsedCapacity) && parsedCapacity > 0
+      ? formatContainerFractionLabel(targetStock, parsedCapacity, effectiveFormUnit)
+      : '';
+  const levelFractionOneUnit =
+    inputType === 'level' &&
+    Number.isFinite(parsedCapacity) &&
+    parsedCapacity > 0 &&
+    minStock !== 1 &&
+    targetStock !== 1
+      ? formatContainerFractionLabel(1, parsedCapacity, effectiveFormUnit)
+      : '';
+
+  const minIdealUnitLabel =
+    inputType === 'packs'
+      ? pluralizeSpanishLabel(effectivePackLooseUnit, 2)
+      : effectiveFormUnit;
+
   return (
     <div className="space-y-6 min-w-0">
       <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
@@ -319,6 +409,54 @@ export function CatalogManager({
           </button>
         </div>
       </div>
+
+      {migratedPacksNotice.length > 0 && (
+        <div
+          role="status"
+          className="px-4 py-3.5 rounded-2xl bg-sky-50 border border-sky-200 flex items-start justify-between gap-3 text-xs sm:text-sm text-sky-950"
+        >
+          <div className="space-y-1">
+            <p className="font-semibold">
+              Se actualizó la unidad base a su unidad suelta en {migratedPacksNotice.length}{' '}
+              {migratedPacksNotice.length === 1 ? 'insumo por paquetes' : 'insumos por paquetes'} (sin cambiar las cantidades guardadas):
+            </p>
+            <ul className="list-disc pl-5 text-xs space-y-0.5">
+              {migratedPacksNotice.map((rec) => (
+                <li key={rec.id}>
+                  <strong>{rec.name}</strong>: &ldquo;{rec.oldUnit}&rdquo; → &ldquo;{rec.newUnit}&rdquo;. Revisa que su mínimo e ideal estén en {pluralizeSpanishLabel(rec.newUnit, 2)}.
+                </li>
+              ))}
+            </ul>
+          </div>
+          {onDismissMigratedPacksNotice && (
+            <button
+              type="button"
+              onClick={onDismissMigratedPacksNotice}
+              aria-label="Cerrar aviso de migración"
+              className="min-w-[36px] min-h-[36px] flex items-center justify-center text-sky-700 hover:bg-sky-100 rounded-lg shrink-0 cursor-pointer"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          )}
+        </div>
+      )}
+
+      {invalidLevelActiveItems.length > 0 && (
+        <div
+          role="status"
+          className="px-4 py-3 rounded-2xl bg-amber-50 border border-amber-200 flex items-start gap-2.5 text-xs sm:text-sm text-amber-950"
+        >
+          <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+          <span>
+            Hay <strong>{invalidLevelActiveItems.length}</strong>{' '}
+            {invalidLevelActiveItems.length === 1
+              ? 'insumo de tipo Nivel (barra)'
+              : 'insumos de tipo Nivel (barra)'}{' '}
+            con unidad <strong>&ldquo;{invalidLevelActiveItems[0].unit}&rdquo;</strong> (
+            {invalidLevelActiveItems.map((it) => it.name).join(', ')}). Edítalos para usar una medida real (<strong>L, ml, kg o g</strong>).
+          </span>
+        </div>
+      )}
 
       {activeItems.length > 0 && stations.length === 0 && onGoToWorkstations && (
         <div className="px-4 py-3.5 rounded-2xl bg-orange-50 border border-orange-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs sm:text-sm text-orange-950">
@@ -466,15 +604,17 @@ export function CatalogManager({
               {filteredItems.map((item) => {
                 const targetLow = hasTargetBelowMin(item.minStock, item.targetStock);
                 const mode = getItemInputType(item);
+                const effectiveUnit = getEffectiveItemUnit(item);
+                const invalidLevelUnit = mode === 'level' && isInvalidLevelUnit(item.unit);
                 const stationLabel =
                   item.station === UNASSIGNED_STATION_ID
                     ? 'Sin asignar'
                     : (stationNameMap.get(item.station) ?? 'Sin asignar');
                 const modeSummary =
                   mode === 'packs' && item.packSize
-                    ? `${item.packLabel || 'paquete'} de ${item.packSize} ${pluralizeSpanishLabel(item.unitLabel || item.unit, item.packSize)}`
+                    ? `${item.packLabel || 'paquete'} de ${item.packSize} ${pluralizeSpanishLabel(effectiveUnit, item.packSize)}`
                     : mode === 'level' && item.capacity
-                      ? `Nivel (envase ${item.capacity} ${item.unit})`
+                      ? `Nivel (envase ${item.capacity} ${effectiveUnit}${item.allowClosedContainers ? ' + cerrados' : ''})`
                       : 'Conteo (− / +)';
                 return (
                   <div key={item.id} className="p-4 flex items-center justify-between gap-3">
@@ -488,11 +628,17 @@ export function CatalogManager({
                         >
                           {stationLabel}
                         </span>{' '}
-                        · {item.unit} · {modeSummary}
+                        · {effectiveUnit} · {modeSummary}
                       </p>
                       <p className="text-xs font-mono tabular-nums text-stone-600 mt-0.5">
-                        Mín: {item.minStock} · Ideal: {item.targetStock}
+                        Mín: {formatItemStockDisplay(item.minStock, item)} · Ideal: {formatItemStockDisplay(item.targetStock, item)}
                       </p>
+                      {invalidLevelUnit && (
+                        <p className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-800 mt-1">
+                          <AlertTriangle className="w-3 h-3 shrink-0" />
+                          Unidad &ldquo;{item.unit}&rdquo; no válida para Nivel (usa L, ml, kg o g)
+                        </p>
+                      )}
                       {targetLow && (
                         <p className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-800 mt-1">
                           <AlertTriangle className="w-3 h-3 shrink-0" />
@@ -555,16 +701,24 @@ export function CatalogManager({
                   {filteredItems.map((item) => {
                     const targetLow = hasTargetBelowMin(item.minStock, item.targetStock);
                     const mode = getItemInputType(item);
+                    const effectiveUnit = getEffectiveItemUnit(item);
+                    const invalidLevelUnit = mode === 'level' && isInvalidLevelUnit(item.unit);
                     const captureText =
                       mode === 'packs' && item.packSize
-                        ? `Paquetes: 1 ${item.packLabel || 'paquete'} = ${item.packSize} ${pluralizeSpanishLabel(item.unitLabel || item.unit, item.packSize)}`
+                        ? `Paquetes: 1 ${item.packLabel || 'paquete'} = ${item.packSize} ${pluralizeSpanishLabel(effectiveUnit, item.packSize)}`
                         : mode === 'level' && item.capacity
-                          ? `Nivel (0 a ${item.capacity} ${item.unit})`
+                          ? `Nivel (0 a ${item.capacity} ${effectiveUnit}${item.allowClosedContainers ? ' + cerrados' : ''})`
                           : 'Conteo';
                     return (
                       <tr key={item.id} className="hover:bg-stone-50/80 transition-colors">
                         <td className="py-3 px-4">
                           <div className="font-medium text-stone-900">{item.name}</div>
+                          {invalidLevelUnit && (
+                            <div className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-800 mt-0.5">
+                              <AlertTriangle className="w-3 h-3 shrink-0" />
+                              Cambia &ldquo;{item.unit}&rdquo; a L, ml, kg o g
+                            </div>
+                          )}
                           {targetLow && (
                             <div className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-800 mt-0.5">
                               <AlertTriangle className="w-3 h-3 shrink-0" />
@@ -581,16 +735,16 @@ export function CatalogManager({
                           )}
                         </td>
                         <td className="py-3 px-4 text-xs text-stone-600">{captureText}</td>
-                        <td className="py-3 px-4 text-stone-600 font-mono text-xs">{item.unit}</td>
+                        <td className="py-3 px-4 text-stone-600 font-mono text-xs">{effectiveUnit}</td>
                         <td className="py-3 px-4 text-right font-mono tabular-nums text-stone-800">
-                          {item.minStock}
+                          {formatItemStockDisplay(item.minStock, item)}
                         </td>
                         <td
                           className={`py-3 px-4 text-right font-mono tabular-nums ${
                             targetLow ? 'text-amber-800 font-semibold' : 'text-stone-600'
                           }`}
                         >
-                          {item.targetStock}
+                          {formatItemStockDisplay(item.targetStock, item)}
                         </td>
                         <td className="py-3 px-4 text-right">
                           <div className="inline-flex items-center gap-1">
@@ -672,6 +826,44 @@ export function CatalogManager({
                 </div>
               )}
 
+              {showPacksSwitchReviewWarning && editingItem && (
+                <div
+                  role="status"
+                  className="p-3 text-xs text-amber-950 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-2"
+                >
+                  <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                  <span>
+                    La unidad base ahora es <strong>{pluralizeSpanishLabel(effectivePackLooseUnit, 2)}</strong> (antes{' '}
+                    &ldquo;{editingItem.unit}&rdquo;). Revisa el mínimo y el ideal para confirmar que están expresados en{' '}
+                    {pluralizeSpanishLabel(effectivePackLooseUnit, 2)}.
+                  </span>
+                </div>
+              )}
+
+              {inputType === 'level' && isInvalidLevelUnit(effectiveFormUnit) && (
+                <div
+                  role="alert"
+                  className="p-3 text-xs text-amber-950 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-2"
+                >
+                  <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                  <span>
+                    Este insumo tenía unidad <strong>&ldquo;{effectiveFormUnit}&rdquo;</strong>. El tipo Nivel (barra) requiere una medida real (<strong>L, ml, kg o g</strong>); selecciona una unidad válida y revisa mínimo, ideal y capacidad.
+                  </span>
+                </div>
+              )}
+
+              {showLevelUnitSwitchWarning && editingItem && (
+                <div
+                  role="status"
+                  className="p-3 text-xs text-amber-950 bg-amber-50 border border-amber-200 rounded-xl flex items-start gap-2"
+                >
+                  <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                  <span>
+                    Se cambió la unidad desde &ldquo;{editingItem.unit}&rdquo; a <strong>{effectiveFormUnit}</strong> porque Nivel requiere una medida real. Revisa mínimo, ideal y capacidad.
+                  </span>
+                </div>
+              )}
+
               <div>
                 <label className="block text-xs font-semibold text-stone-700 mb-1">
                   Nombre del insumo
@@ -719,13 +911,21 @@ export function CatalogManager({
                     Unidad base de inventario <span className="text-red-600">*</span>
                   </label>
                   <OptionSelect
-                    value={unit}
-                    options={unitOptions}
+                    value={effectiveFormUnit}
+                    options={inputType === 'level' ? levelUnitOptions : unitOptions}
                     maxLength={MAX_UNIT_LENGTH}
                     required
+                    disabled={inputType === 'packs'}
+                    disabledNote={
+                      inputType === 'packs'
+                        ? `Se cuenta en ${pluralizeSpanishLabel(effectivePackLooseUnit, 2)}`
+                        : undefined
+                    }
                     selectAriaLabel="Unidad base de inventario"
                     customAriaLabel="Escribe la unidad de inventario"
-                    customPlaceholder="Ej: galón, ml, atado"
+                    customPlaceholder={
+                      inputType === 'level' ? 'Ej: oz, galón' : 'Ej: galón, ml, atado'
+                    }
                     onChange={(val) => {
                       setUnit(val);
                       if (errorMsg) setErrorMsg(null);
@@ -737,16 +937,18 @@ export function CatalogManager({
               {/* Capture type selector */}
               <ItemCaptureFields
                 inputType={inputType}
-                onInputTypeChange={setInputType}
-                unit={unit}
+                onInputTypeChange={handleInputTypeChange}
+                unit={effectiveFormUnit}
                 packSizeInput={packSizeInput}
                 onPackSizeInputChange={setPackSizeInput}
                 packLabel={packLabel}
                 onPackLabelChange={setPackLabel}
                 unitLabel={unitLabel}
-                onUnitLabelChange={setUnitLabel}
+                onUnitLabelChange={handleUnitLabelChange}
                 capacityInput={capacityInput}
                 onCapacityInputChange={setCapacityInput}
+                allowClosedContainers={allowClosedContainers}
+                onAllowClosedContainersChange={setAllowClosedContainers}
                 onClearError={() => {
                   if (errorMsg) setErrorMsg(null);
                 }}
@@ -755,7 +957,7 @@ export function CatalogManager({
               <div className="grid grid-cols-1 min-[360px]:grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-semibold text-stone-700 mb-1">
-                    Stock mínimo ({unit.trim() || 'und'})
+                    Mínimo ({minIdealUnitLabel})
                   </label>
                   <input
                     type="number"
@@ -766,10 +968,20 @@ export function CatalogManager({
                     onChange={(e) => setMinStock(parseFloat(e.target.value) || 0)}
                     className="w-full min-h-[44px] px-3 py-2 text-base sm:text-sm font-mono tabular-nums border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
                   />
+                  {packsEquivalentMin && (
+                    <p className="text-[11px] font-medium text-stone-600 mt-1">
+                      {packsEquivalentMin}
+                    </p>
+                  )}
+                  {levelFractionMin && (
+                    <p className="text-[11px] font-medium text-stone-600 mt-1">
+                      {levelFractionMin}
+                    </p>
+                  )}
                 </div>
                 <div>
                   <label className="block text-xs font-semibold text-stone-700 mb-1">
-                    Stock ideal ({unit.trim() || 'und'})
+                    Ideal ({minIdealUnitLabel})
                   </label>
                   <input
                     type="number"
@@ -780,8 +992,23 @@ export function CatalogManager({
                     onChange={(e) => setTargetStock(parseFloat(e.target.value) || 0)}
                     className="w-full min-h-[44px] px-3 py-2 text-base sm:text-sm font-mono tabular-nums border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
                   />
+                  {packsEquivalentTarget && (
+                    <p className="text-[11px] font-medium text-stone-600 mt-1">
+                      {packsEquivalentTarget}
+                    </p>
+                  )}
+                  {levelFractionTarget && (
+                    <p className="text-[11px] font-medium text-stone-600 mt-1">
+                      {levelFractionTarget}
+                    </p>
+                  )}
                 </div>
               </div>
+              {levelFractionOneUnit && (
+                <p className="text-[11px] text-stone-500 -mt-2">
+                  Referencia del envase: {levelFractionOneUnit}
+                </p>
+              )}
 
               <div className="flex flex-wrap items-center justify-end gap-2 pt-2">
                 <button

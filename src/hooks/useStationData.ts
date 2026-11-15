@@ -3,6 +3,7 @@ import type { User } from 'firebase/auth';
 import { collection, doc, getDoc, getDocs, onSnapshot, query, where } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../firebase';
 import { loadWorkerStationFallback } from '../services/workerService';
+import { getPacksItemsNeedingUnitMigration } from '../utils/inventory';
 import {
   chunkArray,
   computeManagerDateWindow,
@@ -15,6 +16,7 @@ import type {
   DailyReportEntry,
   InventoryItem,
   Invite,
+  PacksUnitMigrationRecord,
   StationLink,
   TeamMember,
   TeamStationId,
@@ -78,8 +80,11 @@ export function useStationData(params: {
   const [members, setMembers] = useState<TeamMember[]>([]);
   const [stationLinksByCode, setStationLinksByCode] = useState<Record<string, StationLink>>({});
   const [workerFallback, setWorkerFallback] = useState<WorkerFallbackState | null>(null);
+  const [migratedPacksNotice, setMigratedPacksNotice] = useState<PacksUnitMigrationRecord[]>([]);
 
   const migrationAttemptedRef = useRef<string | null>(null);
+  const packsUnitMigratedIdsRef = useRef<Set<string>>(new Set());
+  const packsUnitMigrationWorkspaceRef = useRef<string | null>(null);
   const syncingEmailsKeyRef = useRef<string>('');
   const fetchedHistoryVersionRef = useRef<Record<string, number>>({});
   const historicalReportsRef = useRef<Record<string, DailyReport>>({});
@@ -109,6 +114,9 @@ export function useStationData(params: {
     setMembers([]);
     setStationLinksByCode({});
     setWorkerFallback(null);
+    setMigratedPacksNotice([]);
+    packsUnitMigratedIdsRef.current = new Set();
+    packsUnitMigrationWorkspaceRef.current = null;
   }, [user, workspace?.id]);
 
   // Effect 1A: Static workspace collections for managers (never torn down on date switch)
@@ -534,6 +542,41 @@ export function useStationData(params: {
       });
   }, [canManage, workspace, stationsLoaded, itemsLoaded, stations, items]);
 
+  // Auto-migrate packs items whose stored unit differs from unitLabel without touching numeric quantities
+  useEffect(() => {
+    if (!canManage || !workspace?.id || !itemsLoaded) return;
+    if (packsUnitMigrationWorkspaceRef.current !== workspace.id) {
+      packsUnitMigrationWorkspaceRef.current = workspace.id;
+      packsUnitMigratedIdsRef.current = new Set();
+      setMigratedPacksNotice([]);
+    }
+
+    const candidates = getPacksItemsNeedingUnitMigration(items).filter(
+      (it) => !packsUnitMigratedIdsRef.current.has(it.id),
+    );
+    if (candidates.length === 0) return;
+
+    candidates.forEach((it) => packsUnitMigratedIdsRef.current.add(it.id));
+    void import('../services/bossService')
+      .then(({ migratePacksItemUnits }) => migratePacksItemUnits(candidates))
+      .then((records) => {
+        if (records.length === 0) return;
+        setMigratedPacksNotice((prev) => {
+          const byId = new Map(prev.map((r) => [r.id, r]));
+          records.forEach((r) => byId.set(r.id, r));
+          return Array.from(byId.values());
+        });
+      })
+      .catch((err) => {
+        candidates.forEach((it) => packsUnitMigratedIdsRef.current.delete(it.id));
+        console.error('Error migrando unidad de insumos por paquetes:', err);
+      });
+  }, [canManage, workspace?.id, itemsLoaded, items]);
+
+  const dismissMigratedPacksNotice = useCallback(() => {
+    setMigratedPacksNotice([]);
+  }, []);
+
   const refreshWorkerFallback = useCallback(async () => {
     if (!workspace?.id || canManage || role === 'jefe') return;
     try {
@@ -934,6 +977,8 @@ export function useStationData(params: {
     members,
     stationLinksByCode,
     yesterdayHasReports,
+    migratedPacksNotice,
+    dismissMigratedPacksNotice,
     refreshWorkerFallback,
   };
 }

@@ -30,6 +30,7 @@ import type {
   DailyReportEntry,
   InventoryItem,
   Invite,
+  PacksUnitMigrationRecord,
   ShiftSchedule,
   StationId,
   StationLink,
@@ -44,6 +45,7 @@ import type {
   ResetTaskItem,
   RestaurantBackupPayload,
 } from '../utils/reset';
+import { buildPacksUnitMigrationPlan } from '../utils/inventory';
 import { validateShiftSchedule } from '../utils/schedule';
 import { clampNumber, clampString, generateAccessCode, makeCleanId } from './shared';
 
@@ -480,6 +482,7 @@ export interface InventoryItemCapturePayload {
   packLabel?: string;
   unitLabel?: string;
   capacity?: number;
+  allowClosedContainers?: boolean;
 }
 
 function buildItemCapturePayload(
@@ -502,6 +505,7 @@ function buildItemCapturePayload(
     };
     if (forUpdate) {
       result.capacity = deleteField();
+      result.allowClosedContainers = deleteField();
     }
     return result;
   }
@@ -512,6 +516,11 @@ function buildItemCapturePayload(
       inputType: 'level',
       capacity: safeCapacity,
     };
+    if (payload.allowClosedContainers) {
+      result.allowClosedContainers = true;
+    } else if (forUpdate) {
+      result.allowClosedContainers = deleteField();
+    }
     if (forUpdate) {
       result.packSize = deleteField();
       result.packLabel = deleteField();
@@ -528,8 +537,35 @@ function buildItemCapturePayload(
     result.packLabel = deleteField();
     result.unitLabel = deleteField();
     result.capacity = deleteField();
+    result.allowClosedContainers = deleteField();
   }
   return result;
+}
+
+export async function migratePacksItemUnits(
+  items: InventoryItem[],
+): Promise<PacksUnitMigrationRecord[]> {
+  const plan = buildPacksUnitMigrationPlan(items);
+  if (plan.length === 0) return [];
+
+  const CHUNK_SIZE = 20;
+  for (let i = 0; i < plan.length; i += CHUNK_SIZE) {
+    const chunk = plan.slice(i, i + CHUNK_SIZE);
+    const batch = writeBatch(db);
+    chunk.forEach((rec) => {
+      batch.update(doc(db, 'items', rec.id), {
+        unit: clampString(rec.newUnit, MAX_UNIT_LENGTH),
+        updatedAt: serverTimestamp(),
+      });
+    });
+    try {
+      await batch.commit();
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, `items/${chunk[0]?.id ?? 'migration'}`);
+    }
+  }
+
+  return plan;
 }
 
 function computeStationAssignedIds(

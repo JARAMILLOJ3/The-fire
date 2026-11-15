@@ -246,6 +246,14 @@ export function StationShiftView({
     [items, station.id],
   );
 
+  const stationItemsById = useMemo(() => {
+    const map: Record<string, InventoryItem> = {};
+    stationItems.forEach((it) => {
+      map[it.id] = it;
+    });
+    return map;
+  }, [stationItems]);
+
   const isCompleted = report?.status === 'completed';
   const isLocked = isCompleted && !canManage;
   const isWorkerOpeningPhase = !canManage && scheduleStatus.phase === 'opening';
@@ -953,7 +961,7 @@ export function StationShiftView({
     }
 
     const rows = buildRowsForSubmit();
-    const anomalies = detectReportAnomalies(rows, mode);
+    const anomalies = detectReportAnomalies(rows, mode, stationItemsById);
     setConfirmModalState({ mode, anomalies });
   };
 

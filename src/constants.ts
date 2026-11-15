@@ -20,6 +20,38 @@ export const TIME_PATTERN = /^([01][0-9]|2[0-3]):[0-5][0-9]$/;
 
 export const PACK_LABEL_OPTIONS = ['paquete', 'kilo', 'caja', 'bolsa', 'bandeja', 'tarro'];
 export const UNIT_LABEL_OPTIONS = ['und', 'pan', 'loncha', 'tajada', 'porción', 'salchicha', 'carne'];
+export const LEVEL_UNIT_OPTIONS = ['L', 'ml', 'kg', 'g'] as const;
+export const INVALID_LEVEL_UNIT_NAMES = new Set([
+  'und',
+  'ud',
+  'uds',
+  'unidad',
+  'unidades',
+  'paq',
+  'paquete',
+  'paquetes',
+  'bolsa',
+  'bolsas',
+  'caja',
+  'cajas',
+  'porción',
+  'porciones',
+  'porcion',
+  'tajada',
+  'tajadas',
+  'lata',
+  'latas',
+  'botella',
+  'botellas',
+  'bandeja',
+  'bandejas',
+  'tarro',
+  'tarros',
+  'pan',
+  'panes',
+  'loncha',
+  'lonchas',
+]);
 export const UNASSIGNED_STATION_ID = 'sin_asignar';
 
 export const DEFAULT_SHIFT_SCHEDULE: ShiftSchedule = {

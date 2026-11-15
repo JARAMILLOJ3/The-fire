@@ -314,7 +314,7 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'workspaceId', 'ownerUid', 'authorizedEmails', 'station', 'name',
           'unit', 'minStock', 'targetStock', 'inputType', 'packSize', 'packLabel',
-          'unitLabel', 'capacity', 'active', 'sortOrder', 'createdAt', 'updatedAt'
+          'unitLabel', 'capacity', 'allowClosedContainers', 'active', 'sortOrder', 'createdAt', 'updatedAt'
         ])
         && isValidId(data.workspaceId)
         && isValidId(data.ownerUid)
@@ -329,6 +329,7 @@ service cloud.firestore {
         && (!('packLabel' in data) || (data.packLabel is string && data.packLabel.size() >= 1 && data.packLabel.size() <= 20))
         && (!('unitLabel' in data) || (data.unitLabel is string && data.unitLabel.size() >= 1 && data.unitLabel.size() <= 20))
         && (!('capacity' in data) || (data.capacity is number && data.capacity > 0 && data.capacity <= 100000))
+        && (!('allowClosedContainers' in data) || (data.allowClosedContainers is bool && (!data.allowClosedContainers || ('inputType' in data && data.inputType == 'level'))))
         && (
           !('inputType' in data)
           || data.inputType == 'count'
@@ -634,7 +635,7 @@ service cloud.firestore {
         && incoming().diff(existing()).affectedKeys().hasOnly([
           'authorizedEmails', 'station', 'name', 'unit',
           'minStock', 'targetStock', 'inputType', 'packSize', 'packLabel',
-          'unitLabel', 'capacity', 'active', 'sortOrder', 'updatedAt'
+          'unitLabel', 'capacity', 'allowClosedContainers', 'active', 'sortOrder', 'updatedAt'
         ]);
 
       allow delete: if isValidId(itemId)

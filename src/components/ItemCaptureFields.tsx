@@ -26,6 +26,8 @@ interface ItemCaptureFieldsProps {
   onUnitLabelChange: (val: string) => void;
   capacityInput: string;
   onCapacityInputChange: (val: string) => void;
+  allowClosedContainers?: boolean;
+  onAllowClosedContainersChange?: (next: boolean) => void;
   onClearError?: () => void;
   compact?: boolean;
   requireCaptureFields?: boolean;
@@ -49,6 +51,8 @@ export function ItemCaptureFields({
   onUnitLabelChange,
   capacityInput,
   onCapacityInputChange,
+  allowClosedContainers = false,
+  onAllowClosedContainersChange,
   onClearError,
   compact = false,
   requireCaptureFields = true,
@@ -221,6 +225,27 @@ export function ItemCaptureFields({
               <strong>{formatLevelApproximate(parsedCapacity / 8, cleanUnit)}</strong>, ½ ={' '}
               <strong>{formatLevelApproximate(parsedCapacity / 2, cleanUnit)}</strong>)
             </p>
+          )}
+          {onAllowClosedContainersChange && (
+            <label className="flex items-start gap-2.5 p-2.5 bg-white border border-stone-200 rounded-xl cursor-pointer hover:bg-stone-50 transition-colors">
+              <input
+                type="checkbox"
+                checked={allowClosedContainers}
+                onChange={(e) => {
+                  onAllowClosedContainersChange(e.target.checked);
+                  onClearError?.();
+                }}
+                className="mt-0.5 w-5 h-5 rounded border-stone-300 text-orange-600 focus:ring-orange-500 shrink-0 cursor-pointer"
+              />
+              <span className="min-w-0">
+                <span className="block text-xs font-semibold text-stone-900">
+                  Contar envases cerrados
+                </span>
+                <span className="block text-[11px] text-stone-600 leading-snug mt-0.5">
+                  Actívalo solo si en este puesto también hay botellas o tarros sellados además del envase abierto.
+                </span>
+              </span>
+            </label>
           )}
         </div>
       )}

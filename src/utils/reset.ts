@@ -4,7 +4,12 @@ import type {
   InventoryItem,
   Workstation,
 } from '../types';
-import { escapeCsvCell, getItemInputType, sanitizeStockQuantity } from './inventory';
+import {
+  escapeCsvCell,
+  getEffectiveItemUnit,
+  getItemInputType,
+  sanitizeStockQuantity,
+} from './inventory';
 
 export type ResetScope = 'reports_only' | 'all';
 
@@ -227,17 +232,19 @@ function formatCaptureTypeForBackup(item: InventoryItem): string {
   const mode = getItemInputType(item);
   if (mode === 'packs') {
     const pLabel = item.packLabel?.trim() || 'paquete';
-    const uLabel = item.unitLabel?.trim() || item.unit;
+    const uLabel = getEffectiveItemUnit(item);
     return `packs (1 ${pLabel} = ${item.packSize ?? '?'} ${uLabel})`;
   }
   if (mode === 'level') {
-    return `level (cap. ${item.capacity ?? '?'} ${item.unit})`;
+    const closedSuffix = item.allowClosedContainers ? ' + envases cerrados' : '';
+    return `level (cap. ${item.capacity ?? '?'} ${getEffectiveItemUnit(item)}${closedSuffix})`;
   }
   return 'count';
 }
 
 export function buildRestaurantBackupCsvContent(payload: RestaurantBackupPayload): string {
   const stationNameMap = new Map(payload.stations.map((s) => [s.id, s.name]));
+  const itemsById = new Map(payload.items.map((it) => [it.id, it]));
 
   const headers = [
     'Seccion',
@@ -296,7 +303,7 @@ export function buildRestaurantBackupCsvContent(payload: RestaurantBackupPayload
       escapeCsvCell(''),
       escapeCsvCell(it.station),
       escapeCsvCell(stationNameMap.get(it.station) ?? it.station),
-      escapeCsvCell(it.unit),
+      escapeCsvCell(getEffectiveItemUnit(it)),
       escapeCsvCell(formatCaptureTypeForBackup(it)),
       escapeCsvCell(it.name),
       escapeCsvCell(it.active ? 'Activo' : 'Archivado'),
@@ -348,6 +355,8 @@ export function buildRestaurantBackupCsvContent(payload: RestaurantBackupPayload
       a.itemName.localeCompare(b.itemName),
     );
     sortedEntries.forEach((entry) => {
+      const matchedItem = itemsById.get(entry.itemId);
+      const resolvedUnit = matchedItem ? getEffectiveItemUnit(matchedItem) : entry.unit;
       const consumed =
         !entry.notApplicable && entry.hasOpening && entry.hasClosing
           ? sanitizeStockQuantity(Math.max(0, entry.opening + entry.added - entry.closing))
@@ -368,7 +377,7 @@ export function buildRestaurantBackupCsvContent(payload: RestaurantBackupPayload
         escapeCsvCell(entry.date),
         escapeCsvCell(entry.station),
         escapeCsvCell(stationName),
-        escapeCsvCell(entry.unit),
+        escapeCsvCell(resolvedUnit),
         escapeCsvCell(''),
         escapeCsvCell(entry.itemName),
         escapeCsvCell(entryStatus),

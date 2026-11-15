@@ -253,6 +253,10 @@
           "type": "number",
           "description": "Capacidad total del envase lleno en su unidad base (> 0)"
         },
+        "allowClosedContainers": {
+          "type": "boolean",
+          "description": "Si está activo en tipo level, permite contar envases cerrados además del envase abierto"
+        },
         "active": {
           "type": "boolean"
         },

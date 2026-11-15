@@ -157,6 +157,8 @@ export default function App() {
     members,
     stationLinksByCode,
     yesterdayHasReports,
+    migratedPacksNotice,
+    dismissMigratedPacksNotice,
     refreshWorkerFallback,
   } = useStationData({
     authReady,
@@ -617,6 +619,8 @@ export default function App() {
                         onGoToTeam={() => navigateTo('equipo')}
                         onOpenScheduleModal={() => setScheduleModalOpen(true)}
                         onResetComplete={handleResetComplete}
+                        migratedPacksNotice={migratedPacksNotice}
+                        onDismissMigratedPacksNotice={dismissMigratedPacksNotice}
                       />
                     ) : activeSection === 'puestos' && canManage ? (
                       <WorkstationsManager
@@ -642,6 +646,8 @@ export default function App() {
                         items={effectiveItems}
                         initialFilterStation={catalogFilterStation}
                         onGoToWorkstations={() => navigateTo('puestos')}
+                        migratedPacksNotice={migratedPacksNotice}
+                        onDismissMigratedPacksNotice={dismissMigratedPacksNotice}
                       />
                     ) : activeSection === 'equipo' && canManage ? (
                       <TeamManager
