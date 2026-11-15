@@ -1,4 +1,4 @@
-import { useId } from 'react';
+import { useMemo } from 'react';
 import {
   MAX_PACK_LABEL_LENGTH,
   MAX_PACK_SIZE,
@@ -12,6 +12,7 @@ import {
   parseCaptureDecimalInput,
   pluralizeSpanishLabel,
 } from '../utils/inventory';
+import { OptionSelect } from './OptionSelect';
 
 interface ItemCaptureFieldsProps {
   inputType: CaptureInputType;
@@ -52,9 +53,14 @@ export function ItemCaptureFields({
   compact = false,
   requireCaptureFields = true,
 }: ItemCaptureFieldsProps) {
-  const uid = useId();
-  const packLabelListId = `${uid}-pack-labels`;
-  const unitLabelListId = `${uid}-unit-labels`;
+  const packOptions = useMemo(
+    () => PACK_LABEL_OPTIONS.map((opt) => ({ value: opt, label: opt })),
+    [],
+  );
+  const unitLabelOptions = useMemo(
+    () => UNIT_LABEL_OPTIONS.map((opt) => ({ value: opt, label: opt })),
+    [],
+  );
 
   const parsedPackSize = parseCaptureDecimalInput(packSizeInput);
   const parsedCapacity = parseCaptureDecimalInput(capacityInput);
@@ -91,52 +97,44 @@ export function ItemCaptureFields({
           }`}
         >
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-            <div>
+            <div className="min-w-0">
               <label className="block text-xs font-semibold text-stone-700 mb-1">
                 Nombre del paquete <span className="text-red-600">*</span>
               </label>
-              <input
-                type="text"
-                list={packLabelListId}
-                required={requireCaptureFields}
-                maxLength={MAX_PACK_LABEL_LENGTH}
+              <OptionSelect
+                size="sm"
                 value={packLabel}
-                onChange={(e) => {
-                  onPackLabelChange(e.target.value);
+                options={packOptions}
+                maxLength={MAX_PACK_LABEL_LENGTH}
+                required={requireCaptureFields}
+                selectAriaLabel="Nombre del paquete"
+                customAriaLabel="Otro nombre del paquete"
+                customPlaceholder="Ej: saco, bulto, caja"
+                onChange={(val) => {
+                  onPackLabelChange(val);
                   onClearError?.();
                 }}
-                placeholder="Ej: paquete, kilo, caja"
-                className="w-full min-h-[38px] px-2.5 py-1.5 text-xs sm:text-sm bg-white border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
               />
-              <datalist id={packLabelListId}>
-                {PACK_LABEL_OPTIONS.map((opt) => (
-                  <option key={opt} value={opt} />
-                ))}
-              </datalist>
             </div>
 
-            <div>
+            <div className="min-w-0">
               <label className="block text-xs font-semibold text-stone-700 mb-1">
                 Nombre de la unidad suelta <span className="text-red-600">*</span>
               </label>
-              <input
-                type="text"
-                list={unitLabelListId}
-                required={requireCaptureFields}
-                maxLength={MAX_PACK_LABEL_LENGTH}
+              <OptionSelect
+                size="sm"
                 value={unitLabel}
-                onChange={(e) => {
-                  onUnitLabelChange(e.target.value);
+                options={unitLabelOptions}
+                maxLength={MAX_PACK_LABEL_LENGTH}
+                required={requireCaptureFields}
+                selectAriaLabel="Nombre de la unidad suelta"
+                customAriaLabel="Otro nombre de la unidad suelta"
+                customPlaceholder="Ej: alita, pieza, und"
+                onChange={(val) => {
+                  onUnitLabelChange(val);
                   onClearError?.();
                 }}
-                placeholder="Ej: pan, loncha, und"
-                className="w-full min-h-[38px] px-2.5 py-1.5 text-xs sm:text-sm bg-white border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
               />
-              <datalist id={unitLabelListId}>
-                {UNIT_LABEL_OPTIONS.map((opt) => (
-                  <option key={opt} value={opt} />
-                ))}
-              </datalist>
             </div>
           </div>
 

@@ -4,7 +4,6 @@ import { AlertTriangle, Archive, ArchiveRestore, Pencil, Plus, X } from 'lucide-
 import {
   MAX_NAME_LENGTH,
   MAX_UNIT_LENGTH,
-  UNIT_OPTIONS,
 } from '../constants';
 import {
   createInventoryItem,
@@ -21,12 +20,14 @@ import type {
 import {
   buildItemCaptureFields,
   getItemInputType,
+  getUnitSelectOptions,
   hasTargetBelowMin,
   parseCaptureDecimalInput,
   pluralizeSpanishLabel,
   validateCatalogItemInput,
 } from '../utils/inventory';
 import { ItemCaptureFields } from './ItemCaptureFields';
+import { OptionSelect } from './OptionSelect';
 
 interface CatalogManagerProps {
   workspace: Workspace;
@@ -79,6 +80,8 @@ export function CatalogManager({
   const filteredItems = scopedStatusItems.filter((it) =>
     stationFilter === 'all' ? true : it.station === stationFilter,
   );
+
+  const unitOptions = useMemo(() => getUnitSelectOptions(), []);
 
   const parsedPackSize = useMemo(
     () => parseCaptureDecimalInput(packSizeInput),
@@ -578,7 +581,7 @@ export function CatalogManager({
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.96, y: 10 }}
               transition={{ duration: 0.2 }}
-              className="bg-white border border-stone-200 rounded-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto p-6 space-y-5 shadow-2xl"
+              className="bg-white border border-stone-200 rounded-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto p-5 sm:p-6 space-y-5 shadow-2xl min-w-0"
             >
               <div className="flex items-center justify-between">
                 <h2 className="font-display text-lg font-bold text-stone-900">
@@ -650,28 +653,23 @@ export function CatalogManager({
                     </select>
                   </div>
 
-                  <div>
+                  <div className="min-w-0">
                     <label className="block text-xs font-semibold text-stone-700 mb-1">
                       Unidad base de inventario <span className="text-red-600">*</span>
                     </label>
-                    <input
-                      type="text"
-                      list="unit-suggestions"
-                      required
-                      maxLength={MAX_UNIT_LENGTH}
+                    <OptionSelect
                       value={unit}
-                      onChange={(e) => {
-                        setUnit(e.target.value);
+                      options={unitOptions}
+                      maxLength={MAX_UNIT_LENGTH}
+                      required
+                      selectAriaLabel="Unidad base de inventario"
+                      customAriaLabel="Escribe la unidad de inventario"
+                      customPlaceholder="Ej: galón, ml, atado"
+                      onChange={(val) => {
+                        setUnit(val);
                         if (errorMsg) setErrorMsg(null);
                       }}
-                      placeholder="Ej: und, kg, L"
-                      className="w-full min-h-[42px] px-3 py-2 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500"
                     />
-                    <datalist id="unit-suggestions">
-                      {UNIT_OPTIONS.map((u) => (
-                        <option key={u} value={u} />
-                      ))}
-                    </datalist>
                   </div>
                 </div>
 

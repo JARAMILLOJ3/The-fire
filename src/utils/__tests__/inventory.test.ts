@@ -14,6 +14,7 @@ import {
   detectEntryAnomalies,
   getStockLevel,
   getSuggestedPurchase,
+  getUnitSelectOptions,
   inventoryItemToDraft,
   parseCaptureDecimalInput,
   parseQuantityInput,
@@ -1030,5 +1031,12 @@ describe('inventory.ts (sanitización, sin_dato, anomalías y compras)', () => {
 
     expect(parseCaptureDecimalInput(' 4,25 ')).toBe(4.25);
     expect(parseCaptureDecimalInput('   ')).toBeNaN();
+  });
+
+  it('builds unit selector options with descriptive labels for L and kg while keeping raw values', () => {
+    const opts = getUnitSelectOptions();
+    expect(opts.find((o) => o.value === 'L')).toEqual({ value: 'L', label: 'L (litros)' });
+    expect(opts.find((o) => o.value === 'kg')).toEqual({ value: 'kg', label: 'kg (kilos)' });
+    expect(opts.find((o) => o.value === 'und')).toEqual({ value: 'und', label: 'und' });
   });
 });

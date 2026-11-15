@@ -4,6 +4,7 @@ import {
   MAX_PACK_LABEL_LENGTH,
   MAX_PACK_SIZE,
   MAX_STOCK_VALUE,
+  UNIT_OPTIONS,
   WORKER_GRACE_MINUTES,
 } from '../constants';
 import type {
@@ -595,6 +596,13 @@ export interface PreparedStationItemPayload {
   packLabel?: string;
   unitLabel?: string;
   capacity?: number;
+}
+
+export function getUnitSelectOptions(): Array<{ value: string; label: string }> {
+  return UNIT_OPTIONS.map((unit) => ({
+    value: unit,
+    label: unit === 'L' ? 'L (litros)' : unit === 'kg' ? 'kg (kilos)' : unit,
+  }));
 }
 
 export function parseCaptureDecimalInput(rawValue: string): number {

@@ -23,7 +23,6 @@ import {
   MAX_DESC_LENGTH,
   MAX_NAME_LENGTH,
   MAX_UNIT_LENGTH,
-  UNIT_OPTIONS,
 } from '../constants';
 import {
   buildStationShareUrl,
@@ -36,11 +35,13 @@ import {
 import type { InventoryItem, StationLink, Workspace, Workstation } from '../types';
 import {
   createDefaultStationItemDraft,
+  getUnitSelectOptions,
   inventoryItemToDraft,
   type StationItemDraft,
   validateStationItemsDraft,
 } from '../utils/inventory';
 import { ItemCaptureFields } from './ItemCaptureFields';
+import { OptionSelect } from './OptionSelect';
 
 interface WorkstationsManagerProps {
   workspace: Workspace;
@@ -95,6 +96,8 @@ export function WorkstationsManager({
       .then((url) => setQrDataUrl(url))
       .catch(() => setQrDataUrl(''));
   }, [qrStation, qrStation?.accessCode]);
+
+  const unitOptions = useMemo(() => getUnitSelectOptions(), []);
 
   const itemsValidation = useMemo(
     () =>
@@ -480,14 +483,14 @@ export function WorkstationsManager({
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 bg-stone-950/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto"
+            className="fixed inset-0 z-50 bg-stone-950/50 backdrop-blur-xs flex items-start sm:items-center justify-center p-3 sm:p-4 overflow-y-auto"
           >
             <motion.div
               initial={{ opacity: 0, scale: 0.96, y: 10 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.96, y: 10 }}
               transition={{ duration: 0.2 }}
-              className="bg-white border border-stone-200 rounded-2xl w-full max-w-xl p-5 sm:p-6 space-y-5 shadow-2xl my-8"
+              className="bg-white border border-stone-200 rounded-2xl w-full max-w-xl p-4 sm:p-6 space-y-5 shadow-2xl my-4 sm:my-8 min-w-0"
             >
               <div className="flex items-center justify-between">
                 <h2 className="font-display text-lg font-bold text-stone-900">
@@ -595,7 +598,7 @@ export function WorkstationsManager({
                           key={row.id ?? `new_${idx}`}
                           className="p-3 bg-stone-50 border border-stone-200 rounded-xl space-y-2.5"
                         >
-                          <div className="flex items-end gap-2">
+                          <div className="flex items-end gap-2 min-w-0">
                             <div className="flex-1 min-w-0">
                               <label className="block text-[11px] font-semibold text-stone-700 mb-1">
                                 Insumo
@@ -606,22 +609,7 @@ export function WorkstationsManager({
                                 value={row.name}
                                 onChange={(e) => handleUpdateDraftItem(idx, 'name', e.target.value)}
                                 placeholder="Nombre del insumo"
-                                className="w-full min-h-[38px] px-2.5 py-1.5 text-xs sm:text-sm bg-white border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500"
-                              />
-                            </div>
-                            <div className="w-24 shrink-0">
-                              <label className="block text-[11px] font-semibold text-stone-700 mb-1">
-                                Unidad
-                              </label>
-                              <input
-                                type="text"
-                                list="ws-unit-list"
-                                maxLength={MAX_UNIT_LENGTH}
-                                value={row.unit}
-                                onChange={(e) => handleUpdateDraftItem(idx, 'unit', e.target.value)}
-                                placeholder="und"
-                                aria-label="Unidad"
-                                className="w-full min-h-[38px] px-2.5 py-1.5 text-xs sm:text-sm bg-white border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500"
+                                className="w-full min-h-[38px] px-2.5 py-1.5 text-sm bg-white border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500"
                               />
                             </div>
                             <button
@@ -633,6 +621,23 @@ export function WorkstationsManager({
                             >
                               <Trash2 className="w-4 h-4" />
                             </button>
+                          </div>
+
+                          <div className="min-w-0">
+                            <label className="block text-[11px] font-semibold text-stone-700 mb-1">
+                              Unidad <span className="text-red-600">*</span>
+                            </label>
+                            <OptionSelect
+                              size="sm"
+                              value={row.unit}
+                              options={unitOptions}
+                              maxLength={MAX_UNIT_LENGTH}
+                              required={Boolean(row.id || row.name.trim().length > 0)}
+                              selectAriaLabel="Unidad"
+                              customAriaLabel="Escribe la unidad"
+                              customPlaceholder="Ej: galón, ml, atado"
+                              onChange={(val) => handleUpdateDraftItem(idx, 'unit', val)}
+                            />
                           </div>
 
                           <div className="grid grid-cols-2 gap-2">
@@ -710,12 +715,6 @@ export function WorkstationsManager({
                       ))}
                     </div>
                   )}
-
-                  <datalist id="ws-unit-list">
-                    {UNIT_OPTIONS.map((u) => (
-                      <option key={u} value={u} />
-                    ))}
-                  </datalist>
 
                   {!errorMsg && itemsValidation.warning && (
                     <div
