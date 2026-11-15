@@ -270,7 +270,7 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'workspaceId', 'ownerUid', 'authorizedEmails', 'name', 'area',
-          'workerName', 'description', 'accessCode', 'nextItemSlot',
+          'workerName', 'description', 'accessCode', 'nextItemSlot', 'assignedItemIds',
           'active', 'sortOrder', 'createdAt', 'updatedAt'
         ])
         && isValidId(data.workspaceId)
@@ -283,6 +283,7 @@ service cloud.firestore {
         && isValidId(data.accessCode)
         && data.accessCode.size() >= 6 && data.accessCode.size() <= 64
         && data.nextItemSlot is number && data.nextItemSlot >= 1 && data.nextItemSlot <= 500
+        && (!('assignedItemIds' in data) || (data.assignedItemIds is list && data.assignedItemIds.size() <= 150 && (data.assignedItemIds.size() == 0 || isValidId(data.assignedItemIds[0]))))
         && data.active is bool
         && data.sortOrder is number && data.sortOrder >= 0 && data.sortOrder <= 10000
         && data.createdAt is timestamp
@@ -539,7 +540,7 @@ service cloud.firestore {
         && canManageWorkspace(existing().workspaceId)
         && incoming().diff(existing()).affectedKeys().hasOnly([
           'authorizedEmails', 'name', 'area', 'workerName', 'description',
-          'accessCode', 'nextItemSlot', 'active', 'sortOrder', 'updatedAt'
+          'accessCode', 'nextItemSlot', 'assignedItemIds', 'active', 'sortOrder', 'updatedAt'
         ]);
 
       allow delete: if isValidId(stationId)

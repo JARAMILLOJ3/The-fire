@@ -170,6 +170,15 @@ export function BossDashboard({
   const [resetModalOpen, setResetModalOpen] = useState(false);
 
   const isRestaurantEmpty = stations.length === 0 && items.length === 0;
+  const activeItemsCount = items.filter((it) => it.active).length;
+  const assignedActiveItemsCount = items.filter(
+    (it) => it.active && it.station !== 'sin_asignar',
+  ).length;
+  const showSetupGuide =
+    isRestaurantEmpty ||
+    activeItemsCount === 0 ||
+    stations.length === 0 ||
+    assignedActiveItemsCount === 0;
 
   const normalizedSchedule = useMemo(
     () => normalizeShiftSchedule(shiftSchedule),
@@ -478,6 +487,14 @@ export function BossDashboard({
           </button>
           <button
             type="button"
+            onClick={onGoToCatalog}
+            className="min-h-[44px] inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-semibold text-stone-800 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            <Package className="w-4 h-4 text-orange-600" />
+            <span>Insumos</span>
+          </button>
+          <button
+            type="button"
             onClick={onOpenScheduleModal}
             className="min-h-[44px] inline-flex items-center gap-1.5 px-3.5 py-2 text-sm font-semibold text-stone-800 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
@@ -601,44 +618,111 @@ export function BossDashboard({
         </motion.div>
       ) : null}
 
-      {isRestaurantEmpty ? (
+      {showSetupGuide && (
         <motion.section
           initial={{ opacity: 0, y: 8 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.25, ease: [0.22, 1, 0.36, 1] }}
-          className="bg-white border border-stone-200 rounded-2xl p-6 sm:p-8 text-center space-y-5"
+          className="bg-white border border-stone-200 rounded-2xl p-5 sm:p-6 space-y-4 no-print"
         >
-          <div className="w-12 h-12 rounded-2xl bg-orange-50 border border-orange-200 flex items-center justify-center mx-auto">
-            <QrCode className="w-6 h-6 text-orange-600" />
-          </div>
-          <div className="space-y-2 max-w-lg mx-auto">
-            <h2 className="font-display text-xl sm:text-2xl font-bold text-stone-900">
-              Restaurante sin datos · Listo para empezar
+          <div className="space-y-1">
+            <p className="text-xs font-semibold text-orange-600">
+              {isRestaurantEmpty ? 'Restaurante nuevo · Primeros pasos' : 'Configuración inicial'}
+            </p>
+            <h2 className="font-display text-lg sm:text-xl font-bold text-stone-900">
+              Prepara tu inventario en 3 pasos
             </h2>
-            <p className="text-sm text-stone-600 leading-relaxed">
-              No hay puestos de trabajo, insumos, reportes ni alertas activas. Crea primero tu primer puesto de trabajo y luego agrega su primer insumo.
+            <p className="text-sm text-stone-600">
+              Primero crea los insumos, luego crea los puestos de trabajo y por último asígnalos.
             </p>
           </div>
-          <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-1">
-            <button
-              type="button"
-              onClick={onGoToWorkstations}
-              className="w-full sm:w-auto min-h-[44px] inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 transition-colors cursor-pointer"
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <div
+              className={`rounded-xl border p-4 flex flex-col justify-between gap-3 ${
+                activeItemsCount > 0
+                  ? 'bg-emerald-50/50 border-emerald-200'
+                  : 'bg-orange-50/60 border-orange-200'
+              }`}
             >
-              <QrCode className="w-4 h-4" />
-              1. Crear primer puesto
-            </button>
-            <button
-              type="button"
-              onClick={onGoToCatalog}
-              className="w-full sm:w-auto min-h-[44px] inline-flex items-center justify-center gap-2 px-5 py-2.5 text-sm font-semibold text-stone-800 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 transition-colors cursor-pointer"
+              <div className="space-y-1">
+                <span className="text-xs font-bold text-stone-700">
+                  Paso 1 · {activeItemsCount > 0 ? `Listo (${activeItemsCount})` : 'Pendiente'}
+                </span>
+                <h3 className="text-sm font-bold text-stone-900">Crear insumos</h3>
+                <p className="text-xs text-stone-600">
+                  Define nombre, unidad, mínimo, ideal y cómo se cuenta cada producto.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={onGoToCatalog}
+                className="min-h-[40px] inline-flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 cursor-pointer"
+              >
+                <Package className="w-3.5 h-3.5" />
+                Ir a Insumos
+              </button>
+            </div>
+
+            <div
+              className={`rounded-xl border p-4 flex flex-col justify-between gap-3 ${
+                stations.length > 0
+                  ? 'bg-emerald-50/50 border-emerald-200'
+                  : 'bg-stone-50 border-stone-200'
+              }`}
             >
-              <Package className="w-4 h-4 text-orange-600" />
-              2. Crear primer insumo
-            </button>
+              <div className="space-y-1">
+                <span className="text-xs font-bold text-stone-700">
+                  Paso 2 · {stations.length > 0 ? `Listo (${stations.length})` : 'Pendiente'}
+                </span>
+                <h3 className="text-sm font-bold text-stone-900">Crear puestos</h3>
+                <p className="text-xs text-stone-600">
+                  Agrega cada sección con su trabajadora encargada y genera su código QR.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={onGoToWorkstations}
+                className="min-h-[40px] inline-flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-stone-800 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 cursor-pointer"
+              >
+                <QrCode className="w-3.5 h-3.5 text-orange-600" />
+                Ir a Puestos y QR
+              </button>
+            </div>
+
+            <div
+              className={`rounded-xl border p-4 flex flex-col justify-between gap-3 ${
+                assignedActiveItemsCount > 0
+                  ? 'bg-emerald-50/50 border-emerald-200'
+                  : 'bg-stone-50 border-stone-200'
+              }`}
+            >
+              <div className="space-y-1">
+                <span className="text-xs font-bold text-stone-700">
+                  Paso 3 ·{' '}
+                  {assignedActiveItemsCount > 0
+                    ? `Listo (${assignedActiveItemsCount})`
+                    : 'Pendiente'}
+                </span>
+                <h3 className="text-sm font-bold text-stone-900">Asignar insumos</h3>
+                <p className="text-xs text-stone-600">
+                  En cada puesto elige qué insumos aparecen en la planilla de su trabajadora.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={onGoToWorkstations}
+                className="min-h-[40px] inline-flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-stone-800 bg-white border border-stone-200 rounded-xl hover:bg-stone-100 cursor-pointer"
+              >
+                <ArrowRight className="w-3.5 h-3.5 text-orange-600" />
+                Asignar en Puestos
+              </button>
+            </div>
           </div>
         </motion.section>
-      ) : (
+      )}
+
+      {!isRestaurantEmpty && (
         <>
           {/* Semáforo KPI Summary Strip using gap-px */}
           <motion.section
@@ -1062,21 +1146,25 @@ export function BossDashboard({
           </div>
         </div>
 
-        {items.length === 0 ? (
+        {consolidatedRows.length === 0 ? (
           <div className="p-12 text-center space-y-3">
             <ShoppingBag className="w-8 h-8 text-stone-400 mx-auto" />
             <h3 className="font-display text-lg font-semibold text-stone-900">
-              Aún no hay insumos registrados
+              {items.length === 0
+                ? 'Aún no hay insumos registrados'
+                : 'No hay insumos asignados a un puesto todavía'}
             </h3>
             <p className="text-sm text-stone-600 max-w-md mx-auto">
-              Agrega insumos a tus puestos de trabajo en el catálogo para ver aquí el cierre diario y la lista de compras.
+              {items.length === 0
+                ? 'Crea tus insumos en el apartado Insumos y luego asígnalos a cada puesto de trabajo.'
+                : 'Asigna tus insumos creados a un puesto de trabajo para ver aquí el cierre diario y la lista de compras.'}
             </p>
             <button
               type="button"
-              onClick={onGoToCatalog}
+              onClick={items.length === 0 ? onGoToCatalog : onGoToWorkstations}
               className="mt-2 min-h-[44px] px-4 py-2 text-sm font-semibold text-white bg-stone-950 rounded-xl hover:bg-stone-800 transition-colors cursor-pointer"
             >
-              Ir al catálogo de insumos
+              {items.length === 0 ? 'Ir a Insumos' : 'Asignar en Puestos'}
             </button>
           </div>
         ) : sortedShoppingRows.length === 0 ? (
@@ -1582,9 +1670,9 @@ export function BossDashboard({
                 >
                   <Package className="w-5 h-5 text-orange-600 shrink-0 mt-0.5" />
                   <div className="min-w-0">
-                    <p className="text-sm font-semibold text-stone-900">Catálogo de insumos</p>
+                    <p className="text-sm font-semibold text-stone-900">Insumos</p>
                     <p className="text-xs text-stone-600 mt-0.5">
-                      Editar unidades, mínimos y stock objetivo
+                      Crear, editar unidades, mínimos y captura
                     </p>
                   </div>
                 </button>

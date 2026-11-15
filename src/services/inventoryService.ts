@@ -25,6 +25,7 @@ import {
   MAX_PACK_LABEL_LENGTH,
   MAX_PACK_SIZE,
   MAX_UNIT_LENGTH,
+  UNASSIGNED_STATION_ID,
 } from '../constants';
 import { db, handleFirestoreError, OperationType } from '../firebase';
 import type {
@@ -695,39 +696,11 @@ export async function createWorkstation(
     workerName: string;
     description: string;
     sortOrder: number;
-    initialItems?: Array<
-      {
-        name: string;
-        unit: string;
-        minStock: number;
-        targetStock: number;
-      } & InventoryItemCapturePayload
-    >;
   },
 ): Promise<Workstation> {
   const stationId = makeCleanId('puesto');
   const accessCode = generateAccessCode();
-  const initialItems = payload.initialItems ?? [];
   const batch = writeBatch(db);
-
-  initialItems.forEach((item, idx) => {
-    const itemId = `${stationId}_${idx + 1}`;
-    batch.set(doc(db, 'items', itemId), {
-      workspaceId: workspace.id,
-      ownerUid: workspace.ownerUid,
-      authorizedEmails: workspace.authorizedEmails.slice(0, 15),
-      station: stationId,
-      name: clampString(item.name, MAX_NAME_LENGTH),
-      unit: clampString(item.unit, MAX_UNIT_LENGTH),
-      minStock: clampNumber(item.minStock),
-      targetStock: clampNumber(item.targetStock),
-      ...buildItemCapturePayload(item, false),
-      active: true,
-      sortOrder: (idx + 1) * 10,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
-  });
 
   const stationBase: Omit<Workstation, 'id' | 'createdAt' | 'updatedAt'> = {
     workspaceId: workspace.id,
@@ -738,7 +711,8 @@ export async function createWorkstation(
     workerName: clampString(payload.workerName, MAX_NAME_LENGTH),
     description: clampString(payload.description, MAX_DESC_LENGTH),
     accessCode,
-    nextItemSlot: initialItems.length + 1,
+    nextItemSlot: 1,
+    assignedItemIds: [],
     active: true,
     sortOrder: clampNumber(payload.sortOrder),
   };
@@ -767,83 +741,25 @@ export async function createWorkstation(
 }
 
 export async function updateWorkstation(
-  workspace: Workspace,
   station: Workstation,
   payload: {
     name: string;
     area: string;
     workerName: string;
     description: string;
-    items?: Array<
-      {
-        id?: string;
-        name: string;
-        unit: string;
-        minStock: number;
-        targetStock: number;
-      } & InventoryItemCapturePayload
-    >;
-    archivedItemIds?: string[];
   },
 ): Promise<void> {
   const cleanName = clampString(payload.name, MAX_NAME_LENGTH);
   const cleanWorker = clampString(payload.workerName, MAX_NAME_LENGTH);
   const batch = writeBatch(db);
 
-  let nextSlot = Math.max(1, station.nextItemSlot || 1);
-
-  (payload.archivedItemIds ?? []).forEach((archivedId) => {
-    batch.update(doc(db, 'items', archivedId), {
-      active: false,
-      updatedAt: serverTimestamp(),
-    });
-  });
-
-  (payload.items ?? []).forEach((item) => {
-    if (item.id) {
-      batch.update(doc(db, 'items', item.id), {
-        name: clampString(item.name, MAX_NAME_LENGTH),
-        unit: clampString(item.unit, MAX_UNIT_LENGTH),
-        minStock: clampNumber(item.minStock),
-        targetStock: clampNumber(item.targetStock),
-        ...buildItemCapturePayload(item, true),
-        active: true,
-        updatedAt: serverTimestamp(),
-      });
-    } else {
-      const slot = nextSlot;
-      nextSlot += 1;
-      const itemId = `${station.id}_${slot}`;
-      batch.set(doc(db, 'items', itemId), {
-        workspaceId: workspace.id,
-        ownerUid: workspace.ownerUid,
-        authorizedEmails: workspace.authorizedEmails.slice(0, 15),
-        station: station.id,
-        name: clampString(item.name, MAX_NAME_LENGTH),
-        unit: clampString(item.unit, MAX_UNIT_LENGTH),
-        minStock: clampNumber(item.minStock),
-        targetStock: clampNumber(item.targetStock),
-        ...buildItemCapturePayload(item, false),
-        active: true,
-        sortOrder: slot * 10,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-    }
-  });
-
-  const stationUpdate: Record<string, unknown> = {
+  batch.update(doc(db, 'stations', station.id), {
     name: cleanName,
     area: clampString(payload.area, MAX_AREA_LENGTH),
     workerName: cleanWorker,
     description: clampString(payload.description, MAX_DESC_LENGTH),
     updatedAt: serverTimestamp(),
-  };
-  if (nextSlot !== station.nextItemSlot) {
-    stationUpdate.nextItemSlot = nextSlot;
-  }
-
-  batch.update(doc(db, 'stations', station.id), stationUpdate);
+  });
 
   if (station.accessCode) {
     batch.update(doc(db, 'stationLinks', station.accessCode), {
@@ -958,7 +874,10 @@ export async function deleteWorkstation(
     batch.delete(doc(db, 'stationLinks', station.accessCode));
   }
   stationItems.forEach((item) => {
-    batch.delete(doc(db, 'items', item.id));
+    batch.update(doc(db, 'items', item.id), {
+      station: UNASSIGNED_STATION_ID,
+      updatedAt: serverTimestamp(),
+    });
   });
 
   try {
@@ -1080,6 +999,32 @@ function buildItemCapturePayload(
   return result;
 }
 
+function computeStationAssignedIds(
+  stationId: string,
+  allItems: InventoryItem[],
+  overrides: Record<string, { station: StationId; active: boolean }> = {},
+): string[] {
+  const result: string[] = [];
+  const seen = new Set<string>();
+
+  allItems.forEach((item) => {
+    const effective = overrides[item.id] ?? { station: item.station, active: item.active };
+    if (effective.active && effective.station === stationId && !seen.has(item.id)) {
+      seen.add(item.id);
+      result.push(item.id);
+    }
+  });
+
+  Object.entries(overrides).forEach(([itemId, effective]) => {
+    if (effective.active && effective.station === stationId && !seen.has(itemId)) {
+      seen.add(itemId);
+      result.push(itemId);
+    }
+  });
+
+  return result.slice(0, 150);
+}
+
 export async function createInventoryItem(
   workspace: Workspace,
   station: Workstation | undefined,
@@ -1091,9 +1036,12 @@ export async function createInventoryItem(
     targetStock: number;
     sortOrder: number;
   } & InventoryItemCapturePayload,
+  allItems: InventoryItem[] = [],
 ): Promise<void> {
-  const slot = station ? Math.max(1, station.nextItemSlot) : Math.floor(Date.now() % 100000);
-  const itemId = `${payload.station}_${slot}`;
+  const isAssignedToStation =
+    Boolean(station) && payload.station !== UNASSIGNED_STATION_ID && station?.id === payload.station;
+  const slot = isAssignedToStation && station ? Math.max(1, station.nextItemSlot) : 1;
+  const itemId = isAssignedToStation ? `${payload.station}_${slot}` : makeCleanId('item');
   const batch = writeBatch(db);
 
   batch.set(doc(db, 'items', itemId), {
@@ -1112,9 +1060,13 @@ export async function createInventoryItem(
     updatedAt: serverTimestamp(),
   });
 
-  if (station) {
+  if (isAssignedToStation && station) {
+    const nextAssignedIds = computeStationAssignedIds(station.id, allItems, {
+      [itemId]: { station: station.id, active: true },
+    });
     batch.update(doc(db, 'stations', station.id), {
       nextItemSlot: slot + 1,
+      assignedItemIds: nextAssignedIds,
       updatedAt: serverTimestamp(),
     });
   }
@@ -1136,31 +1088,135 @@ export async function updateInventoryItem(
     targetStock: number;
     active: boolean;
   } & InventoryItemCapturePayload,
+  syncContext?: {
+    previousStation?: Workstation;
+    nextStation?: Workstation;
+    allItems: InventoryItem[];
+  },
 ): Promise<void> {
+  const batch = writeBatch(db);
+  batch.update(doc(db, 'items', itemId), {
+    station: payload.station,
+    name: clampString(payload.name, MAX_NAME_LENGTH),
+    unit: clampString(payload.unit, MAX_UNIT_LENGTH),
+    minStock: clampNumber(payload.minStock),
+    targetStock: clampNumber(payload.targetStock),
+    ...buildItemCapturePayload(payload, true),
+    active: payload.active,
+    updatedAt: serverTimestamp(),
+  });
+
+  if (syncContext) {
+    const overrides = {
+      [itemId]: { station: payload.station, active: payload.active },
+    };
+    const { previousStation, nextStation, allItems } = syncContext;
+    if (previousStation && previousStation.id !== payload.station) {
+      batch.update(doc(db, 'stations', previousStation.id), {
+        assignedItemIds: computeStationAssignedIds(previousStation.id, allItems, overrides),
+        updatedAt: serverTimestamp(),
+      });
+    }
+    if (nextStation) {
+      batch.update(doc(db, 'stations', nextStation.id), {
+        assignedItemIds: computeStationAssignedIds(nextStation.id, allItems, overrides),
+        updatedAt: serverTimestamp(),
+      });
+    }
+  }
+
   try {
-    await updateDoc(doc(db, 'items', itemId), {
-      station: payload.station,
-      name: clampString(payload.name, MAX_NAME_LENGTH),
-      unit: clampString(payload.unit, MAX_UNIT_LENGTH),
-      minStock: clampNumber(payload.minStock),
-      targetStock: clampNumber(payload.targetStock),
-      ...buildItemCapturePayload(payload, true),
-      active: payload.active,
-      updatedAt: serverTimestamp(),
-    });
+    await batch.commit();
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, `items/${itemId}`);
   }
 }
 
-export async function setInventoryItemActive(itemId: string, active: boolean): Promise<void> {
-  try {
-    await updateDoc(doc(db, 'items', itemId), {
-      active,
+export async function setInventoryItemActive(
+  itemId: string,
+  active: boolean,
+  syncContext?: {
+    station?: Workstation;
+    stationId: StationId;
+    allItems: InventoryItem[];
+  },
+): Promise<void> {
+  const batch = writeBatch(db);
+  batch.update(doc(db, 'items', itemId), {
+    active,
+    updatedAt: serverTimestamp(),
+  });
+
+  if (syncContext?.station) {
+    const overrides = {
+      [itemId]: { station: syncContext.stationId, active },
+    };
+    batch.update(doc(db, 'stations', syncContext.station.id), {
+      assignedItemIds: computeStationAssignedIds(
+        syncContext.station.id,
+        syncContext.allItems,
+        overrides,
+      ),
       updatedAt: serverTimestamp(),
     });
+  }
+
+  try {
+    await batch.commit();
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, `items/${itemId}`);
+  }
+}
+
+export async function assignWorkstationItems(params: {
+  station: Workstation;
+  allStations: Workstation[];
+  allItems: InventoryItem[];
+  selectedItemIds: string[];
+}): Promise<void> {
+  const { station, allStations, allItems, selectedItemIds } = params;
+  const selectedSet = new Set(selectedItemIds);
+  const batch = writeBatch(db);
+  const overrides: Record<string, { station: StationId; active: boolean }> = {};
+  const touchedStationIds = new Set<string>([station.id]);
+  const stationById = new Map(allStations.map((st) => [st.id, st]));
+
+  allItems.forEach((item) => {
+    if (!item.active) return;
+    const shouldBelongHere = selectedSet.has(item.id);
+    const currentlyHere = item.station === station.id;
+
+    if (shouldBelongHere && !currentlyHere) {
+      batch.update(doc(db, 'items', item.id), {
+        station: station.id,
+        updatedAt: serverTimestamp(),
+      });
+      overrides[item.id] = { station: station.id, active: true };
+      if (item.station && item.station !== UNASSIGNED_STATION_ID && stationById.has(item.station)) {
+        touchedStationIds.add(item.station);
+      }
+    } else if (!shouldBelongHere && currentlyHere) {
+      batch.update(doc(db, 'items', item.id), {
+        station: UNASSIGNED_STATION_ID,
+        updatedAt: serverTimestamp(),
+      });
+      overrides[item.id] = { station: UNASSIGNED_STATION_ID, active: true };
+    }
+  });
+
+  touchedStationIds.forEach((stId) => {
+    const targetStation = stationById.get(stId);
+    if (!targetStation) return;
+    batch.update(doc(db, 'stations', stId), {
+      assignedItemIds: computeStationAssignedIds(stId, allItems, overrides),
+      updatedAt: serverTimestamp(),
+    });
+  });
+
+  try {
+    await batch.commit();
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `stations/${station.id}`);
   }
 }
 
@@ -1181,18 +1237,27 @@ export async function loadWorkerStationFallback(params: {
       ? ({ id: stSnap.id, ...stSnap.data() } as Workstation)
       : null;
 
-    const maxSlot = station ? Math.min(200, station.nextItemSlot) : 40;
-    const itemPromises: Promise<InventoryItem | null>[] = [];
-    for (let slot = 1; slot < maxSlot; slot++) {
-      const id = `${stationId}_${slot}`;
-      itemPromises.push(
-        getDoc(doc(db, 'items', id)).then((snap) =>
-          snap.exists() ? ({ id: snap.id, ...snap.data() } as InventoryItem) : null,
-        ),
-      );
+    const itemIdsToFetch: string[] = [];
+    if (station && Array.isArray(station.assignedItemIds)) {
+      station.assignedItemIds.forEach((id) => {
+        if (id && !itemIdsToFetch.includes(id)) {
+          itemIdsToFetch.push(id);
+        }
+      });
+    } else {
+      const maxSlot = station ? Math.min(200, station.nextItemSlot) : 40;
+      for (let slot = 1; slot < maxSlot; slot++) {
+        itemIdsToFetch.push(`${stationId}_${slot}`);
+      }
     }
+
+    const itemPromises = itemIdsToFetch.map((id) =>
+      getDoc(doc(db, 'items', id)).then((snap) =>
+        snap.exists() ? ({ id: snap.id, ...snap.data() } as InventoryItem) : null,
+      ),
+    );
     const fetchedItems = (await Promise.all(itemPromises)).filter(
-      (it): it is InventoryItem => Boolean(it && it.active),
+      (it): it is InventoryItem => Boolean(it && it.active && it.station === stationId),
     );
     fetchedItems.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name));
 

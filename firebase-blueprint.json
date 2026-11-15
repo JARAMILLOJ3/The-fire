@@ -106,6 +106,10 @@
         "nextItemSlot": {
           "type": "number"
         },
+        "assignedItemIds": {
+          "type": "array",
+          "description": "IDs de insumos asignados a este puesto de trabajo"
+        },
         "active": {
           "type": "boolean"
         },

@@ -20,6 +20,7 @@ export const TIME_PATTERN = /^([01][0-9]|2[0-3]):[0-5][0-9]$/;
 
 export const PACK_LABEL_OPTIONS = ['paquete', 'kilo', 'caja', 'bolsa', 'bandeja', 'tarro'];
 export const UNIT_LABEL_OPTIONS = ['und', 'pan', 'loncha', 'tajada', 'porción', 'salchicha', 'carne'];
+export const UNASSIGNED_STATION_ID = 'sin_asignar';
 
 export const DEFAULT_SHIFT_SCHEDULE: ShiftSchedule = {
   enabled: true,

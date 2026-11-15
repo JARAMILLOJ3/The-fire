@@ -302,7 +302,7 @@ export default function App() {
       : activeSection === 'puestos'
         ? 'Puestos y QR'
         : activeSection === 'catalogo'
-          ? 'Catálogo'
+          ? 'Insumos'
           : activeSection === 'equipo'
             ? 'Equipo'
             : currentStation?.name ?? 'Puesto';
@@ -390,18 +390,6 @@ export default function App() {
             </p>
             <button
               type="button"
-              onClick={() => navigateTo('puestos')}
-              className={`w-full min-h-[44px] flex items-center gap-2.5 px-3 py-2.5 text-sm font-medium rounded-xl transition-colors cursor-pointer ${
-                activeSection === 'puestos'
-                  ? 'bg-orange-600/15 text-orange-400 font-semibold'
-                  : 'text-stone-300 hover:bg-stone-900 hover:text-white'
-              }`}
-            >
-              <QrCode className="w-4 h-4 shrink-0" />
-              <span className="truncate">Puestos y Códigos QR</span>
-            </button>
-            <button
-              type="button"
               onClick={() => {
                 setCatalogFilterStation('all');
                 navigateTo('catalogo');
@@ -413,7 +401,19 @@ export default function App() {
               }`}
             >
               <Package className="w-4 h-4 shrink-0" />
-              <span className="truncate">Catálogo de Insumos</span>
+              <span className="truncate">Insumos</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => navigateTo('puestos')}
+              className={`w-full min-h-[44px] flex items-center gap-2.5 px-3 py-2.5 text-sm font-medium rounded-xl transition-colors cursor-pointer ${
+                activeSection === 'puestos'
+                  ? 'bg-orange-600/15 text-orange-400 font-semibold'
+                  : 'text-stone-300 hover:bg-stone-900 hover:text-white'
+              }`}
+            >
+              <QrCode className="w-4 h-4 shrink-0" />
+              <span className="truncate">Puestos y Códigos QR</span>
             </button>
             <button
               type="button"
@@ -656,6 +656,10 @@ export default function App() {
                         onOpenStationSheet={(stId) => navigateTo(stId)}
                         onOpenStationCatalog={(stId) => {
                           setCatalogFilterStation(stId);
+                          navigateTo('catalogo');
+                        }}
+                        onGoToCatalog={() => {
+                          setCatalogFilterStation('all');
                           navigateTo('catalogo');
                         }}
                       />

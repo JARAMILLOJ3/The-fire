@@ -91,4 +91,15 @@ describe('firestore.rules structural security audit', () => {
     // Entry delete requires 0 extra get/exists reads so owner batch reset works cleanly across reports
     expect(entriesDelete).not.toMatch(/\b(get|exists)\s*\(/);
   });
+
+  it('bounds assignedItemIds on stations to <= 150 and restricts station updates to managers', () => {
+    expect(rulesText).toContain('data.assignedItemIds.size() <= 150');
+    const stationsBlockMatch = rulesText.match(/match \/stations\/\{stationId\} \{[\s\S]*?\n    \}/);
+    expect(stationsBlockMatch).not.toBeNull();
+    const stationsBlock = stationsBlockMatch![0];
+    expect(stationsBlock).toContain("'assignedItemIds'");
+    expect(stationsBlock).toContain('allow update:');
+    expect(stationsBlock).toContain('canManageWorkspace(');
+    expect(stationsBlock).not.toContain('isActiveStationWorker(');
+  });
 });

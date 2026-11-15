@@ -4,6 +4,7 @@ import {
   MAX_PACK_LABEL_LENGTH,
   MAX_PACK_SIZE,
   MAX_STOCK_VALUE,
+  UNASSIGNED_STATION_ID,
   UNIT_OPTIONS,
   WORKER_GRACE_MINUTES,
 } from '../constants';
@@ -560,7 +561,10 @@ export function validateCatalogItemInput(params: {
   if (duplicate) {
     return {
       valid: false,
-      error: `Ya existe un insumo activo llamado "${duplicate.name}" en este puesto.`,
+      error:
+        params.station === UNASSIGNED_STATION_ID
+          ? `Ya existe un insumo activo llamado "${duplicate.name}" sin asignar.`
+          : `Ya existe un insumo activo llamado "${duplicate.name}" en este puesto.`,
       warning: null,
     };
   }
@@ -570,32 +574,6 @@ export function validateCatalogItemInput(params: {
     : null;
 
   return { valid: true, error: null, warning };
-}
-
-export interface StationItemDraft {
-  id?: string;
-  name: string;
-  unit: string;
-  minStock: number;
-  targetStock: number;
-  inputType: CaptureInputType;
-  packSizeInput: string;
-  packLabel: string;
-  unitLabel: string;
-  capacityInput: string;
-}
-
-export interface PreparedStationItemPayload {
-  id?: string;
-  name: string;
-  unit: string;
-  minStock: number;
-  targetStock: number;
-  inputType: CaptureInputType;
-  packSize?: number;
-  packLabel?: string;
-  unitLabel?: string;
-  capacity?: number;
 }
 
 export function getUnitSelectOptions(): Array<{ value: string; label: string }> {
@@ -641,134 +619,27 @@ export function buildItemCaptureFields(draft: {
   return { inputType: 'count' };
 }
 
-export function createDefaultStationItemDraft(
-  overrides: Partial<StationItemDraft> = {},
-): StationItemDraft {
-  return {
-    name: '',
-    unit: 'und',
-    minStock: 5,
-    targetStock: 15,
-    inputType: 'count',
-    packSizeInput: '8',
-    packLabel: 'paquete',
-    unitLabel: 'und',
-    capacityInput: '5',
-    ...overrides,
-  };
-}
+export function validateStationItemAssignment(params: {
+  selectedItemIds: string[];
+  allItems: InventoryItem[];
+}): { valid: boolean; error: string | null } {
+  const selectedSet = new Set(params.selectedItemIds);
+  const seenNames = new Map<string, string>();
 
-export function inventoryItemToDraft(item: InventoryItem): StationItemDraft {
-  return {
-    id: item.id,
-    name: item.name,
-    unit: item.unit,
-    minStock: item.minStock,
-    targetStock: item.targetStock,
-    inputType: getItemInputType(item),
-    packSizeInput: typeof item.packSize === 'number' ? String(item.packSize) : '8',
-    packLabel: item.packLabel ?? 'paquete',
-    unitLabel: item.unitLabel ?? (item.unit || 'und'),
-    capacityInput: typeof item.capacity === 'number' ? String(item.capacity) : '5',
-  };
-}
-
-export interface StationDraftItemsValidationResult {
-  valid: boolean;
-  error: string | null;
-  warning: string | null;
-  preparedItems: PreparedStationItemPayload[];
-}
-
-export function validateStationItemsDraft(params: {
-  drafts: StationItemDraft[];
-  stationId: StationId;
-}): StationDraftItemsValidationResult {
-  const preparedItems: PreparedStationItemPayload[] = [];
-  const accumulatedActiveItems: InventoryItem[] = [];
-  const warnings: string[] = [];
-
-  for (let i = 0; i < params.drafts.length; i++) {
-    const row = params.drafts[i];
-    const cleanName = row.name.trim();
-
-    if (!cleanName) {
-      if (row.id) {
-        return {
-          valid: false,
-          error: 'Escribe el nombre de cada insumo existente o quítalo de la lista.',
-          warning: null,
-          preparedItems: [],
-        };
-      }
-      continue;
-    }
-
-    const captureFields = buildItemCaptureFields(row);
-    const check = validateCatalogItemInput({
-      name: cleanName,
-      unit: row.unit,
-      station: params.stationId,
-      minStock: row.minStock,
-      targetStock: row.targetStock,
-      inputType: captureFields.inputType,
-      packSize: captureFields.packSize,
-      packLabel: captureFields.packLabel,
-      unitLabel: captureFields.unitLabel,
-      capacity: captureFields.capacity,
-      existingItems: accumulatedActiveItems,
-      editingItemId: row.id,
-    });
-
-    if (!check.valid) {
+  for (const item of params.allItems) {
+    if (!item.active || !selectedSet.has(item.id)) continue;
+    const norm = normalizeCatalogItemName(item.name);
+    const existingName = seenNames.get(norm);
+    if (existingName) {
       return {
         valid: false,
-        error: `${cleanName}: ${check.error ?? 'Revisa los datos del insumo.'}`,
-        warning: null,
-        preparedItems: [],
+        error: `No puedes asignar dos insumos activos con el mismo nombre ("${existingName}") al mismo puesto.`,
       };
     }
-
-    if (check.warning) {
-      warnings.push(`${cleanName}: ${check.warning}`);
-    }
-
-    const prepared: PreparedStationItemPayload = {
-      ...(row.id ? { id: row.id } : {}),
-      name: cleanName,
-      unit: row.unit.trim(),
-      minStock: row.minStock,
-      targetStock: row.targetStock,
-      ...captureFields,
-    };
-    preparedItems.push(prepared);
-
-    accumulatedActiveItems.push({
-      id: row.id ?? `draft_${i}`,
-      workspaceId: '',
-      ownerUid: '',
-      authorizedEmails: [],
-      station: params.stationId,
-      name: prepared.name,
-      unit: prepared.unit,
-      minStock: prepared.minStock,
-      targetStock: prepared.targetStock,
-      inputType: prepared.inputType,
-      packSize: prepared.packSize,
-      packLabel: prepared.packLabel,
-      unitLabel: prepared.unitLabel,
-      capacity: prepared.capacity,
-      active: true,
-      sortOrder: (i + 1) * 10,
-    });
+    seenNames.set(norm, item.name);
   }
 
-  return {
-    valid: true,
-    error: null,
-    warning: warnings.length > 0 ? warnings[0] : null,
-    preparedItems,
-  };
+  return { valid: true, error: null };
 }
 
 export function getStockLevelMeta(level: StockLevel): {
@@ -822,7 +693,7 @@ export function buildConsolidatedRows(
   reportsByStation: Record<string, DailyReport | undefined>,
 ): ConsolidatedItemRow[] {
   return items
-    .filter((item) => item.active)
+    .filter((item) => item.active && item.station !== UNASSIGNED_STATION_ID)
     .map((item) => {
       const entry = entriesByItemId[item.id] ?? null;
       const report = reportsByStation[item.station];

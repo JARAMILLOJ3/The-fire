@@ -231,10 +231,19 @@ export function useStationData(params: {
   }, [authReady, user, workspace?.id, canManage, userEmail, role, effectiveSelectedDate]);
 
   // Worker mode: real-time document-level listeners on worker's own station items
-  const workerNextSlot = useMemo(() => {
-    if (canManage || role === 'jefe' || !stationsLoaded) return 0;
+  const workerItemIdsKey = useMemo(() => {
+    if (canManage || role === 'jefe' || !stationsLoaded) return '';
     const st = stations.find((s) => s.id === role);
-    return st ? Math.min(200, Math.max(1, st.nextItemSlot)) : 1;
+    if (!st) return '';
+    if (Array.isArray(st.assignedItemIds)) {
+      return st.assignedItemIds.filter(Boolean).join('|');
+    }
+    const nextSlot = Math.min(200, Math.max(1, st.nextItemSlot));
+    const legacyIds: string[] = [];
+    for (let slot = 1; slot < nextSlot; slot++) {
+      legacyIds.push(`${role}_${slot}`);
+    }
+    return legacyIds.join('|');
   }, [canManage, role, stationsLoaded, stations]);
 
   useEffect(() => {
@@ -242,7 +251,9 @@ export function useStationData(params: {
       return;
     }
 
-    if (workerNextSlot <= 1) {
+    const itemIds = workerItemIdsKey ? workerItemIdsKey.split('|').filter(Boolean) : [];
+
+    if (itemIds.length === 0) {
       setItems([]);
       setItemsLoaded(true);
       return;
@@ -251,10 +262,8 @@ export function useStationData(params: {
     const itemsMap = new Map<string, InventoryItem>();
     const unsubs: Array<() => void> = [];
     let resolvedCount = 0;
-    const totalSlots = workerNextSlot - 1;
 
-    for (let slot = 1; slot < workerNextSlot; slot++) {
-      const itemId = `${role}_${slot}`;
+    itemIds.forEach((itemId) => {
       const unsub = onSnapshot(
         doc(db, 'items', itemId),
         (snap) => {
@@ -277,14 +286,14 @@ export function useStationData(params: {
             (a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name),
           );
           setItems(list);
-          if (resolvedCount >= totalSlots) {
+          if (resolvedCount >= itemIds.length) {
             setItemsLoaded(true);
           }
         },
         (err) => handleFirestoreError(err, OperationType.GET, `items/${itemId}`),
       );
       unsubs.push(unsub);
-    }
+    });
 
     const fallbackTimer = window.setTimeout(() => setItemsLoaded(true), 800);
 
@@ -292,7 +301,7 @@ export function useStationData(params: {
       window.clearTimeout(fallbackTimer);
       unsubs.forEach((u) => u());
     };
-  }, [authReady, user, workspace?.id, canManage, role, stationsLoaded, workerNextSlot]);
+  }, [authReady, user, workspace?.id, canManage, role, stationsLoaded, workerItemIdsKey]);
 
   // Auto-migrate legacy workspaces that predate dynamic Workstations (never re-seed reset workspaces)
   useEffect(() => {

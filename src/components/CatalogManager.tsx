@@ -4,6 +4,7 @@ import { AlertTriangle, Archive, ArchiveRestore, Pencil, Plus, X } from 'lucide-
 import {
   MAX_NAME_LENGTH,
   MAX_UNIT_LENGTH,
+  UNASSIGNED_STATION_ID,
 } from '../constants';
 import {
   createInventoryItem,
@@ -54,7 +55,9 @@ export function CatalogManager({
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
 
   const [name, setName] = useState('');
-  const [stationId, setStationId] = useState<StationId>(stations[0]?.id ?? 'mesera');
+  const [stationId, setStationId] = useState<StationId>(
+    stations[0]?.id ?? UNASSIGNED_STATION_ID,
+  );
   const [unit, setUnit] = useState('und');
   const [minStock, setMinStock] = useState(5);
   const [targetStock, setTargetStock] = useState(15);
@@ -76,6 +79,10 @@ export function CatalogManager({
   const activeItems = useMemo(() => items.filter((it) => it.active), [items]);
   const archivedItems = useMemo(() => items.filter((it) => !it.active), [items]);
   const scopedStatusItems = statusFilter === 'active' ? activeItems : archivedItems;
+  const unassignedCount = useMemo(
+    () => scopedStatusItems.filter((i) => i.station === UNASSIGNED_STATION_ID).length,
+    [scopedStatusItems],
+  );
 
   const filteredItems = scopedStatusItems.filter((it) =>
     stationFilter === 'all' ? true : it.station === stationFilter,
@@ -128,7 +135,11 @@ export function CatalogManager({
   const openCreateForm = () => {
     setEditingItem(null);
     setName('');
-    setStationId(stationFilter === 'all' ? (stations[0]?.id ?? 'mesera') : stationFilter);
+    setStationId(
+      stationFilter === 'all'
+        ? (stations[0]?.id ?? UNASSIGNED_STATION_ID)
+        : stationFilter,
+    );
     setUnit('und');
     setMinStock(5);
     setTargetStock(15);
@@ -145,7 +156,7 @@ export function CatalogManager({
   const openEditForm = (item: InventoryItem) => {
     setEditingItem(item);
     setName(item.name);
-    setStationId(item.station);
+    setStationId(item.station || UNASSIGNED_STATION_ID);
     setUnit(item.unit);
     setMinStock(item.minStock);
     setTargetStock(item.targetStock);
@@ -180,26 +191,41 @@ export function CatalogManager({
       });
 
       if (editingItem) {
-        await updateInventoryItem(editingItem.id, {
-          station: stationId,
-          name: cleanName,
-          unit: cleanUnit,
-          minStock,
-          targetStock,
-          active: editingItem.active,
-          ...capturePayload,
-        });
+        const previousStation = stations.find((s) => s.id === editingItem.station);
+        const nextStation = stations.find((s) => s.id === stationId);
+        await updateInventoryItem(
+          editingItem.id,
+          {
+            station: stationId,
+            name: cleanName,
+            unit: cleanUnit,
+            minStock,
+            targetStock,
+            active: editingItem.active,
+            ...capturePayload,
+          },
+          {
+            previousStation,
+            nextStation,
+            allItems: items,
+          },
+        );
       } else {
         const targetStationObj = stations.find((s) => s.id === stationId);
-        await createInventoryItem(workspace, targetStationObj, {
-          station: stationId,
-          name: cleanName,
-          unit: cleanUnit,
-          minStock,
-          targetStock,
-          sortOrder: (items.length + 1) * 10,
-          ...capturePayload,
-        });
+        await createInventoryItem(
+          workspace,
+          targetStationObj,
+          {
+            station: stationId,
+            name: cleanName,
+            unit: cleanUnit,
+            minStock,
+            targetStock,
+            sortOrder: (items.length + 1) * 10,
+            ...capturePayload,
+          },
+          items,
+        );
       }
       setShowForm(false);
     } catch {
@@ -214,7 +240,11 @@ export function CatalogManager({
     setSubmitting(true);
     setActionFeedback(null);
     try {
-      await setInventoryItemActive(confirmArchive.id, false);
+      await setInventoryItemActive(confirmArchive.id, false, {
+        station: stations.find((s) => s.id === confirmArchive.station),
+        stationId: confirmArchive.station,
+        allItems: items,
+      });
       setConfirmArchive(null);
     } catch {
       setActionFeedback('No se pudo archivar el insumo. Intenta nuevamente.');
@@ -248,7 +278,11 @@ export function CatalogManager({
 
     setSubmitting(true);
     try {
-      await setInventoryItemActive(item.id, true);
+      await setInventoryItemActive(item.id, true, {
+        station: stations.find((s) => s.id === item.station),
+        stationId: item.station,
+        allItems: items,
+      });
     } catch {
       setActionFeedback('No se pudo reactivar el insumo. Intenta nuevamente.');
     } finally {
@@ -269,24 +303,38 @@ export function CatalogManager({
             {archivedItems.length > 0 ? ` · ${archivedItems.length} archivados` : ''}
           </p>
           <h1 className="font-display text-2xl sm:text-3xl font-bold tracking-tight text-stone-900 mt-1">
-            Catálogo de Insumos
+            Insumos
           </h1>
           <p className="text-sm text-stone-600 mt-1">
-            Administra los productos de cada puesto. Los insumos archivados conservan todo su historial sin aparecer en planillas nuevas.
+            Crea y edita todos tus insumos aquí. Luego asigna cada producto a su puesto desde Puestos de Trabajo.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
             onClick={openCreateForm}
-            disabled={stations.length === 0}
-            className="min-h-[44px] inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.98] disabled:opacity-50 transition-all whitespace-nowrap shrink-0 cursor-pointer"
+            className="min-h-[44px] inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 active:scale-[0.98] transition-all whitespace-nowrap shrink-0 cursor-pointer"
           >
             <Plus className="w-4 h-4" />
             Nuevo insumo
           </button>
         </div>
       </div>
+
+      {activeItems.length > 0 && stations.length === 0 && onGoToWorkstations && (
+        <div className="px-4 py-3.5 rounded-2xl bg-orange-50 border border-orange-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs sm:text-sm text-orange-950">
+          <span>
+            <strong>Siguiente paso:</strong> ya tienes insumos creados. Crea tus puestos de trabajo para asignarlos y generar sus códigos QR.
+          </span>
+          <button
+            type="button"
+            onClick={onGoToWorkstations}
+            className="min-h-[40px] px-4 py-2 text-xs sm:text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            Ir a Puestos y QR
+          </button>
+        </div>
+      )}
 
       {misconfiguredActiveCount > 0 && (
         <div
@@ -325,6 +373,21 @@ export function CatalogManager({
           >
             Todos ({scopedStatusItems.length})
           </button>
+          {(unassignedCount > 0 ||
+            stations.length === 0 ||
+            stationFilter === UNASSIGNED_STATION_ID) && (
+            <button
+              type="button"
+              onClick={() => setStationFilter(UNASSIGNED_STATION_ID)}
+              className={`min-h-[36px] px-3 py-1.5 text-xs font-semibold rounded-lg transition-all whitespace-nowrap shrink-0 cursor-pointer ${
+                stationFilter === UNASSIGNED_STATION_ID
+                  ? 'bg-white text-stone-900 shadow-sm'
+                  : 'text-stone-600 hover:text-stone-900'
+              }`}
+            >
+              Sin asignar ({unassignedCount})
+            </button>
+          )}
           {stations.map((st) => {
             const count = scopedStatusItems.filter((i) => i.station === st.id).length;
             return (
@@ -381,29 +444,21 @@ export function CatalogManager({
         {filteredItems.length === 0 ? (
           <div className="p-10 text-center space-y-3">
             <p className="text-sm font-medium text-stone-700">
-              {stations.length === 0
-                ? 'Primero crea tu primer puesto de trabajo para poder agregar insumos.'
-                : statusFilter === 'archived'
-                  ? 'No hay insumos archivados en este filtro.'
+              {statusFilter === 'archived'
+                ? 'No hay insumos archivados en este filtro.'
+                : activeItems.length === 0
+                  ? 'Aún no hay insumos creados. Paso 1: crea tus insumos con unidad, mínimo, ideal y tipo de captura.'
                   : 'No hay insumos activos en esta vista.'}
             </p>
-            {stations.length === 0 && onGoToWorkstations ? (
-              <button
-                type="button"
-                onClick={onGoToWorkstations}
-                className="min-h-[40px] px-4 py-2 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 cursor-pointer"
-              >
-                Crear primer puesto de trabajo
-              </button>
-            ) : statusFilter === 'active' && stations.length > 0 ? (
+            {statusFilter === 'active' && (
               <button
                 type="button"
                 onClick={openCreateForm}
-                className="text-sm font-semibold text-orange-600 hover:text-orange-700 cursor-pointer"
+                className="min-h-[42px] px-4 py-2 text-sm font-semibold text-white bg-orange-600 rounded-xl hover:bg-orange-700 cursor-pointer"
               >
-                + Agregar primer insumo
+                + Crear primer insumo
               </button>
-            ) : null}
+            )}
           </div>
         ) : (
           <>
@@ -412,6 +467,10 @@ export function CatalogManager({
               {filteredItems.map((item) => {
                 const targetLow = hasTargetBelowMin(item.minStock, item.targetStock);
                 const mode = getItemInputType(item);
+                const stationLabel =
+                  item.station === UNASSIGNED_STATION_ID
+                    ? 'Sin asignar'
+                    : (stationNameMap.get(item.station) ?? 'Sin asignar');
                 const modeSummary =
                   mode === 'packs' && item.packSize
                     ? `${item.packLabel || 'paquete'} de ${item.packSize} ${pluralizeSpanishLabel(item.unitLabel || item.unit, item.packSize)}`
@@ -423,7 +482,14 @@ export function CatalogManager({
                     <div className="min-w-0">
                       <p className="text-sm font-semibold text-stone-900 truncate">{item.name}</p>
                       <p className="text-xs text-stone-500 truncate">
-                        {stationNameMap.get(item.station) ?? item.station} · {item.unit} · {modeSummary}
+                        <span
+                          className={
+                            stationLabel === 'Sin asignar' ? 'text-amber-700 font-semibold' : undefined
+                          }
+                        >
+                          {stationLabel}
+                        </span>{' '}
+                        · {item.unit} · {modeSummary}
                       </p>
                       <p className="text-xs font-mono tabular-nums text-stone-600 mt-0.5">
                         Mín: {item.minStock} · Ideal: {item.targetStock}
@@ -508,7 +574,12 @@ export function CatalogManager({
                           )}
                         </td>
                         <td className="py-3 px-4 text-stone-600">
-                          {stationNameMap.get(item.station) ?? item.station}
+                          {item.station === UNASSIGNED_STATION_ID ||
+                          !stationNameMap.has(item.station) ? (
+                            <span className="text-amber-700 font-medium">Sin asignar</span>
+                          ) : (
+                            stationNameMap.get(item.station)
+                          )}
                         </td>
                         <td className="py-3 px-4 text-xs text-stone-600">{captureText}</td>
                         <td className="py-3 px-4 text-stone-600 font-mono text-xs">{item.unit}</td>
@@ -645,6 +716,9 @@ export function CatalogManager({
                       }}
                       className="w-full min-h-[42px] px-3 py-2 text-sm border border-stone-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 bg-white"
                     >
+                      <option value={UNASSIGNED_STATION_ID}>
+                        Sin asignar (asignar después en Puestos)
+                      </option>
                       {stations.map((s) => (
                         <option key={s.id} value={s.id}>
                           {s.name}

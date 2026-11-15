@@ -39,6 +39,7 @@ export interface Workstation {
   description: string;
   accessCode: string;
   nextItemSlot: number;
+  assignedItemIds?: string[];
   active: boolean;
   sortOrder: number;
   createdAt?: Timestamp;
