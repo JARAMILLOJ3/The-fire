@@ -51,4 +51,19 @@ describe('firestore.rules structural security audit', () => {
     expect(rulesText).toContain('entryMatchesItem(\n                incoming(),\n                get(/databases/$(database)/documents/items/$(itemId)).data');
     expect(rulesText).not.toContain('exists(/databases/$(database)/documents/items/$(itemId))');
   });
+
+  it('validates capture type fields on items (inputType, int packSize > 1, labels <= 20, capacity > 0) without widening worker writes', () => {
+    expect(rulesText).toContain("data.inputType in ['count', 'packs', 'level']");
+    expect(rulesText).toContain('data.packSize is int && data.packSize > 1 && data.packSize <= 10000');
+    expect(rulesText).toContain('data.packLabel is string && data.packLabel.size() >= 1 && data.packLabel.size() <= 20');
+    expect(rulesText).toContain('data.unitLabel is string && data.unitLabel.size() >= 1 && data.unitLabel.size() <= 20');
+    expect(rulesText).toContain('data.capacity is number && data.capacity > 0 && data.capacity <= 100000');
+
+    const itemsBlockMatch = rulesText.match(/match \/items\/\{itemId\} \{[\s\S]*?\n    \}/);
+    expect(itemsBlockMatch).not.toBeNull();
+    const itemsBlock = itemsBlockMatch![0];
+    expect(itemsBlock).toContain('allow create:');
+    expect(itemsBlock).toContain('canManageWorkspace(');
+    expect(itemsBlock).not.toContain('isActiveStationWorker(');
+  });
 });

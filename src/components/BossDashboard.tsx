@@ -41,6 +41,7 @@ import {
   downloadDailyCsvReport,
   formatDateHuman,
   formatTimeShort,
+  getPacksPurchaseSummary,
   getStockLevelMeta,
   hasTargetBelowMin,
 } from '../utils/inventory';
@@ -1062,6 +1063,7 @@ export function BossDashboard({
                   <div className="divide-y divide-stone-100">
                     {group.rows.map((row) => {
                       const meta = getStockLevelMeta(row.stockLevel);
+                      const packsSummary = getPacksPurchaseSummary(row.suggestedBuy, row.item);
                       return (
                         <div
                           key={row.item.id}
@@ -1094,7 +1096,9 @@ export function BossDashboard({
                           <div className="flex items-center justify-between sm:justify-end gap-3 shrink-0 font-mono tabular-nums">
                             {row.suggestedBuy > 0 ? (
                               <span className="text-sm font-bold text-red-700 whitespace-nowrap">
-                                Pedir +{row.suggestedBuy} {row.item.unit}
+                                {packsSummary
+                                  ? packsSummary.text
+                                  : `Pedir +${row.suggestedBuy} ${row.item.unit}`}
                               </span>
                             ) : hasTargetBelowMin(row.item.minStock, row.item.targetStock) ? (
                               <span className="text-xs font-semibold text-amber-800 whitespace-nowrap">
@@ -1173,11 +1177,16 @@ export function BossDashboard({
                         <span className="text-stone-500 text-xs"> (Mín {row.item.minStock})</span>
                       </span>
 
-                      {row.hasCountedClosing && row.suggestedBuy > 0 && (
-                        <span className="font-bold text-red-700 shrink-0">
-                          Pedir +{row.suggestedBuy} {row.item.unit}
-                        </span>
-                      )}
+                      {row.hasCountedClosing && row.suggestedBuy > 0 && (() => {
+                        const packsSummary = getPacksPurchaseSummary(row.suggestedBuy, row.item);
+                        return (
+                          <span className="font-bold text-red-700 shrink-0 text-xs sm:text-sm">
+                            {packsSummary
+                              ? packsSummary.text
+                              : `Pedir +${row.suggestedBuy} ${row.item.unit}`}
+                          </span>
+                        );
+                      })()}
                     </div>
                   </div>
                 );
@@ -1293,11 +1302,18 @@ export function BossDashboard({
                           )}
                         </td>
                         <td className="py-3.5 px-4 text-right font-mono tabular-nums font-bold">
-                          {row.hasCountedClosing && row.suggestedBuy > 0 ? (
-                            <span className="text-red-700">
-                              +{row.suggestedBuy} {row.item.unit}
-                            </span>
-                          ) : (
+                          {row.hasCountedClosing && row.suggestedBuy > 0 ? (() => {
+                            const packsSummary = getPacksPurchaseSummary(row.suggestedBuy, row.item);
+                            return packsSummary ? (
+                              <span className="text-red-700 whitespace-nowrap">
+                                {packsSummary.text}
+                              </span>
+                            ) : (
+                              <span className="text-red-700">
+                                +{row.suggestedBuy} {row.item.unit}
+                              </span>
+                            );
+                          })() : (
                             <span className="text-stone-400 font-normal">—</span>
                           )}
                         </td>

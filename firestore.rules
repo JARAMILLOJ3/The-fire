@@ -305,7 +305,8 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'workspaceId', 'ownerUid', 'authorizedEmails', 'station', 'name',
-          'unit', 'minStock', 'targetStock', 'active', 'sortOrder', 'createdAt', 'updatedAt'
+          'unit', 'minStock', 'targetStock', 'inputType', 'packSize', 'packLabel',
+          'unitLabel', 'capacity', 'active', 'sortOrder', 'createdAt', 'updatedAt'
         ])
         && isValidId(data.workspaceId)
         && isValidId(data.ownerUid)
@@ -315,6 +316,25 @@ service cloud.firestore {
         && data.unit is string && data.unit.size() >= 1 && data.unit.size() <= 24
         && data.minStock is number && data.minStock >= 0 && data.minStock <= 100000
         && data.targetStock is number && data.targetStock >= 0 && data.targetStock <= 100000
+        && (!('inputType' in data) || (data.inputType is string && data.inputType in ['count', 'packs', 'level']))
+        && (!('packSize' in data) || (data.packSize is int && data.packSize > 1 && data.packSize <= 10000))
+        && (!('packLabel' in data) || (data.packLabel is string && data.packLabel.size() >= 1 && data.packLabel.size() <= 20))
+        && (!('unitLabel' in data) || (data.unitLabel is string && data.unitLabel.size() >= 1 && data.unitLabel.size() <= 20))
+        && (!('capacity' in data) || (data.capacity is number && data.capacity > 0 && data.capacity <= 100000))
+        && (
+          !('inputType' in data)
+          || data.inputType == 'count'
+          || (
+            data.inputType == 'packs'
+            && 'packSize' in data
+            && 'packLabel' in data
+            && 'unitLabel' in data
+          )
+          || (
+            data.inputType == 'level'
+            && 'capacity' in data
+          )
+        )
         && data.active is bool
         && data.sortOrder is number && data.sortOrder >= 0 && data.sortOrder <= 10000
         && data.createdAt is timestamp
@@ -604,7 +624,8 @@ service cloud.firestore {
         && canManageWorkspace(existing().workspaceId)
         && incoming().diff(existing()).affectedKeys().hasOnly([
           'authorizedEmails', 'station', 'name', 'unit',
-          'minStock', 'targetStock', 'active', 'sortOrder', 'updatedAt'
+          'minStock', 'targetStock', 'inputType', 'packSize', 'packLabel',
+          'unitLabel', 'capacity', 'active', 'sortOrder', 'updatedAt'
         ]);
 
       allow delete: if isValidId(itemId)

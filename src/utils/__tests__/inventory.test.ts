@@ -603,4 +603,237 @@ describe('inventory.ts (sanitización, sin_dato, anomalías y compras)', () => {
     expect(anomalies.find((a) => a.itemId === 'mesera_1')?.ratioToAverage).toBe(5);
     expect(anomalies.find((a) => a.itemId === 'mesera_2')?.kind).toBe('closing_exceeds_available');
   });
+
+  it('converts packs + loose units and splits totals with custom packLabel/unitLabel', async () => {
+    const {
+      computePacksTotal,
+      formatPreviousClosingForItem,
+      getPacksFieldLabels,
+      splitTotalToPacks,
+    } = await import('../inventory');
+
+    // Tocineta: kilo of 40 lonchas -> 2 kilos + 12 lonchas = 92 lonchas
+    expect(computePacksTotal(2, 12, 40)).toBe(92);
+    expect(splitTotalToPacks(92, 40)).toEqual({ packs: 2, loose: 12 });
+    // Pan: paquete of 8 panes -> 100 panes = 12 paquetes + 4 panes
+    expect(splitTotalToPacks(100, 8)).toEqual({ packs: 12, loose: 4 });
+    // Loose >= packSize still calculates exact base total so worker can see warning & override
+    expect(computePacksTotal(1, 45, 40)).toBe(85);
+
+    const tocinetaItem = makeItem({
+      name: 'Tocineta',
+      unit: 'lonchas',
+      inputType: 'packs',
+      packSize: 40,
+      packLabel: 'kilo',
+      unitLabel: 'loncha',
+    });
+    expect(getPacksFieldLabels(tocinetaItem)).toMatchObject({
+      packsFieldLabel: 'Kilos',
+      looseFieldLabel: 'Lonchas sueltas',
+    });
+    expect(formatPreviousClosingForItem(92, tocinetaItem)).toBe('2 kilos + 12 lonchas (92 lonchas)');
+
+    const panItem = makeItem({
+      name: 'Pan hamburguesa',
+      unit: 'pan',
+      inputType: 'packs',
+      packSize: 8,
+      packLabel: 'paquete',
+      unitLabel: 'pan',
+    });
+    expect(getPacksFieldLabels(panItem)).toMatchObject({
+      packsFieldLabel: 'Paquetes',
+      looseFieldLabel: 'Panes sueltos',
+    });
+    expect(formatPreviousClosingForItem(24, panItem)).toBe('3 paquetes (24 panes)');
+  });
+
+  it('converts 1/8 level steps to base units, snaps back, and formats approximate amounts', async () => {
+    const {
+      computeLevelTotal,
+      formatLevelApproximate,
+      formatPreviousClosingForItem,
+      snapQuantityToLevelStep,
+    } = await import('../inventory');
+
+    // 5 L container in 1/8 steps
+    expect(computeLevelTotal(0, 5)).toBe(0);
+    expect(computeLevelTotal(1, 5)).toBe(0.63); // 1/8 * 5 = 0.625 -> sanitized 0.63
+    expect(computeLevelTotal(2, 5)).toBe(1.25); // 1/4
+    expect(computeLevelTotal(4, 5)).toBe(2.5); // 1/2
+    expect(computeLevelTotal(6, 5)).toBe(3.75); // 3/4
+    expect(computeLevelTotal(8, 5)).toBe(5); // Lleno
+
+    expect(formatLevelApproximate(0.625, 'L')).toBe('≈ 0,6 L');
+    expect(formatLevelApproximate(2.5, 'L')).toBe('≈ 2,5 L');
+    expect(formatLevelApproximate(0, 'L')).toBe('0 L');
+
+    expect(snapQuantityToLevelStep(0.63, 5)).toBe(1);
+    expect(snapQuantityToLevelStep(2.5, 5)).toBe(4);
+    expect(snapQuantityToLevelStep(5, 5)).toBe(8);
+
+    const aceiteItem = makeItem({
+      name: 'Aceite',
+      unit: 'L',
+      inputType: 'level',
+      capacity: 5,
+    });
+    expect(formatPreviousClosingForItem(2.5, aceiteItem)).toBe('½ (≈ 2,5 L)');
+  });
+
+  it('rounds packs shopping quantities up to full packages with unit equivalent in BossDashboard and WhatsApp', async () => {
+    const { getPacksPurchaseSummary } = await import('../inventory');
+
+    const tocineta = makeItem({
+      id: 'com_1',
+      station: 'comida_rapida',
+      name: 'Tocineta',
+      unit: 'loncha',
+      minStock: 40,
+      targetStock: 120,
+      inputType: 'packs',
+      packSize: 40,
+      packLabel: 'kilo',
+      unitLabel: 'loncha',
+    });
+
+    // Need 81 lonchas -> ceil(81 / 40) = 3 kilos (120 lonchas)
+    expect(getPacksPurchaseSummary(81, tocineta)?.text).toBe('Comprar: 3 kilos (120 lonchas)');
+    // Need 40 lonchas exact -> 1 kilo (40 lonchas)
+    expect(getPacksPurchaseSummary(40, tocineta)?.text).toBe('Comprar: 1 kilo (40 lonchas)');
+    // Need 1 loncha -> rounds up to 1 kilo (40 lonchas)
+    expect(getPacksPurchaseSummary(1, tocineta)?.text).toBe('Comprar: 1 kilo (40 lonchas)');
+    // Count item returns null
+    expect(getPacksPurchaseSummary(10, makeItem())).toBeNull();
+
+    const station = makeStation({ id: 'comida_rapida', name: 'Comida Rápida' });
+    const rows = buildConsolidatedRows(
+      [tocineta],
+      {
+        com_1: makeEntry({
+          itemId: 'com_1',
+          station: 'comida_rapida',
+          itemName: 'Tocineta',
+          unit: 'loncha',
+          minStock: 40,
+          targetStock: 120,
+          closing: 39,
+          hasClosing: true,
+        }),
+      },
+      {
+        comida_rapida: {
+          id: 'ws_1_2026-11-13_comida_rapida',
+          workspaceId: 'ws_1',
+          ownerUid: 'owner_1',
+          authorizedEmails: ['boss@example.com'],
+          date: '2026-11-13',
+          station: 'comida_rapida',
+          status: 'completed',
+          reportedByUid: 'w1',
+          reportedByName: 'Juan',
+          notes: '',
+        },
+      },
+    );
+
+    expect(rows[0].suggestedBuy).toBe(81);
+    const whatsapp = buildWhatsAppShoppingList('2026-11-13', rows, [station]);
+    expect(whatsapp).toContain('Comprar: 3 kilos (120 lonchas)');
+  });
+
+  it('validates packSize (integer > 1), packLabel/unitLabel (<= 20 chars), and level capacity (> 0)', async () => {
+    const { validateCatalogItemInput } = await import('../inventory');
+
+    // Float or <= 1 packSize rejected
+    expect(
+      validateCatalogItemInput({
+        name: 'Pan',
+        unit: 'pan',
+        station: 'comida_rapida',
+        minStock: 8,
+        targetStock: 24,
+        inputType: 'packs',
+        packSize: 8.5,
+        packLabel: 'paquete',
+        unitLabel: 'pan',
+        existingItems: [],
+      }).valid,
+    ).toBe(false);
+
+    expect(
+      validateCatalogItemInput({
+        name: 'Pan',
+        unit: 'pan',
+        station: 'comida_rapida',
+        minStock: 8,
+        targetStock: 24,
+        inputType: 'packs',
+        packSize: 1,
+        packLabel: 'paquete',
+        unitLabel: 'pan',
+        existingItems: [],
+      }).valid,
+    ).toBe(false);
+
+    // Oversized label (> 20 chars) rejected
+    expect(
+      validateCatalogItemInput({
+        name: 'Pan',
+        unit: 'pan',
+        station: 'comida_rapida',
+        minStock: 8,
+        targetStock: 24,
+        inputType: 'packs',
+        packSize: 8,
+        packLabel: 'nombre_demasiado_largo_21',
+        unitLabel: 'pan',
+        existingItems: [],
+      }).valid,
+    ).toBe(false);
+
+    // Valid packs
+    expect(
+      validateCatalogItemInput({
+        name: 'Pan',
+        unit: 'pan',
+        station: 'comida_rapida',
+        minStock: 8,
+        targetStock: 24,
+        inputType: 'packs',
+        packSize: 8,
+        packLabel: 'paquete',
+        unitLabel: 'pan',
+        existingItems: [],
+      }).valid,
+    ).toBe(true);
+
+    // Invalid vs valid capacity for level
+    expect(
+      validateCatalogItemInput({
+        name: 'Aceite',
+        unit: 'L',
+        station: 'comida_rapida',
+        minStock: 2,
+        targetStock: 5,
+        inputType: 'level',
+        capacity: 0,
+        existingItems: [],
+      }).valid,
+    ).toBe(false);
+
+    expect(
+      validateCatalogItemInput({
+        name: 'Aceite',
+        unit: 'L',
+        station: 'comida_rapida',
+        minStock: 2,
+        targetStock: 5,
+        inputType: 'level',
+        capacity: 5,
+        existingItems: [],
+      }).valid,
+    ).toBe(true);
+  });
 });

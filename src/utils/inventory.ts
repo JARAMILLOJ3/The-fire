@@ -1,6 +1,13 @@
 import type { Timestamp } from 'firebase/firestore';
-import { MAX_STOCK_VALUE, WORKER_GRACE_MINUTES } from '../constants';
+import {
+  LEVEL_STEPS,
+  MAX_PACK_LABEL_LENGTH,
+  MAX_PACK_SIZE,
+  MAX_STOCK_VALUE,
+  WORKER_GRACE_MINUTES,
+} from '../constants';
 import type {
+  CaptureInputType,
   ConsolidatedItemRow,
   DailyReport,
   DailyReportEntry,
@@ -252,6 +259,190 @@ export function getSuggestedPurchase(currentQty: number, minStock: number, targe
   return Math.max(0, Math.ceil(targetStock - currentQty));
 }
 
+export const LEVEL_STEP_LABELS = [
+  '0',
+  '⅛',
+  '¼',
+  '⅜',
+  '½',
+  '⅝',
+  '¾',
+  '⅞',
+  'Lleno',
+] as const;
+
+const INVARIANT_ABBREVIATIONS = new Set(['und', 'ud', 'kg', 'g', 'gr', 'l', 'lt', 'ml', 'lb', 'oz']);
+
+export function pluralizeSpanishLabel(label: string, count: number): string {
+  const clean = label.trim();
+  if (!clean) return '';
+  if (Math.abs(count) === 1) return clean;
+
+  const lower = clean.toLocaleLowerCase('es');
+  if (INVARIANT_ABBREVIATIONS.has(lower)) return clean;
+  if (lower.endsWith('s') || lower.endsWith('x')) return clean;
+  if (lower.endsWith('z')) return `${clean.slice(0, -1)}ces`;
+  if (lower.endsWith('ción')) return `${clean.slice(0, -4)}ciones`;
+  if (/[aeiouáéíóú]$/i.test(clean)) return `${clean}s`;
+  return `${clean}es`;
+}
+
+function capitalizeWord(word: string): string {
+  if (!word) return '';
+  return word.charAt(0).toLocaleUpperCase('es') + word.slice(1);
+}
+
+export function getItemInputType(
+  item: Pick<InventoryItem, 'inputType' | 'packSize' | 'capacity'>,
+): CaptureInputType {
+  if (item.inputType === 'packs') return 'packs';
+  if (item.inputType === 'level') return 'level';
+  return 'count';
+}
+
+export function getPacksFieldLabels(
+  item: Pick<InventoryItem, 'packLabel' | 'unitLabel' | 'unit'>,
+): {
+  packSingular: string;
+  packPlural: string;
+  unitSingular: string;
+  unitPlural: string;
+  packsFieldLabel: string;
+  looseFieldLabel: string;
+} {
+  const packSingular = item.packLabel?.trim() || 'paquete';
+  const packPlural = pluralizeSpanishLabel(packSingular, 2);
+  const unitSingular = item.unitLabel?.trim() || item.unit?.trim() || 'und';
+  const unitPlural = pluralizeSpanishLabel(unitSingular, 2);
+
+  const lowerUnit = unitSingular.toLocaleLowerCase('es');
+  const isFeminine = /(a|ción|dad|tad|ud|und)$/i.test(lowerUnit);
+  const looseWord = isFeminine ? 'sueltas' : 'sueltos';
+  const looseBase =
+    lowerUnit === 'und' ? 'Unidades' : capitalizeWord(unitPlural);
+
+  return {
+    packSingular,
+    packPlural,
+    unitSingular,
+    unitPlural,
+    packsFieldLabel: capitalizeWord(packPlural),
+    looseFieldLabel: `${looseBase} ${looseWord}`,
+  };
+}
+
+export function computePacksTotal(packs: number, loose: number, packSize: number): number {
+  const safePacks = Number.isFinite(packs) ? Math.max(0, Math.floor(packs)) : 0;
+  const safeLoose = Number.isFinite(loose) ? Math.max(0, loose) : 0;
+  const safeSize = Number.isFinite(packSize) ? Math.max(2, Math.floor(packSize)) : 2;
+  return sanitizeStockQuantity(safePacks * safeSize + safeLoose);
+}
+
+export function splitTotalToPacks(
+  total: number,
+  packSize: number,
+): { packs: number; loose: number } {
+  const safeTotal = sanitizeStockQuantity(total);
+  const safeSize = Number.isFinite(packSize) ? Math.max(2, Math.floor(packSize)) : 2;
+  let packs = Math.floor(safeTotal / safeSize);
+  let loose = Math.round((safeTotal - packs * safeSize) * 100) / 100;
+  if (loose >= safeSize) {
+    packs += Math.floor(loose / safeSize);
+    loose = Math.round((loose % safeSize) * 100) / 100;
+  }
+  return { packs, loose };
+}
+
+export function computeLevelTotal(stepIndex: number, capacity: number): number {
+  const safeStep = Number.isFinite(stepIndex)
+    ? Math.max(0, Math.min(LEVEL_STEPS, Math.round(stepIndex)))
+    : 0;
+  const safeCapacity = Number.isFinite(capacity) ? Math.max(0, capacity) : 0;
+  return sanitizeStockQuantity((safeStep / LEVEL_STEPS) * safeCapacity);
+}
+
+export function snapQuantityToLevelStep(value: number, capacity: number): number {
+  if (!Number.isFinite(capacity) || capacity <= 0) return 0;
+  const safeVal = Math.max(0, Number.isFinite(value) ? value : 0);
+  const ratio = Math.min(1, safeVal / capacity);
+  return Math.max(0, Math.min(LEVEL_STEPS, Math.round(ratio * LEVEL_STEPS)));
+}
+
+export function formatSpanishDecimal(value: number, maxDecimals = 2): string {
+  const rounded = Math.round(value * 10 ** maxDecimals) / 10 ** maxDecimals;
+  return new Intl.NumberFormat('es-CO', {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: maxDecimals,
+  }).format(rounded);
+}
+
+export function formatLevelApproximate(value: number, unit: string): string {
+  const safeVal = Math.max(0, Number.isFinite(value) ? value : 0);
+  if (safeVal === 0) return `0 ${unit}`;
+  const oneDecimal = Math.round(safeVal * 10) / 10;
+  const maxDecimals =
+    safeVal < 0.1 || Math.abs(safeVal - oneDecimal) >= 0.03 ? 2 : 1;
+  return `≈ ${formatSpanishDecimal(safeVal, maxDecimals)} ${unit}`;
+}
+
+export function formatPreviousClosingForItem(
+  previousClosing: number,
+  item: Pick<InventoryItem, 'inputType' | 'packSize' | 'packLabel' | 'unitLabel' | 'capacity' | 'unit'>,
+): string {
+  const inputType = getItemInputType(item);
+  if (inputType === 'packs' && typeof item.packSize === 'number' && item.packSize > 1) {
+    const { packs, loose } = splitTotalToPacks(previousClosing, item.packSize);
+    const packLabel = pluralizeSpanishLabel(item.packLabel?.trim() || 'paquete', packs);
+    const unitBase = item.unitLabel?.trim() || item.unit;
+    const totalLabel = `${formatSpanishDecimal(previousClosing, 2)} ${pluralizeSpanishLabel(unitBase, previousClosing)}`;
+    if (loose > 0) {
+      const looseLabel = pluralizeSpanishLabel(unitBase, loose);
+      return `${packs} ${packLabel} + ${formatSpanishDecimal(loose, 2)} ${looseLabel} (${totalLabel})`;
+    }
+    return `${packs} ${packLabel} (${totalLabel})`;
+  }
+
+  if (inputType === 'level' && typeof item.capacity === 'number' && item.capacity > 0) {
+    const step = snapQuantityToLevelStep(previousClosing, item.capacity);
+    const mark = LEVEL_STEP_LABELS[step] ?? '0';
+    return `${mark} (${formatLevelApproximate(previousClosing, item.unit)})`;
+  }
+
+  return `${formatSpanishDecimal(previousClosing, 2)} ${item.unit}`;
+}
+
+export interface PacksPurchaseSummary {
+  packs: number;
+  equivalentUnits: number;
+  packLabelFormatted: string;
+  unitLabelFormatted: string;
+  text: string;
+}
+
+export function getPacksPurchaseSummary(
+  suggestedUnits: number,
+  item: Pick<InventoryItem, 'inputType' | 'packSize' | 'packLabel' | 'unitLabel' | 'unit'>,
+): PacksPurchaseSummary | null {
+  if (getItemInputType(item) !== 'packs') return null;
+  if (!Number.isFinite(suggestedUnits) || suggestedUnits <= 0) return null;
+  const packSize = item.packSize;
+  if (!Number.isFinite(packSize) || !packSize || packSize <= 1) return null;
+
+  const packs = Math.ceil(suggestedUnits / packSize);
+  const equivalentUnits = sanitizeStockQuantity(packs * packSize);
+  const packLabelFormatted = pluralizeSpanishLabel(item.packLabel?.trim() || 'paquete', packs);
+  const unitBase = item.unitLabel?.trim() || item.unit || 'und';
+  const unitLabelFormatted = pluralizeSpanishLabel(unitBase, equivalentUnits);
+
+  return {
+    packs,
+    equivalentUnits,
+    packLabelFormatted,
+    unitLabelFormatted,
+    text: `Comprar: ${packs} ${packLabelFormatted} (${formatSpanishDecimal(equivalentUnits, 2)} ${unitLabelFormatted})`,
+  };
+}
+
 export function normalizeCatalogItemName(name: string): string {
   return name.trim().replace(/\s+/g, ' ').toLocaleLowerCase('es');
 }
@@ -268,11 +459,17 @@ export function validateCatalogItemInput(params: {
   station: StationId;
   minStock: number;
   targetStock: number;
+  inputType?: CaptureInputType;
+  packSize?: number;
+  packLabel?: string;
+  unitLabel?: string;
+  capacity?: number;
   existingItems: InventoryItem[];
   editingItemId?: string;
 }): CatalogItemValidationResult {
   const cleanName = params.name.trim();
   const cleanUnit = params.unit.trim();
+  const inputType: CaptureInputType = params.inputType ?? 'count';
 
   if (!cleanName) {
     return { valid: false, error: 'Escribe el nombre del insumo.', warning: null };
@@ -289,6 +486,66 @@ export function validateCatalogItemInput(params: {
   }
   if (!Number.isFinite(params.targetStock) || params.targetStock < 0) {
     return { valid: false, error: 'El stock ideal no puede ser negativo.', warning: null };
+  }
+
+  if (inputType === 'packs') {
+    const cleanPackLabel = (params.packLabel ?? '').trim();
+    const cleanUnitLabel = (params.unitLabel ?? '').trim();
+
+    if (!cleanPackLabel) {
+      return {
+        valid: false,
+        error: 'Escribe cómo se llama el paquete (ej: paquete, kilo, caja, bolsa).',
+        warning: null,
+      };
+    }
+    if (cleanPackLabel.length > MAX_PACK_LABEL_LENGTH) {
+      return {
+        valid: false,
+        error: `El nombre del paquete no puede superar ${MAX_PACK_LABEL_LENGTH} caracteres.`,
+        warning: null,
+      };
+    }
+    if (!cleanUnitLabel) {
+      return {
+        valid: false,
+        error: 'Escribe cómo se llama la unidad suelta (ej: pan, loncha, und).',
+        warning: null,
+      };
+    }
+    if (cleanUnitLabel.length > MAX_PACK_LABEL_LENGTH) {
+      return {
+        valid: false,
+        error: `El nombre de la unidad suelta no puede superar ${MAX_PACK_LABEL_LENGTH} caracteres.`,
+        warning: null,
+      };
+    }
+    if (
+      typeof params.packSize !== 'number' ||
+      !Number.isFinite(params.packSize) ||
+      !Number.isInteger(params.packSize) ||
+      params.packSize <= 1 ||
+      params.packSize > MAX_PACK_SIZE
+    ) {
+      return {
+        valid: false,
+        error: 'La cantidad por paquete debe ser un número entero mayor a 1.',
+        warning: null,
+      };
+    }
+  } else if (inputType === 'level') {
+    if (
+      typeof params.capacity !== 'number' ||
+      !Number.isFinite(params.capacity) ||
+      params.capacity <= 0 ||
+      params.capacity > MAX_STOCK_VALUE
+    ) {
+      return {
+        valid: false,
+        error: 'La capacidad total del envase lleno debe ser mayor a 0.',
+        warning: null,
+      };
+    }
   }
 
   const normalizedName = normalizeCatalogItemName(cleanName);
@@ -441,7 +698,12 @@ export function buildWhatsAppShoppingList(
     if (stationRows.length === 0) return;
     lines.push(`*${station.name}* (${station.workerName})`);
     stationRows.forEach((r) => {
-      const qtyText = r.suggestedBuy > 0 ? `Pedir ${r.suggestedBuy} ${r.item.unit}` : 'Revisar reposición';
+      const packsSummary = getPacksPurchaseSummary(r.suggestedBuy, r.item);
+      const qtyText = packsSummary
+        ? packsSummary.text
+        : r.suggestedBuy > 0
+          ? `Pedir ${r.suggestedBuy} ${r.item.unit}`
+          : 'Revisar reposición';
       lines.push(`- ${r.item.name}: queda ${r.currentStock} ${r.item.unit} (${qtyText})`);
     });
     lines.push('');

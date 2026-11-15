@@ -224,6 +224,31 @@
         "targetStock": {
           "type": "number"
         },
+        "inputType": {
+          "type": "string",
+          "enum": ["count", "packs", "level"],
+          "description": "Tipo de captura para trabajadoras: count, packs o level"
+        },
+        "packSize": {
+          "type": "number",
+          "description": "Cantidad entera de unidades por paquete (> 1)"
+        },
+        "packLabel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20,
+          "description": "Etiqueta del paquete (ej: paquete, kilo, caja)"
+        },
+        "unitLabel": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20,
+          "description": "Etiqueta de la unidad suelta (ej: pan, loncha, und)"
+        },
+        "capacity": {
+          "type": "number",
+          "description": "Capacidad total del envase lleno en su unidad base (> 0)"
+        },
         "active": {
           "type": "boolean"
         },

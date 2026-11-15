@@ -5,6 +5,7 @@ export type TeamStationId = StationId | 'jefe';
 export type ReportStatus = 'open' | 'opening_saved' | 'completed';
 export type StockLevel = 'agotado' | 'comprar' | 'medio' | 'suficiente' | 'sin_dato';
 export type OpeningAuditStatus = 'confirmed_match' | 'adjusted' | 'manual';
+export type CaptureInputType = 'count' | 'packs' | 'level';
 
 export interface ShiftSchedule {
   enabled: boolean;
@@ -65,6 +66,11 @@ export interface InventoryItem {
   unit: string;
   minStock: number;
   targetStock: number;
+  inputType?: CaptureInputType;
+  packSize?: number;
+  packLabel?: string;
+  unitLabel?: string;
+  capacity?: number;
   active: boolean;
   sortOrder: number;
   createdAt?: Timestamp;

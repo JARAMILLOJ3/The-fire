@@ -1,6 +1,7 @@
 import type { User } from 'firebase/auth';
 import {
   collection,
+  deleteField,
   doc,
   getDoc,
   getDocs,
@@ -21,10 +22,13 @@ import {
   MAX_EMAIL_LENGTH,
   MAX_NAME_LENGTH,
   MAX_NOTES_LENGTH,
+  MAX_PACK_LABEL_LENGTH,
+  MAX_PACK_SIZE,
   MAX_UNIT_LENGTH,
 } from '../constants';
 import { db, handleFirestoreError, OperationType } from '../firebase';
 import type {
+  CaptureInputType,
   DailyReport,
   DailyReportEntry,
   DraftEntryRow,
@@ -944,6 +948,64 @@ export async function updateWorkspaceShiftSchedule(
   }
 }
 
+export interface InventoryItemCapturePayload {
+  inputType?: CaptureInputType;
+  packSize?: number;
+  packLabel?: string;
+  unitLabel?: string;
+  capacity?: number;
+}
+
+function buildItemCapturePayload(
+  payload: InventoryItemCapturePayload,
+  forUpdate: boolean,
+): Record<string, unknown> {
+  const inputType: CaptureInputType =
+    payload.inputType === 'packs' || payload.inputType === 'level' ? payload.inputType : 'count';
+
+  if (inputType === 'packs') {
+    const safeSize = Math.min(
+      MAX_PACK_SIZE,
+      Math.max(2, Math.round(Number(payload.packSize ?? 2))),
+    );
+    const result: Record<string, unknown> = {
+      inputType: 'packs',
+      packSize: safeSize,
+      packLabel: clampString(payload.packLabel || 'paquete', MAX_PACK_LABEL_LENGTH),
+      unitLabel: clampString(payload.unitLabel || 'und', MAX_PACK_LABEL_LENGTH),
+    };
+    if (forUpdate) {
+      result.capacity = deleteField();
+    }
+    return result;
+  }
+
+  if (inputType === 'level') {
+    const safeCapacity = Math.max(0.1, clampNumber(Number(payload.capacity ?? 1)));
+    const result: Record<string, unknown> = {
+      inputType: 'level',
+      capacity: safeCapacity,
+    };
+    if (forUpdate) {
+      result.packSize = deleteField();
+      result.packLabel = deleteField();
+      result.unitLabel = deleteField();
+    }
+    return result;
+  }
+
+  const result: Record<string, unknown> = {
+    inputType: 'count',
+  };
+  if (forUpdate) {
+    result.packSize = deleteField();
+    result.packLabel = deleteField();
+    result.unitLabel = deleteField();
+    result.capacity = deleteField();
+  }
+  return result;
+}
+
 export async function createInventoryItem(
   workspace: Workspace,
   station: Workstation | undefined,
@@ -954,7 +1016,7 @@ export async function createInventoryItem(
     minStock: number;
     targetStock: number;
     sortOrder: number;
-  },
+  } & InventoryItemCapturePayload,
 ): Promise<void> {
   const slot = station ? Math.max(1, station.nextItemSlot) : Math.floor(Date.now() % 100000);
   const itemId = `${payload.station}_${slot}`;
@@ -969,6 +1031,7 @@ export async function createInventoryItem(
     unit: clampString(payload.unit, MAX_UNIT_LENGTH),
     minStock: clampNumber(payload.minStock),
     targetStock: clampNumber(payload.targetStock),
+    ...buildItemCapturePayload(payload, false),
     active: true,
     sortOrder: clampNumber(payload.sortOrder),
     createdAt: serverTimestamp(),
@@ -998,7 +1061,7 @@ export async function updateInventoryItem(
     minStock: number;
     targetStock: number;
     active: boolean;
-  },
+  } & InventoryItemCapturePayload,
 ): Promise<void> {
   try {
     await updateDoc(doc(db, 'items', itemId), {
@@ -1007,6 +1070,7 @@ export async function updateInventoryItem(
       unit: clampString(payload.unit, MAX_UNIT_LENGTH),
       minStock: clampNumber(payload.minStock),
       targetStock: clampNumber(payload.targetStock),
+      ...buildItemCapturePayload(payload, true),
       active: payload.active,
       updatedAt: serverTimestamp(),
     });

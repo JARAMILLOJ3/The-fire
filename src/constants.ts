@@ -8,12 +8,18 @@ export const MAX_NAME_LENGTH = 80;
 export const MAX_AREA_LENGTH = 60;
 export const MAX_DESC_LENGTH = 200;
 export const MAX_UNIT_LENGTH = 24;
+export const MAX_PACK_LABEL_LENGTH = 20;
+export const MAX_PACK_SIZE = 10000;
+export const LEVEL_STEPS = 8;
 export const MAX_NOTES_LENGTH = 500;
 export const MAX_EMAIL_LENGTH = 120;
 export const MAX_STOCK_VALUE = 100000;
 export const ID_PATTERN = /^[a-zA-Z0-9_\-]+$/;
 export const DATE_PATTERN = /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/;
 export const TIME_PATTERN = /^([01][0-9]|2[0-3]):[0-5][0-9]$/;
+
+export const PACK_LABEL_OPTIONS = ['paquete', 'kilo', 'caja', 'bolsa', 'bandeja', 'tarro'];
+export const UNIT_LABEL_OPTIONS = ['und', 'pan', 'loncha', 'tajada', 'porción', 'salchicha', 'carne'];
 
 export const DEFAULT_SHIFT_SCHEDULE: ShiftSchedule = {
   enabled: true,

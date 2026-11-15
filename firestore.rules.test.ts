@@ -741,4 +741,122 @@ describe('Firestore Security Rules (Emulator Suite)', () => {
     }
     await assertSucceeds(updateBatch.commit());
   });
+
+  it('validates packs/level catalog item fields on create/update without widening worker permissions', async () => {
+    const bossDb = testEnv
+      .authenticatedContext(OWNER_UID, { email: OWNER_EMAIL, email_verified: true })
+      .firestore();
+    const workerDb = testEnv
+      .authenticatedContext(WORKER_UID, { email: WORKER_EMAIL, email_verified: true })
+      .firestore();
+
+    // Boss creates valid packs item
+    await assertSucceeds(
+      setDoc(doc(bossDb, 'items', 'mesera_packs'), {
+        workspaceId: WS_ID,
+        ownerUid: OWNER_UID,
+        authorizedEmails: [OWNER_EMAIL],
+        station: 'mesera',
+        name: 'Tocineta',
+        unit: 'loncha',
+        minStock: 40,
+        targetStock: 120,
+        inputType: 'packs',
+        packSize: 40,
+        packLabel: 'kilo',
+        unitLabel: 'loncha',
+        active: true,
+        sortOrder: 5,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }),
+    );
+
+    // Boss creates valid level item
+    await assertSucceeds(
+      setDoc(doc(bossDb, 'items', 'mesera_level'), {
+        workspaceId: WS_ID,
+        ownerUid: OWNER_UID,
+        authorizedEmails: [OWNER_EMAIL],
+        station: 'mesera',
+        name: 'Aceite',
+        unit: 'L',
+        minStock: 2,
+        targetStock: 5,
+        inputType: 'level',
+        capacity: 5,
+        active: true,
+        sortOrder: 6,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }),
+    );
+
+    // Non-integer packSize rejected
+    await assertFails(
+      setDoc(doc(bossDb, 'items', 'mesera_bad_float'), {
+        workspaceId: WS_ID,
+        ownerUid: OWNER_UID,
+        authorizedEmails: [OWNER_EMAIL],
+        station: 'mesera',
+        name: 'Pan',
+        unit: 'pan',
+        minStock: 8,
+        targetStock: 24,
+        inputType: 'packs',
+        packSize: 8.5,
+        packLabel: 'paquete',
+        unitLabel: 'pan',
+        active: true,
+        sortOrder: 7,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }),
+    );
+
+    // packSize <= 1 or oversized packLabel (>20 chars) rejected
+    await assertFails(
+      setDoc(doc(bossDb, 'items', 'mesera_bad_size'), {
+        workspaceId: WS_ID,
+        ownerUid: OWNER_UID,
+        authorizedEmails: [OWNER_EMAIL],
+        station: 'mesera',
+        name: 'Pan 2',
+        unit: 'pan',
+        minStock: 8,
+        targetStock: 24,
+        inputType: 'packs',
+        packSize: 1,
+        packLabel: 'paquete',
+        unitLabel: 'pan',
+        active: true,
+        sortOrder: 8,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }),
+    );
+
+    await assertFails(
+      updateDoc(doc(bossDb, 'items', 'mesera_packs'), {
+        packLabel: 'etiqueta_con_mas_de_20_caracteres',
+        updatedAt: serverTimestamp(),
+      }),
+    );
+
+    // Level capacity <= 0 rejected
+    await assertFails(
+      updateDoc(doc(bossDb, 'items', 'mesera_level'), {
+        capacity: 0,
+        updatedAt: serverTimestamp(),
+      }),
+    );
+
+    // Worker still cannot modify items even with valid capture fields
+    await assertFails(
+      updateDoc(doc(workerDb, 'items', 'mesera_packs'), {
+        packSize: 50,
+        updatedAt: serverTimestamp(),
+      }),
+    );
+  });
 });

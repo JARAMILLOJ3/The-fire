@@ -9,9 +9,7 @@ import {
   CheckCircle2,
   Clock,
   Lock,
-  Minus,
   Moon,
-  Plus,
   RotateCcw,
   Save,
   Search,
@@ -43,19 +41,22 @@ import {
   detectEntryAnomalies,
   detectReportAnomalies,
   formatDateHuman,
+  formatPreviousClosingForItem,
+  formatSpanishDecimal,
   formatStationSaveError,
   formatTimeShort,
   getOpeningRowState,
+  getPacksPurchaseSummary,
   getPreviousDateStr,
   getStockLevel,
   getStockLevelMeta,
   getSuggestedPurchase,
-  parseQuantityInput,
   sanitizeStockQuantity,
   type EntryAnomaly,
   type StationSaveErrorInfo,
 } from '../utils/inventory';
 import { formatTime12h, type WorkerScheduleStatus } from '../utils/schedule';
+import { QuantityCaptureControl } from './shift/QuantityCaptureControl';
 import { ShiftOutsideHoursView } from './shift/ShiftOutsideHoursView';
 import { ShiftSubmitConfirmModal } from './shift/ShiftSubmitConfirmModal';
 
@@ -617,65 +618,12 @@ export function StationShiftView({
     });
   };
 
-  const handleNumberInput = (
+  const commitFieldValue = (
     itemId: string,
     field: 'opening' | 'added' | 'closing',
-    rawValue: string,
-    badInput: boolean,
+    nextRawValue: number,
   ) => {
-    if (badInput) return;
-    const parsed = parseQuantityInput(rawValue);
-    if (!parsed.valid) return;
-
-    if (parsed.empty) {
-      applyRowMutation(
-        itemId,
-        (current) => ({
-          ...current,
-          [field]: 0,
-          hasOpening: field === 'opening' ? false : current.hasOpening,
-          hasClosing: field === 'closing' ? false : current.hasClosing,
-          openingStatus: field === 'opening' ? undefined : current.openingStatus,
-        }),
-        { [field]: true },
-      );
-      return;
-    }
-
-    applyRowMutation(
-      itemId,
-      (current) => ({
-        ...current,
-        [field]: parsed.value,
-        notApplicable: field === 'added' ? current.notApplicable : false,
-        hasOpening: field === 'opening' ? true : current.hasOpening,
-        hasClosing: field === 'closing' ? true : current.hasClosing,
-        openingStatus:
-          field === 'opening'
-            ? computeOpeningStatusForValue(parsed.value, current.previousClosing)
-            : current.openingStatus,
-      }),
-      {
-        [field]: true,
-        ...(field !== 'added' ? { notApplicable: true } : {}),
-      },
-    );
-  };
-
-  const stepField = (itemId: string, field: 'opening' | 'added' | 'closing', delta: number) => {
-    const current = drafts[itemId];
-    if (!current) return;
-    const base =
-      field === 'closing'
-        ? current.hasClosing
-          ? current.closing
-          : 0
-        : field === 'opening'
-          ? current.hasOpening || typeof current.previousClosing === 'number'
-            ? current.opening
-            : 0
-          : current.added;
-    const nextVal = sanitizeStockQuantity(base + delta);
+    const nextVal = sanitizeStockQuantity(nextRawValue);
     applyRowMutation(
       itemId,
       (row) => ({
@@ -693,6 +641,23 @@ export function StationShiftView({
         [field]: true,
         ...(field !== 'added' ? { notApplicable: true } : {}),
       },
+    );
+  };
+
+  const clearFieldValue = (
+    itemId: string,
+    field: 'opening' | 'added' | 'closing',
+  ) => {
+    applyRowMutation(
+      itemId,
+      (current) => ({
+        ...current,
+        [field]: 0,
+        hasOpening: field === 'opening' ? false : current.hasOpening,
+        hasClosing: field === 'closing' ? false : current.hasClosing,
+        openingStatus: field === 'opening' ? undefined : current.openingStatus,
+      }),
+      { [field]: true },
     );
   };
 
@@ -1533,7 +1498,22 @@ export function StationShiftView({
                   item.minStock,
                   item.targetStock,
                 );
+                const packsPurchaseHint = getPacksPurchaseSummary(suggestBuy, item);
                 const rowAnomalies = detectEntryAnomalies(row, draftMode);
+                const openingTone = isPendingConfirm
+                  ? 'pending'
+                  : openingState === 'adjusted'
+                    ? 'adjusted'
+                    : row.hasOpening
+                      ? 'confirmed'
+                      : 'default';
+                const closingTone = !hasClosingVal
+                  ? 'default'
+                  : level === 'agotado' || level === 'comprar'
+                    ? 'red'
+                    : level === 'medio'
+                      ? 'amber'
+                      : 'emerald';
 
                 const cardSurface = isNA
                   ? 'bg-stone-100/80'
@@ -1556,7 +1536,12 @@ export function StationShiftView({
                         <p className="text-xs text-stone-500 mt-0.5 font-mono tabular-nums">
                           {item.unit} · Mín: {item.minStock}
                           {typeof row.previousClosing === 'number' && (
-                            <> · <span className="text-sky-800 font-semibold">Ayer quedó: {row.previousClosing}</span></>
+                            <>
+                              {' '}·{' '}
+                              <span className="text-sky-800 font-semibold">
+                                Ayer quedó: {formatPreviousClosingForItem(row.previousClosing, item)}
+                              </span>
+                            </>
                           )}
                         </p>
                       </div>
@@ -1606,7 +1591,9 @@ export function StationShiftView({
                         </span>
                         {!isNA && (row.hasOpening || isPendingConfirm) && (
                           <span className="font-mono tabular-nums font-semibold text-stone-600">
-                            Disponible: {sanitizeStockQuantity(row.opening + row.added)} {item.unit}
+                            Disponible:{' '}
+                            {formatSpanishDecimal(sanitizeStockQuantity(row.opening + row.added), 2)}{' '}
+                            {item.unit}
                           </span>
                         )}
                       </div>
@@ -1615,64 +1602,28 @@ export function StationShiftView({
                         <div className="space-y-1.5">
                           <label
                             htmlFor={`m-open-${item.id}`}
-                            className="flex items-center justify-between gap-2 text-xs font-semibold text-stone-700"
+                            className="flex flex-wrap items-center justify-between gap-1.5 text-xs font-semibold text-stone-700"
                           >
                             <span>Inicio del día ({item.unit})</span>
                             {typeof row.previousClosing === 'number' && (
                               <span className="font-mono tabular-nums text-sky-800">
-                                Ayer quedó: {row.previousClosing}
+                                Ayer quedó: {formatPreviousClosingForItem(row.previousClosing, item)}
                               </span>
                             )}
                           </label>
-                          <div className="flex items-center gap-2">
-                            <motion.button
-                              whileTap={{ scale: 0.94 }}
-                              type="button"
-                              disabled={isLocked || isNA}
-                              onClick={() => stepField(item.id, 'opening', -1)}
-                              aria-label={`Restar inicio ${item.name}`}
-                              className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                            >
-                              <Minus className="w-5 h-5" />
-                            </motion.button>
-                            <input
-                              id={`m-open-${item.id}`}
-                              type="number"
-                              inputMode="decimal"
-                              min={0}
-                              step="any"
-                              disabled={isLocked || isNA}
-                              placeholder="—"
-                              value={showOpeningNumber ? row.opening : ''}
-                              onChange={(e) =>
-                                handleNumberInput(
-                                  item.id,
-                                  'opening',
-                                  e.target.value,
-                                  e.target.validity.badInput,
-                                )
-                              }
-                              className={`min-w-0 flex-1 h-12 text-center font-mono tabular-nums text-xl font-bold rounded-xl border placeholder:text-stone-300 focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:bg-stone-100 ${
-                                isPendingConfirm
-                                  ? 'bg-sky-50 border-sky-400 text-sky-950'
-                                  : openingState === 'adjusted'
-                                    ? 'bg-orange-50/40 border-orange-400 text-stone-900'
-                                    : row.hasOpening
-                                      ? 'bg-emerald-50/40 border-emerald-500 text-stone-900'
-                                      : 'bg-white border-stone-300 text-stone-900'
-                              }`}
-                            />
-                            <motion.button
-                              whileTap={{ scale: 0.94 }}
-                              type="button"
-                              disabled={isLocked || isNA}
-                              onClick={() => stepField(item.id, 'opening', 1)}
-                              aria-label={`Sumar inicio ${item.name}`}
-                              className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                            >
-                              <Plus className="w-5 h-5" />
-                            </motion.button>
-                          </div>
+                          <QuantityCaptureControl
+                            item={item}
+                            field="opening"
+                            fieldLabel="inicio"
+                            value={row.opening}
+                            hasValue={showOpeningNumber}
+                            disabled={isLocked || isNA}
+                            variant="mobile"
+                            tone={openingTone}
+                            inputId={`m-open-${item.id}`}
+                            onCommitValue={(val) => commitFieldValue(item.id, 'opening', val)}
+                            onClearValue={() => clearFieldValue(item.id, 'opening')}
+                          />
                         </div>
 
                         <div className="space-y-1.5">
@@ -1682,46 +1633,18 @@ export function StationShiftView({
                           >
                             Surtido / llegó hoy (+)
                           </label>
-                          <div className="flex items-center gap-2">
-                            <motion.button
-                              whileTap={{ scale: 0.94 }}
-                              type="button"
-                              disabled={isLocked || isNA}
-                              onClick={() => stepField(item.id, 'added', -1)}
-                              aria-label={`Restar surtido ${item.name}`}
-                              className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-orange-200 bg-orange-50 text-orange-800 hover:bg-orange-100 disabled:opacity-40 cursor-pointer"
-                            >
-                              <Minus className="w-5 h-5" />
-                            </motion.button>
-                            <input
-                              id={`m-add-${item.id}`}
-                              type="number"
-                              inputMode="decimal"
-                              min={0}
-                              step="any"
-                              disabled={isLocked || isNA}
-                              value={isNA ? '' : row.added}
-                              onChange={(e) =>
-                                handleNumberInput(
-                                  item.id,
-                                  'added',
-                                  e.target.value,
-                                  e.target.validity.badInput,
-                                )
-                              }
-                              className="min-w-0 flex-1 h-12 text-center font-mono tabular-nums text-xl font-bold rounded-xl border border-orange-300 bg-orange-50/40 text-stone-900 focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:bg-stone-100"
-                            />
-                            <motion.button
-                              whileTap={{ scale: 0.94 }}
-                              type="button"
-                              disabled={isLocked || isNA}
-                              onClick={() => stepField(item.id, 'added', 1)}
-                              aria-label={`Sumar surtido ${item.name}`}
-                              className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-orange-200 bg-orange-50 text-orange-800 hover:bg-orange-100 disabled:opacity-40 cursor-pointer"
-                            >
-                              <Plus className="w-5 h-5" />
-                            </motion.button>
-                          </div>
+                          <QuantityCaptureControl
+                            item={item}
+                            field="added"
+                            fieldLabel="surtido"
+                            value={row.added}
+                            hasValue={!isNA}
+                            disabled={isLocked || isNA}
+                            variant="mobile"
+                            tone="orange"
+                            inputId={`m-add-${item.id}`}
+                            onCommitValue={(val) => commitFieldValue(item.id, 'added', val)}
+                          />
                         </div>
                       </div>
 
@@ -1785,64 +1708,30 @@ export function StationShiftView({
                               {(level === 'agotado' || level === 'comprar') && (
                                 <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
                               )}
-                              {suggestBuy > 0 ? `Pedir +${suggestBuy}` : meta.label}
+                              {packsPurchaseHint
+                                ? packsPurchaseHint.text
+                                : suggestBuy > 0
+                                  ? `Pedir +${suggestBuy}`
+                                  : meta.label}
                             </span>
                           ) : !isNA ? (
                             <span className="text-xs font-semibold text-stone-400">Por contar</span>
                           ) : null}
                         </div>
 
-                        <div className="flex items-center gap-2">
-                          <motion.button
-                            whileTap={{ scale: 0.94 }}
-                            type="button"
-                            disabled={isLocked || isNA}
-                            onClick={() => stepField(item.id, 'closing', -1)}
-                            aria-label={`Restar cierre ${item.name}`}
-                            className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                          >
-                            <Minus className="w-5 h-5" />
-                          </motion.button>
-                          <input
-                            id={`mobile-close-${item.id}`}
-                            type="number"
-                            inputMode="decimal"
-                            min={0}
-                            step="any"
-                            disabled={isLocked || isNA}
-                            placeholder="—"
-                            value={hasClosingVal ? row.closing : ''}
-                            onChange={(e) =>
-                              handleNumberInput(
-                                item.id,
-                                'closing',
-                                e.target.value,
-                                e.target.validity.badInput,
-                              )
-                            }
-                            className={`min-w-0 flex-1 h-12 text-center font-mono tabular-nums text-xl font-bold rounded-xl border placeholder:text-stone-300 focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:opacity-60 transition-colors ${
-                              isNA
-                                ? 'bg-stone-100 border-stone-200 text-stone-400'
-                                : !hasClosingVal
-                                  ? 'bg-stone-50 border-stone-300 text-stone-800'
-                                  : level === 'agotado' || level === 'comprar'
-                                    ? 'bg-red-50/40 border-red-400 text-stone-900'
-                                    : level === 'medio'
-                                      ? 'bg-amber-50/40 border-amber-400 text-stone-900'
-                                      : 'bg-emerald-50/40 border-emerald-500 text-stone-900'
-                            }`}
-                          />
-                          <motion.button
-                            whileTap={{ scale: 0.94 }}
-                            type="button"
-                            disabled={isLocked || isNA}
-                            onClick={() => stepField(item.id, 'closing', 1)}
-                            aria-label={`Sumar cierre ${item.name}`}
-                            className="w-12 h-12 shrink-0 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                          >
-                            <Plus className="w-5 h-5" />
-                          </motion.button>
-                        </div>
+                        <QuantityCaptureControl
+                          item={item}
+                          field="closing"
+                          fieldLabel="cierre"
+                          value={row.closing}
+                          hasValue={hasClosingVal}
+                          disabled={isLocked || isNA}
+                          variant="mobile"
+                          tone={closingTone}
+                          inputId={`mobile-close-${item.id}`}
+                          onCommitValue={(val) => commitFieldValue(item.id, 'closing', val)}
+                          onClearValue={() => clearFieldValue(item.id, 'closing')}
+                        />
 
                         {!isLocked && (
                           <div className="grid grid-cols-2 gap-2 pt-0.5">
@@ -1924,7 +1813,7 @@ export function StationShiftView({
                     const hasValue = row.hasClosing && !isNA;
                     const consumed =
                       row.hasOpening && hasValue
-                        ? Math.max(0, row.opening + row.added - row.closing)
+                        ? sanitizeStockQuantity(Math.max(0, row.opening + row.added - row.closing))
                         : null;
                     const level = getStockLevel(row.closing, item.minStock);
                     const meta = getStockLevelMeta(level);
@@ -1933,7 +1822,22 @@ export function StationShiftView({
                       item.minStock,
                       item.targetStock,
                     );
+                    const packsPurchaseHint = getPacksPurchaseSummary(suggestBuy, item);
                     const rowAnomalies = detectEntryAnomalies(row, draftMode);
+                    const openingTone = isPendingConfirm
+                      ? 'pending'
+                      : openingState === 'adjusted'
+                        ? 'adjusted'
+                        : row.hasOpening
+                          ? 'confirmed'
+                          : 'default';
+                    const closingTone = !hasValue
+                      ? 'default'
+                      : level === 'agotado' || level === 'comprar'
+                        ? 'red'
+                        : level === 'medio'
+                          ? 'amber'
+                          : 'emerald';
 
                     return (
                       <tr
@@ -1946,7 +1850,7 @@ export function StationShiftView({
                               : 'hover:bg-stone-50/70'
                         }`}
                       >
-                        <td className="py-4 px-5">
+                        <td className="py-4 px-5 align-top">
                           <div className="text-base font-semibold text-stone-900">{item.name}</div>
                           <div className="text-xs text-stone-500 font-mono tabular-nums mt-0.5 flex flex-wrap items-center gap-x-1.5">
                             <span>
@@ -1954,7 +1858,7 @@ export function StationShiftView({
                             </span>
                             {typeof row.previousClosing === 'number' && (
                               <span className="text-sky-800 font-semibold">
-                                · Ayer quedó: {row.previousClosing}
+                                · Ayer quedó: {formatPreviousClosingForItem(row.previousClosing, item)}
                               </span>
                             )}
                           </div>
@@ -1967,54 +1871,20 @@ export function StationShiftView({
                         </td>
 
                         {/* Inicio del día + "✓ Está bien" si pendiente */}
-                        <td className="py-4 px-3">
+                        <td className="py-4 px-3 align-top">
                           <div className="flex flex-col items-center gap-1.5">
-                            <div className="flex items-center justify-center gap-1">
-                              <button
-                                type="button"
-                                disabled={isLocked || isNA}
-                                onClick={() => stepField(item.id, 'opening', -1)}
-                                aria-label={`Restar inicio de ${item.name}`}
-                                className="w-9 h-10 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                              >
-                                <Minus className="w-3.5 h-3.5" />
-                              </button>
-                              <input
-                                type="number"
-                                min={0}
-                                step="any"
-                                disabled={isLocked || isNA}
-                                placeholder="—"
-                                aria-label={`Inicio de ${item.name}`}
-                                value={showOpeningNumber ? row.opening : ''}
-                                onChange={(e) =>
-                                  handleNumberInput(
-                                    item.id,
-                                    'opening',
-                                    e.target.value,
-                                    e.target.validity.badInput,
-                                  )
-                                }
-                                className={`w-16 h-10 text-center font-mono tabular-nums text-sm font-bold rounded-lg border placeholder:text-stone-300 focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:opacity-60 ${
-                                  isPendingConfirm
-                                    ? 'bg-sky-50 border-sky-400 text-sky-950'
-                                    : openingState === 'adjusted'
-                                      ? 'bg-orange-50 border-orange-400 text-stone-900'
-                                      : row.hasOpening
-                                        ? 'bg-emerald-50/50 border-emerald-500 text-stone-900'
-                                        : 'bg-stone-50 border-stone-200 text-stone-900'
-                                }`}
-                              />
-                              <button
-                                type="button"
-                                disabled={isLocked || isNA}
-                                onClick={() => stepField(item.id, 'opening', 1)}
-                                aria-label={`Sumar inicio de ${item.name}`}
-                                className="w-9 h-10 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                              >
-                                <Plus className="w-3.5 h-3.5" />
-                              </button>
-                            </div>
+                            <QuantityCaptureControl
+                              item={item}
+                              field="opening"
+                              fieldLabel="inicio"
+                              value={row.opening}
+                              hasValue={showOpeningNumber}
+                              disabled={isLocked || isNA}
+                              variant="desktop"
+                              tone={openingTone}
+                              onCommitValue={(val) => commitFieldValue(item.id, 'opening', val)}
+                              onClearValue={() => clearFieldValue(item.id, 'opening')}
+                            />
 
                             {isPendingConfirm && !isLocked ? (
                               <button
@@ -2038,49 +1908,23 @@ export function StationShiftView({
                         </td>
 
                         {/* Surtido (+) */}
-                        <td className="py-4 px-3">
-                          <div className="flex items-center justify-center gap-1">
-                            <button
-                              type="button"
-                              disabled={isLocked || isNA}
-                              onClick={() => stepField(item.id, 'added', -1)}
-                              aria-label={`Restar surtido de ${item.name}`}
-                              className="w-9 h-10 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                            >
-                              <Minus className="w-3.5 h-3.5" />
-                            </button>
-                            <input
-                              type="number"
-                              min={0}
-                              step="any"
-                              disabled={isLocked || isNA}
-                              aria-label={`Surtido de ${item.name}`}
-                              value={isNA ? '' : row.added}
-                              onChange={(e) =>
-                                handleNumberInput(
-                                  item.id,
-                                  'added',
-                                  e.target.value,
-                                  e.target.validity.badInput,
-                                )
-                              }
-                              className="w-16 h-10 text-center font-mono tabular-nums text-sm bg-stone-50 border border-stone-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500 focus:bg-white disabled:opacity-60"
-                            />
-                            <button
-                              type="button"
-                              disabled={isLocked || isNA}
-                              onClick={() => stepField(item.id, 'added', 1)}
-                              aria-label={`Sumar surtido de ${item.name}`}
-                              className="w-9 h-10 flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                            >
-                              <Plus className="w-3.5 h-3.5" />
-                            </button>
-                          </div>
+                        <td className="py-4 px-3 align-top">
+                          <QuantityCaptureControl
+                            item={item}
+                            field="added"
+                            fieldLabel="surtido"
+                            value={row.added}
+                            hasValue={!isNA}
+                            disabled={isLocked || isNA}
+                            variant="desktop"
+                            tone="orange"
+                            onCommitValue={(val) => commitFieldValue(item.id, 'added', val)}
+                          />
                         </td>
 
                         {isWorkerOpeningPhase ? (
                           <>
-                            <td className="py-4 px-3">
+                            <td className="py-4 px-3 align-top">
                               <div className="flex items-center justify-center gap-1.5">
                                 <button
                                   type="button"
@@ -2108,14 +1952,14 @@ export function StationShiftView({
                                 </button>
                               </div>
                             </td>
-                            <td className="py-4 px-5 text-right font-mono tabular-nums font-bold">
+                            <td className="py-4 px-5 text-right font-mono tabular-nums font-bold align-top">
                               {isNA ? (
                                 <span className="text-stone-500 font-normal">No aplica</span>
                               ) : isPendingConfirm ? (
                                 <span className="text-sky-700">Por confirmar</span>
                               ) : row.hasOpening ? (
                                 <span className="text-stone-900">
-                                  {row.opening + row.added} {item.unit}
+                                  {formatSpanishDecimal(sanitizeStockQuantity(row.opening + row.added), 2)} {item.unit}
                                 </span>
                               ) : (
                                 <span className="text-stone-400 font-normal">Por contar</span>
@@ -2124,56 +1968,22 @@ export function StationShiftView({
                           </>
                         ) : (
                           <>
-                            <td className="py-4 px-4">
-                              <div className="flex items-center justify-center gap-1.5">
-                                <motion.button
-                                  whileTap={{ scale: 0.94 }}
-                                  type="button"
-                                  disabled={isLocked || isNA}
-                                  onClick={() => stepField(item.id, 'closing', -1)}
-                                  aria-label={`Restar cierre de ${item.name}`}
-                                  className="w-11 h-11 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                                >
-                                  <Minus className="w-4 h-4" />
-                                </motion.button>
-                                <input
-                                  type="number"
-                                  min={0}
-                                  step="any"
-                                  disabled={isLocked || isNA}
-                                  placeholder="—"
-                                  aria-label={`Cierre de ${item.name}`}
-                                  value={hasValue ? row.closing : ''}
-                                  onChange={(e) =>
-                                    handleNumberInput(
-                                      item.id,
-                                      'closing',
-                                      e.target.value,
-                                      e.target.validity.badInput,
-                                    )
-                                  }
-                                  className={`w-20 h-11 text-center font-mono tabular-nums text-base font-bold rounded-xl border placeholder:text-stone-300 focus:outline-none focus:ring-2 focus:ring-orange-500 disabled:opacity-60 transition-colors ${
-                                    isNA
-                                      ? 'bg-stone-100 border-stone-200 text-stone-400'
-                                      : hasValue
-                                        ? 'bg-white border-orange-500 text-stone-900'
-                                        : 'bg-stone-50 border-stone-300 text-stone-800'
-                                  }`}
-                                />
-                                <motion.button
-                                  whileTap={{ scale: 0.94 }}
-                                  type="button"
-                                  disabled={isLocked || isNA}
-                                  onClick={() => stepField(item.id, 'closing', 1)}
-                                  aria-label={`Sumar cierre de ${item.name}`}
-                                  className="w-11 h-11 flex items-center justify-center rounded-xl border border-stone-300 bg-stone-50 text-stone-800 hover:bg-stone-100 disabled:opacity-40 cursor-pointer"
-                                >
-                                  <Plus className="w-4 h-4" />
-                                </motion.button>
-                              </div>
+                            <td className="py-4 px-4 align-top">
+                              <QuantityCaptureControl
+                                item={item}
+                                field="closing"
+                                fieldLabel="cierre"
+                                value={row.closing}
+                                hasValue={hasValue}
+                                disabled={isLocked || isNA}
+                                variant="desktop"
+                                tone={closingTone}
+                                onCommitValue={(val) => commitFieldValue(item.id, 'closing', val)}
+                                onClearValue={() => clearFieldValue(item.id, 'closing')}
+                              />
                             </td>
 
-                            <td className="py-4 px-3">
+                            <td className="py-4 px-3 align-top">
                               <div className="flex items-center justify-center gap-1.5">
                                 <button
                                   type="button"
@@ -2202,11 +2012,11 @@ export function StationShiftView({
                               </div>
                             </td>
 
-                            <td className="py-4 px-4 text-right font-mono tabular-nums text-stone-700">
-                              {consumed !== null ? `${consumed} ${item.unit}` : '—'}
+                            <td className="py-4 px-4 text-right font-mono tabular-nums text-stone-700 align-top">
+                              {consumed !== null ? `${formatSpanishDecimal(consumed, 2)} ${item.unit}` : '—'}
                             </td>
 
-                            <td className="py-4 px-5 whitespace-nowrap">
+                            <td className="py-4 px-5 whitespace-nowrap align-top">
                               {isNA ? (
                                 <span className="text-xs font-semibold text-stone-500">
                                   No aplica hoy
@@ -2231,7 +2041,9 @@ export function StationShiftView({
                                   </span>
                                   {suggestBuy > 0 && (
                                     <p className="text-xs font-mono tabular-nums text-red-700">
-                                      Sugerido pedir: +{suggestBuy} {item.unit}
+                                      {packsPurchaseHint
+                                        ? packsPurchaseHint.text
+                                        : `Sugerido pedir: +${suggestBuy} ${item.unit}`}
                                     </p>
                                   )}
                                 </div>
