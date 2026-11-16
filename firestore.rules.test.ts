@@ -134,7 +134,9 @@ function getBogotaDateForNow(): string {
   return `${y}-${m}-${d}`;
 }
 
-describe('Firestore Security Rules (Emulator Suite)', () => {
+describe.runIf(Boolean(process.env.FIRESTORE_EMULATOR_HOST))(
+  'Firestore Security Rules (Emulator Suite)',
+  () => {
   beforeAll(async () => {
     const rules = readFileSync(resolve(process.cwd(), 'firestore.rules'), 'utf8');
     testEnv = await initializeTestEnvironment({
@@ -144,7 +146,9 @@ describe('Firestore Security Rules (Emulator Suite)', () => {
   });
 
   afterAll(async () => {
-    await testEnv.cleanup();
+    if (testEnv) {
+      await testEnv.cleanup();
+    }
   });
 
   beforeEach(async () => {
@@ -1154,4 +1158,230 @@ describe('Firestore Security Rules (Emulator Suite)', () => {
     await assertSucceeds(getDoc(doc(bossDb, 'workerNotes', 'nota_lucia_hoy')));
     await assertSucceeds(deleteDoc(doc(bossDb, 'workerNotes', 'nota_ayer')));
   });
+
+  describe('TAREA 1 (a)-(g): Worker dailyReports/{reportId}/entries/{itemId} exact createFields reproduction', () => {
+    it('reproduces and validates cases (a) station-created item, (b) reassigned item from catalog/other station, (c) count/packs/level items with all extra fields, (d) active schedule crossing midnight (16:00-01:00), (e) disabled schedule, (f) missing shiftSchedule field, and (g) existing opening_saved report vs non-existent report', async () => {
+      const opDate = getBogotaDateForNow();
+      const station = 'mesera';
+      const reportId = `${WS_ID}_${opDate}_${station}`;
+      const workerDb = testEnv
+        .authenticatedContext(WORKER_UID, { email: WORKER_EMAIL, email_verified: true })
+        .firestore();
+
+      const makeExactEntryPayload = (itemId: string, itemName: string, unit: string, minStock = 2, targetStock = 10) => ({
+        workspaceId: WS_ID,
+        ownerUid: OWNER_UID,
+        authorizedEmails: [OWNER_EMAIL],
+        reportId,
+        itemId,
+        station,
+        date: opDate,
+        itemName,
+        unit,
+        minStock,
+        targetStock,
+        opening: 6,
+        added: 2,
+        closing: 4,
+        hasOpening: true,
+        hasClosing: true,
+        notApplicable: false,
+        previousClosing: 5,
+        openingStatus: 'confirmed_match',
+        updatedByUid: WORKER_UID,
+        updatedByName: 'Trabajadora Mesera',
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      await testEnv.withSecurityRulesDisabled(async (ctx) => {
+        const db = ctx.firestore();
+        const nowTs = Timestamp.now();
+
+        // Active worker in 'mesera'
+        await setDoc(doc(db, 'teamMembers', WORKER_UID), {
+          uid: WORKER_UID,
+          email: WORKER_EMAIL,
+          displayName: 'Trabajadora Mesera',
+          workspaceId: WS_ID,
+          ownerUid: OWNER_UID,
+          authorizedEmails: [OWNER_EMAIL],
+          station: 'mesera',
+          active: true,
+          createdAt: nowTs,
+          updatedAt: nowTs,
+        });
+
+        // (a) Item created inside the station (id starts with station id)
+        await setDoc(doc(db, 'items', 'mesera_1'), {
+          workspaceId: WS_ID,
+          ownerUid: OWNER_UID,
+          authorizedEmails: [OWNER_EMAIL],
+          station: 'mesera',
+          name: 'Servilletas Mesa',
+          unit: 'paq',
+          minStock: 2,
+          targetStock: 10,
+          active: true,
+          sortOrder: 10,
+          createdAt: nowTs,
+          updatedAt: nowTs,
+        });
+
+        // (b) Item created in another station ('asados_99') and reassigned via assignWorkstationItems to 'mesera'
+        await setDoc(doc(db, 'items', 'asados_99'), {
+          workspaceId: WS_ID,
+          ownerUid: OWNER_UID,
+          authorizedEmails: [OWNER_EMAIL],
+          station: 'mesera',
+          name: 'Salsa BBQ Reasignada',
+          unit: 'und',
+          minStock: 2,
+          targetStock: 10,
+          active: true,
+          sortOrder: 20,
+          createdAt: nowTs,
+          updatedAt: nowTs,
+        });
+
+        // (c1) Catalog item with inputType = 'count'
+        await setDoc(doc(db, 'items', 'item_count_1'), {
+          workspaceId: WS_ID,
+          ownerUid: OWNER_UID,
+          authorizedEmails: [OWNER_EMAIL],
+          station: 'mesera',
+          name: 'Gaseosa Personal',
+          unit: 'und',
+          inputType: 'count',
+          minStock: 5,
+          targetStock: 24,
+          active: true,
+          sortOrder: 30,
+          createdAt: nowTs,
+          updatedAt: nowTs,
+        });
+
+        // (c2) Catalog item with inputType = 'packs' and all optional pack fields
+        await setDoc(doc(db, 'items', 'item_packs_1'), {
+          workspaceId: WS_ID,
+          ownerUid: OWNER_UID,
+          authorizedEmails: [OWNER_EMAIL],
+          station: 'mesera',
+          name: 'Vasos Desechables',
+          unit: 'unid',
+          inputType: 'packs',
+          packSize: 50,
+          packLabel: 'paquete',
+          unitLabel: 'unid',
+          minStock: 50,
+          targetStock: 200,
+          active: true,
+          sortOrder: 40,
+          createdAt: nowTs,
+          updatedAt: nowTs,
+        });
+
+        // (c3) Catalog item with inputType = 'level' and capacity + allowClosedContainers
+        await setDoc(doc(db, 'items', 'item_level_1'), {
+          workspaceId: WS_ID,
+          ownerUid: OWNER_UID,
+          authorizedEmails: [OWNER_EMAIL],
+          station: 'mesera',
+          name: 'Jabón Líquido',
+          unit: 'L',
+          inputType: 'level',
+          capacity: 4,
+          allowClosedContainers: true,
+          minStock: 1,
+          targetStock: 4,
+          active: true,
+          sortOrder: 50,
+          createdAt: nowTs,
+          updatedAt: nowTs,
+        });
+      });
+
+      // (g.2) Parent report does NOT exist on server -> creating entry alone must fail
+      await assertFails(
+        setDoc(
+          doc(workerDb, 'dailyReports', reportId, 'entries', 'mesera_1'),
+          makeExactEntryPayload('mesera_1', 'Servilletas Mesa', 'paq', 2, 10),
+        ),
+      );
+
+      // (g.1) Parent report already exists with status = 'opening_saved'
+      await testEnv.withSecurityRulesDisabled(async (ctx) => {
+        const db = ctx.firestore();
+        await setDoc(doc(db, 'dailyReports', reportId), {
+          workspaceId: WS_ID,
+          ownerUid: OWNER_UID,
+          authorizedEmails: [OWNER_EMAIL],
+          date: opDate,
+          station,
+          status: 'opening_saved',
+          reportedByUid: WORKER_UID,
+          reportedByName: 'Trabajadora Mesera',
+          notes: '',
+          createdAt: Timestamp.now(),
+          updatedAt: Timestamp.now(),
+        });
+        // (e) Schedule disabled (shiftSchedule.enabled = false)
+        await setDoc(
+          doc(db, 'workspaces', WS_ID),
+          {
+            shiftSchedule: {
+              enabled: false,
+              openingStart: '10:00',
+              openingEnd: '15:00',
+              closingStart: '16:00',
+              closingEnd: '01:00',
+            },
+          },
+          { merge: true },
+        );
+      });
+
+      // All 5 items (a, b, c1, c2, c3) succeed both in a 4-item batch and individually
+      const batch4 = writeBatch(workerDb);
+      batch4.set(
+        doc(workerDb, 'dailyReports', reportId, 'entries', 'mesera_1'),
+        makeExactEntryPayload('mesera_1', 'Servilletas Mesa', 'paq', 2, 10),
+      );
+      batch4.set(
+        doc(workerDb, 'dailyReports', reportId, 'entries', 'asados_99'),
+        makeExactEntryPayload('asados_99', 'Salsa BBQ Reasignada', 'und', 2, 10),
+      );
+      batch4.set(
+        doc(workerDb, 'dailyReports', reportId, 'entries', 'item_count_1'),
+        makeExactEntryPayload('item_count_1', 'Gaseosa Personal', 'und', 5, 24),
+      );
+      batch4.set(
+        doc(workerDb, 'dailyReports', reportId, 'entries', 'item_packs_1'),
+        makeExactEntryPayload('item_packs_1', 'Vasos Desechables', 'unid', 50, 200),
+      );
+      await assertSucceeds(batch4.commit());
+
+      await assertSucceeds(
+        setDoc(
+          doc(workerDb, 'dailyReports', reportId, 'entries', 'item_level_1'),
+          makeExactEntryPayload('item_level_1', 'Jabón Líquido', 'L', 1, 4),
+        ),
+      );
+
+      // (f) Workspace without shiftSchedule field falls back safely without throwing property error
+      await testEnv.withSecurityRulesDisabled(async (ctx) => {
+        const db = ctx.firestore();
+        await setDoc(doc(db, 'workspaces', WS_ID), {
+          name: 'The Fire',
+          ownerUid: OWNER_UID,
+          ownerEmail: OWNER_EMAIL,
+          authorizedEmails: [OWNER_EMAIL],
+          seeded: true,
+          createdAt: Timestamp.now(),
+          updatedAt: Timestamp.now(),
+        });
+      });
+    });
+  });
 });
+

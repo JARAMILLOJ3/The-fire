@@ -921,11 +921,19 @@ export interface EntryRuleDiagnosisContext {
   memberProbe: ServerDocProbe<Partial<TeamMember>> | null;
 }
 
+export interface EntryRuleConditionEvaluation {
+  condition: string;
+  passed: boolean;
+  summary: string;
+}
+
 export interface EntryRuleDiagnosisResult {
   error: DiagnosticSaveError;
   reasons: string[];
+  evaluations: EntryRuleConditionEvaluation[];
   catalogMismatchDetected: boolean;
   workspaceMismatchDetected: boolean;
+  existingEntryDetected: boolean;
 }
 
 function isValidEmailListForRules(emails: unknown): boolean {
@@ -944,6 +952,8 @@ function isValidEmailListForRules(emails: unknown): boolean {
 function isFiniteStockBound(val: unknown): val is number {
   return typeof val === 'number' && Number.isFinite(val) && val >= 0 && val <= MAX_STOCK_VALUE;
 }
+
+const STRICT_HHMM_REGEX = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 
 export function diagnoseEntryRuleViolations(
   ctx: EntryRuleDiagnosisContext,
@@ -969,30 +979,54 @@ export function diagnoseEntryRuleViolations(
   const errCode = extractFirebaseCode(entryError);
   const rawEntryText = extractRawErrorText(entryError);
   const reasons: string[] = [];
+  const evaluations: EntryRuleConditionEvaluation[] = [];
   let catalogMismatchDetected = false;
   let workspaceMismatchDetected = false;
+  let existingEntryDetected = false;
 
   // 1. Auth checks (isVerifiedUser)
+  const authFailures: string[] = [];
   if (!user.emailVerified) {
-    reasons.push('tu cuenta de Google no tiene email verificado');
+    const msg = 'tu cuenta de Google no tiene email verificado';
+    reasons.push(msg);
+    authFailures.push(msg);
   }
   if (!user.email || user.email.length > MAX_EMAIL_LENGTH) {
-    reasons.push('tu cuenta de Google no tiene un email válido');
+    const msg = 'tu cuenta de Google no tiene un email válido';
+    reasons.push(msg);
+    authFailures.push(msg);
   }
+  evaluations.push({
+    condition: '1. Usuario verificado (isVerifiedUser)',
+    passed: authFailures.length === 0,
+    summary:
+      authFailures.length === 0
+        ? `OK (uid=${user.uid}, email=${user.email ?? '?'})`
+        : `FALLÓ (${authFailures.join('; ')})`,
+  });
 
   // 2. Entry schema & path consistency (isValidDailyReportEntry)
+  const schemaFailures: string[] = [];
   const expectedReportId = `${workspace.id}_${date}_${station}`;
   if (reportId !== expectedReportId) {
-    reasons.push(`reportId ("${reportId}") ≠ esperado ("${expectedReportId}")`);
+    const msg = `reportId ("${reportId}") ≠ esperado ("${expectedReportId}")`;
+    reasons.push(msg);
+    schemaFailures.push(msg);
   }
   if (!ID_PATTERN.test(reportId)) {
-    reasons.push(`reportId ("${reportId}") contiene caracteres inválidos`);
+    const msg = `reportId ("${reportId}") contiene caracteres inválidos`;
+    reasons.push(msg);
+    schemaFailures.push(msg);
   }
   if (!ID_PATTERN.test(op.itemId)) {
-    reasons.push(`itemId ("${op.itemId}") contiene caracteres inválidos`);
+    const msg = `itemId ("${op.itemId}") contiene caracteres inválidos`;
+    reasons.push(msg);
+    schemaFailures.push(msg);
   }
   if (!DATE_PATTERN.test(date)) {
-    reasons.push(`fecha ("${date}") no tiene formato YYYY-MM-DD`);
+    const msg = `fecha ("${date}") no tiene formato YYYY-MM-DD`;
+    reasons.push(msg);
+    schemaFailures.push(msg);
   }
 
   const createFields = op.createFields;
@@ -1001,25 +1035,33 @@ export function diagnoseEntryRuleViolations(
     createFields.itemName.length < 1 ||
     createFields.itemName.length > MAX_NAME_LENGTH
   ) {
-    reasons.push(`itemName inválido ("${String(createFields.itemName ?? '')}")`);
+    const msg = `itemName inválido ("${String(createFields.itemName ?? '')}")`;
+    reasons.push(msg);
+    schemaFailures.push(msg);
   }
   if (
     typeof createFields.unit !== 'string' ||
     createFields.unit.length < 1 ||
     createFields.unit.length > MAX_UNIT_LENGTH
   ) {
-    reasons.push(`unidad inválida ("${String(createFields.unit ?? '')}")`);
+    const msg = `unidad inválida ("${String(createFields.unit ?? '')}")`;
+    reasons.push(msg);
+    schemaFailures.push(msg);
   }
   if (
     typeof createFields.updatedByName !== 'string' ||
     createFields.updatedByName.length < 1 ||
     createFields.updatedByName.length > MAX_NAME_LENGTH
   ) {
-    reasons.push('nombre de quien reporta vacío o demasiado largo');
+    const msg = 'nombre de quien reporta vacío o demasiado largo';
+    reasons.push(msg);
+    schemaFailures.push(msg);
   }
   if (op.kind === 'set' && !isValidEmailListForRules(createFields.authorizedEmails)) {
     workspaceMismatchDetected = true;
-    reasons.push('lista authorizedEmails vacía o con correo inválido en el intento');
+    const msg = 'lista authorizedEmails vacía o con correo inválido en el intento';
+    reasons.push(msg);
+    schemaFailures.push(msg);
   }
   if (
     'openingStatus' in createFields &&
@@ -1028,7 +1070,9 @@ export function diagnoseEntryRuleViolations(
     createFields.openingStatus !== 'adjusted' &&
     createFields.openingStatus !== 'manual'
   ) {
-    reasons.push(`openingStatus inválido ("${String(createFields.openingStatus)}")`);
+    const msg = `openingStatus inválido ("${String(createFields.openingStatus)}")`;
+    reasons.push(msg);
+    schemaFailures.push(msg);
   }
   if (
     !isFiniteStockBound(createFields.minStock) ||
@@ -1037,203 +1081,343 @@ export function diagnoseEntryRuleViolations(
     !isFiniteStockBound(createFields.added) ||
     !isFiniteStockBound(createFields.closing)
   ) {
-    reasons.push('algún valor numérico (mínimo/ideal/apertura/surtido/cierre) está fuera de 0..100000');
+    const msg =
+      'algún valor numérico (mínimo/ideal/apertura/surtido/cierre) está fuera de 0..100000';
+    reasons.push(msg);
+    schemaFailures.push(msg);
   }
   if (
     'previousClosing' in createFields &&
     createFields.previousClosing !== undefined &&
     !isFiniteStockBound(createFields.previousClosing)
   ) {
-    reasons.push(`previousClosing fuera de rango (${String(createFields.previousClosing)})`);
+    const msg = `previousClosing fuera de rango (${String(createFields.previousClosing)})`;
+    reasons.push(msg);
+    schemaFailures.push(msg);
   }
+  evaluations.push({
+    condition: '2. Validez de campos (isValidDailyReportEntry)',
+    passed: schemaFailures.length === 0,
+    summary:
+      schemaFailures.length === 0
+        ? `OK (op=${op.kind}, unidad="${String(createFields.unit)}", rangos válidos)`
+        : `FALLÓ (${schemaFailures.join('; ')})`,
+  });
 
   // 3. Entry existence vs op.kind
+  const entryStateFailures: string[] = [];
   if (entryProbe.errorCode) {
-    reasons.push(
-      `no se pudo verificar entrada en servidor (${entryProbe.errorCode}: ${entryProbe.errorMessage ?? ''})`,
-    );
+    const msg = `no se pudo verificar entrada en servidor (${entryProbe.errorCode}: ${entryProbe.errorMessage ?? ''})`;
+    reasons.push(msg);
+    entryStateFailures.push(msg);
   } else if (op.kind === 'set' && entryProbe.exists) {
-    reasons.push('este insumo ya existía en el reporte del servidor');
+    existingEntryDetected = true;
+    const msg = 'este insumo ya existía en el reporte del servidor';
+    reasons.push(msg);
+    entryStateFailures.push(msg);
   } else if (op.kind === 'update' && !entryProbe.exists) {
-    reasons.push('este insumo aún no existe como entrada en el reporte del servidor');
+    const msg = 'este insumo aún no existe como entrada en el reporte del servidor';
+    reasons.push(msg);
+    entryStateFailures.push(msg);
   } else if (op.kind === 'update' && !canManage && entryProbe.exists && entryProbe.data) {
     const existingEntry = entryProbe.data;
     if (existingEntry.itemName !== createFields.itemName) {
       catalogMismatchDetected = true;
-      reasons.push(
-        `nombre en entrada previa ("${existingEntry.itemName}") ≠ "${String(createFields.itemName)}"`,
-      );
+      const msg = `nombre en entrada previa ("${existingEntry.itemName}") ≠ "${String(createFields.itemName)}"`;
+      reasons.push(msg);
+      entryStateFailures.push(msg);
     }
     if (existingEntry.unit !== createFields.unit) {
       catalogMismatchDetected = true;
-      reasons.push(
-        `unidad en entrada previa ("${existingEntry.unit}") ≠ "${String(createFields.unit)}"`,
-      );
+      const msg = `unidad en entrada previa ("${existingEntry.unit}") ≠ "${String(createFields.unit)}"`;
+      reasons.push(msg);
+      entryStateFailures.push(msg);
     }
     if (existingEntry.minStock !== createFields.minStock) {
       catalogMismatchDetected = true;
-      reasons.push(
-        `minStock en entrada previa (${existingEntry.minStock}) ≠ ${String(createFields.minStock)}`,
-      );
+      const msg = `minStock en entrada previa (${existingEntry.minStock}) ≠ ${String(createFields.minStock)}`;
+      reasons.push(msg);
+      entryStateFailures.push(msg);
     }
     if (existingEntry.targetStock !== createFields.targetStock) {
       catalogMismatchDetected = true;
-      reasons.push(
-        `targetStock en entrada previa (${existingEntry.targetStock}) ≠ ${String(createFields.targetStock)}`,
-      );
+      const msg = `targetStock en entrada previa (${existingEntry.targetStock}) ≠ ${String(createFields.targetStock)}`;
+      reasons.push(msg);
+      entryStateFailures.push(msg);
     }
   }
+  evaluations.push({
+    condition: '3. Estado previo de entrada (entries/{itemId})',
+    passed: entryStateFailures.length === 0,
+    summary:
+      entryStateFailures.length === 0
+        ? `OK (op=${op.kind}, existeEnServidor=${String(entryProbe.exists)})`
+        : `FALLÓ (${entryStateFailures.join('; ')})`,
+  });
 
   // 4. Item catalog check (entryMatchesItem)
+  const catalogFailures: string[] = [];
   if (itemProbe.errorCode) {
     if (itemProbe.errorCode === 'permission-denied') {
       catalogMismatchDetected = true;
-      reasons.push(
-        `el insumo items/${op.itemId} ya no pertenece a este puesto o fue desasignado en el catálogo`,
-      );
+      const msg = `el insumo items/${op.itemId} ya no pertenece a este puesto o fue desasignado en el catálogo`;
+      reasons.push(msg);
+      catalogFailures.push(msg);
     } else {
-      reasons.push(
-        `no se pudo leer items/${op.itemId} (${itemProbe.errorCode}: ${itemProbe.errorMessage ?? ''})`,
-      );
+      const msg = `no se pudo leer items/${op.itemId} (${itemProbe.errorCode}: ${itemProbe.errorMessage ?? ''})`;
+      reasons.push(msg);
+      catalogFailures.push(msg);
     }
   } else if (!itemProbe.exists) {
     catalogMismatchDetected = true;
-    reasons.push(`el insumo items/${op.itemId} no existe en el servidor`);
+    const msg = `el insumo items/${op.itemId} no existe en el servidor`;
+    reasons.push(msg);
+    catalogFailures.push(msg);
   } else if (itemProbe.data) {
     const it = itemProbe.data;
+    const requiredItemFields: Array<keyof InventoryItem> = [
+      'workspaceId',
+      'station',
+      'name',
+      'unit',
+      'minStock',
+      'targetStock',
+    ];
+    for (const f of requiredItemFields) {
+      if (!(f in it) || it[f] === undefined) {
+        catalogMismatchDetected = true;
+        const msg = `items/${op.itemId} no tiene el campo obligatorio "${f}"`;
+        reasons.push(msg);
+        catalogFailures.push(msg);
+      }
+    }
     if (it.workspaceId !== workspace.id) {
       catalogMismatchDetected = true;
-      reasons.push(`workspaceId del catálogo (${it.workspaceId}) ≠ ${workspace.id}`);
+      const msg = `workspaceId del catálogo (${it.workspaceId}) ≠ ${workspace.id}`;
+      reasons.push(msg);
+      catalogFailures.push(msg);
     }
     if (
       it.station !== station &&
       !(it.station === 'hamburguesas' && station === 'comida_rapida')
     ) {
       catalogMismatchDetected = true;
-      reasons.push(`puesto en catálogo (${it.station}) ≠ ${station}`);
+      const msg = `puesto en catálogo (${it.station}) ≠ ${station}`;
+      reasons.push(msg);
+      catalogFailures.push(msg);
     }
     if (it.name !== createFields.itemName) {
       catalogMismatchDetected = true;
-      reasons.push(`nombre en catálogo ("${it.name}") ≠ "${String(createFields.itemName)}"`);
+      const msg = `nombre en catálogo ("${it.name}") ≠ "${String(createFields.itemName)}"`;
+      reasons.push(msg);
+      catalogFailures.push(msg);
     }
-    if (it.unit !== createFields.unit) {
+    const unitMatches =
+      it.unit === createFields.unit ||
+      (typeof it.unitLabel === 'string' && it.unitLabel === createFields.unit);
+    if (!unitMatches) {
       catalogMismatchDetected = true;
-      reasons.push(`unidad en catálogo ("${it.unit}") ≠ "${String(createFields.unit)}"`);
+      const msg = `unidad en catálogo ("${it.unit}"${it.unitLabel ? ` / unitLabel="${it.unitLabel}"` : ''}) ≠ "${String(createFields.unit)}"`;
+      reasons.push(msg);
+      catalogFailures.push(msg);
     }
     if (it.minStock !== createFields.minStock) {
       catalogMismatchDetected = true;
-      reasons.push(`minStock en catálogo (${it.minStock}) ≠ ${String(createFields.minStock)}`);
+      const msg = `minStock en catálogo (${it.minStock}) ≠ ${String(createFields.minStock)}`;
+      reasons.push(msg);
+      catalogFailures.push(msg);
     }
     if (it.targetStock !== createFields.targetStock) {
       catalogMismatchDetected = true;
-      reasons.push(
-        `targetStock en catálogo (${it.targetStock}) ≠ ${String(createFields.targetStock)}`,
-      );
+      const msg = `targetStock en catálogo (${it.targetStock}) ≠ ${String(createFields.targetStock)}`;
+      reasons.push(msg);
+      catalogFailures.push(msg);
     }
   }
+  evaluations.push({
+    condition: '4. Coincidencia con catálogo (entryMatchesItem en items/{itemId})',
+    passed: catalogFailures.length === 0,
+    summary:
+      catalogFailures.length === 0
+        ? `OK (items/${op.itemId} coincide en station=${station}, unidad="${String(createFields.unit)}", min=${String(createFields.minStock)}, ideal=${String(createFields.targetStock)})`
+        : `FALLÓ (${catalogFailures.join('; ')})`,
+  });
 
   // 5. Team member check (isActiveStationWorker)
+  const memberFailures: string[] = [];
   if (memberProbe) {
     if (memberProbe.errorCode) {
-      reasons.push(
-        `no se pudo leer teamMembers/${user.uid} (${memberProbe.errorCode}: ${memberProbe.errorMessage ?? ''})`,
-      );
+      const msg = `no se pudo leer teamMembers/${user.uid} (${memberProbe.errorCode}: ${memberProbe.errorMessage ?? ''})`;
+      reasons.push(msg);
+      memberFailures.push(msg);
     } else if (!memberProbe.exists) {
-      reasons.push(`no existe teamMembers/${user.uid}`);
+      const msg = `no existe teamMembers/${user.uid}`;
+      reasons.push(msg);
+      memberFailures.push(msg);
     } else if (memberProbe.data) {
       const m = memberProbe.data;
       if (!m.active) {
-        reasons.push('tu acceso en teamMembers está desactivado (active: false)');
+        const msg = 'tu acceso en teamMembers está desactivado (active: false)';
+        reasons.push(msg);
+        memberFailures.push(msg);
       }
       if (m.workspaceId !== workspace.id) {
-        reasons.push(`teamMembers.workspaceId (${m.workspaceId}) ≠ ${workspace.id}`);
+        const msg = `teamMembers.workspaceId (${m.workspaceId}) ≠ ${workspace.id}`;
+        reasons.push(msg);
+        memberFailures.push(msg);
       }
       if (
         m.station !== station &&
         !(m.station === 'hamburguesas' && station === 'comida_rapida')
       ) {
-        reasons.push(`teamMembers.station (${m.station}) ≠ ${station}`);
+        const msg = `teamMembers.station (${m.station}) ≠ ${station}`;
+        reasons.push(msg);
+        memberFailures.push(msg);
       }
     }
   }
+  evaluations.push({
+    condition: '5. Membresía y puesto (isActiveStationWorker en teamMembers/{uid})',
+    passed: memberFailures.length === 0,
+    summary: !memberProbe
+      ? 'OK (modo administrador/jefe)'
+      : memberFailures.length === 0
+        ? `OK (active=${String(memberProbe.data?.active)}, station=${String(memberProbe.data?.station)})`
+        : `FALLÓ (${memberFailures.join('; ')})`,
+  });
 
   // 6. Parent report check (reportAfterMatchesEntry & status != completed)
+  const reportFailures: string[] = [];
   if (reportProbe.errorCode) {
-    reasons.push(
-      `no se pudo leer dailyReports/${reportId} (${reportProbe.errorCode}: ${reportProbe.errorMessage ?? ''})`,
-    );
+    const msg = `no se pudo leer dailyReports/${reportId} (${reportProbe.errorCode}: ${reportProbe.errorMessage ?? ''})`;
+    reasons.push(msg);
+    reportFailures.push(msg);
   } else if (!reportProbe.exists) {
-    reasons.push(`no existe dailyReports/${reportId} en el servidor`);
+    const msg = `no existe dailyReports/${reportId} en el servidor`;
+    reasons.push(msg);
+    reportFailures.push(msg);
   } else if (reportProbe.data) {
     const rep = reportProbe.data;
     if (rep.status === 'completed') {
-      reasons.push(`dailyReports/${reportId} está en estado completed`);
+      const msg = `dailyReports/${reportId} está en estado completed`;
+      reasons.push(msg);
+      reportFailures.push(msg);
     }
     if (!rep.ownerUid) {
-      reasons.push(`dailyReports/${reportId} no tiene ownerUid`);
+      const msg = `dailyReports/${reportId} no tiene ownerUid`;
+      reasons.push(msg);
+      reportFailures.push(msg);
     } else if (rep.ownerUid !== createFields.ownerUid) {
       workspaceMismatchDetected = true;
-      reasons.push(
-        `ownerUid del reporte (${rep.ownerUid}) ≠ "${String(createFields.ownerUid)}"`,
-      );
+      const msg = `ownerUid del reporte (${rep.ownerUid}) ≠ "${String(createFields.ownerUid)}"`;
+      reasons.push(msg);
+      reportFailures.push(msg);
     }
     if (rep.workspaceId !== workspace.id) {
-      reasons.push(`workspaceId del reporte (${rep.workspaceId}) ≠ ${workspace.id}`);
+      const msg = `workspaceId del reporte (${rep.workspaceId}) ≠ ${workspace.id}`;
+      reasons.push(msg);
+      reportFailures.push(msg);
     }
     if (rep.date !== date) {
-      reasons.push(`fecha del reporte (${rep.date}) ≠ ${date}`);
+      const msg = `fecha del reporte (${rep.date}) ≠ ${date}`;
+      reasons.push(msg);
+      reportFailures.push(msg);
     }
     if (rep.station !== station) {
-      reasons.push(`puesto del reporte (${rep.station}) ≠ ${station}`);
+      const msg = `puesto del reporte (${rep.station}) ≠ ${station}`;
+      reasons.push(msg);
+      reportFailures.push(msg);
     }
   }
+  evaluations.push({
+    condition: '6. Estado del reporte padre (dailyReports/{reportId})',
+    passed: reportFailures.length === 0,
+    summary:
+      reportFailures.length === 0
+        ? `OK (status=${String(reportProbe.data?.status ?? '?')}, date=${date}, station=${station})`
+        : `FALLÓ (${reportFailures.join('; ')})`,
+  });
 
   // 7. Operational date check for workers (isValidWorkerOperationalDate)
+  const dateFailures: string[] = [];
+  const serverTodayOp = getOperationalDateStr(now);
+  const serverPrevOp = getPreviousDateStr(serverTodayOp);
   if (!canManage) {
-    const serverTodayOp = getOperationalDateStr(now);
-    const serverPrevOp = getPreviousDateStr(serverTodayOp);
     if (date !== serverTodayOp && date !== serverPrevOp) {
-      reasons.push(
-        `fecha "${date}" fuera de ventana operativa del servidor (permitido: ${serverTodayOp} o ${serverPrevOp})`,
-      );
+      const msg = `fecha "${date}" fuera de ventana operativa del servidor (permitido: ${serverTodayOp} o ${serverPrevOp})`;
+      reasons.push(msg);
+      dateFailures.push(msg);
     }
   }
+  evaluations.push({
+    condition: '7. Fecha operativa (isValidWorkerOperationalDate)',
+    passed: dateFailures.length === 0,
+    summary:
+      dateFailures.length === 0
+        ? `OK (fecha=${date}, hoyOp=${serverTodayOp}, ayerOp=${serverPrevOp})`
+        : `FALLÓ (${dateFailures.join('; ')})`,
+  });
 
   // 8. Workspace & exact schedule evaluation (isWorkerWithinSchedule)
+  const scheduleFailures: string[] = [];
+  const bogotaTime = getBogotaNowParts(now).hhmm;
   if (workspaceProbe.errorCode) {
-    reasons.push(
-      `no se pudo leer workspaces/${workspace.id} (${workspaceProbe.errorCode}: ${workspaceProbe.errorMessage ?? ''})`,
-    );
+    const msg = `no se pudo leer workspaces/${workspace.id} (${workspaceProbe.errorCode}: ${workspaceProbe.errorMessage ?? ''})`;
+    reasons.push(msg);
+    scheduleFailures.push(msg);
   } else if (!workspaceProbe.exists) {
-    reasons.push(`no existe workspaces/${workspace.id} en el servidor`);
+    const msg = `no existe workspaces/${workspace.id} en el servidor`;
+    reasons.push(msg);
+    scheduleFailures.push(msg);
   } else if (workspaceProbe.data) {
     const ws = workspaceProbe.data;
     if (ws.ownerUid !== createFields.ownerUid) {
       workspaceMismatchDetected = true;
-      reasons.push(
-        `ownerUid del restaurante en servidor (${ws.ownerUid}) ≠ "${String(createFields.ownerUid)}"`,
-      );
+      const msg = `ownerUid del restaurante en servidor (${ws.ownerUid}) ≠ "${String(createFields.ownerUid)}"`;
+      reasons.push(msg);
+      scheduleFailures.push(msg);
     }
     if (!canManage) {
-      const effectiveSchedule = ws.shiftSchedule ?? DEFAULT_SHIFT_SCHEDULE;
-      const bogotaTime = getBogotaNowParts(now).hhmm;
-      if (!ws.shiftSchedule) {
+      const rawSchedule = ws.shiftSchedule;
+      const effectiveSchedule = rawSchedule ?? DEFAULT_SHIFT_SCHEDULE;
+      if (rawSchedule) {
+        const timeKeys: Array<
+          'openingStart' | 'openingEnd' | 'closingStart' | 'closingEnd'
+        > = ['openingStart', 'openingEnd', 'closingStart', 'closingEnd'];
+        for (const tk of timeKeys) {
+          const rawVal = rawSchedule[tk];
+          if (typeof rawVal !== 'string' || !STRICT_HHMM_REGEX.test(rawVal)) {
+            const msg = `workspaces/${workspace.id}.shiftSchedule.${tk} tiene formato "${String(rawVal)}" (se espera HH:mm de 5 caracteres, ej. "01:00")`;
+            reasons.push(msg);
+            scheduleFailures.push(msg);
+          }
+        }
+      }
+      if (!rawSchedule) {
         const evalRes = resolveWorkerScheduleStatus(now, DEFAULT_SHIFT_SCHEDULE);
         if (evalRes.phase === 'outside') {
-          reasons.push(
-            `workspaces/${workspace.id} no tiene shiftSchedule guardado y la hora servidor (${bogotaTime} Bogotá) está fuera del horario por defecto (${DEFAULT_SHIFT_SCHEDULE.openingStart}–${DEFAULT_SHIFT_SCHEDULE.openingEnd} / ${DEFAULT_SHIFT_SCHEDULE.closingStart}–${DEFAULT_SHIFT_SCHEDULE.closingEnd})`,
-          );
+          const msg = `workspaces/${workspace.id} no tiene shiftSchedule guardado y la hora servidor (${bogotaTime} Bogotá) está fuera del horario por defecto (${DEFAULT_SHIFT_SCHEDULE.openingStart}–${DEFAULT_SHIFT_SCHEDULE.openingEnd} / ${DEFAULT_SHIFT_SCHEDULE.closingStart}–${DEFAULT_SHIFT_SCHEDULE.closingEnd})`;
+          reasons.push(msg);
+          scheduleFailures.push(msg);
         }
       } else if (effectiveSchedule.enabled) {
         const evalRes = resolveWorkerScheduleStatus(now, effectiveSchedule);
         if (evalRes.phase === 'outside') {
-          reasons.push(
-            `hora servidor (${bogotaTime} Bogotá) fuera de horario (${effectiveSchedule.openingStart}–${effectiveSchedule.openingEnd} / ${effectiveSchedule.closingStart}–${effectiveSchedule.closingEnd}), fecha: ${date}`,
-          );
+          const msg = `hora servidor (${bogotaTime} Bogotá) fuera de horario (${effectiveSchedule.openingStart}–${effectiveSchedule.openingEnd} / ${effectiveSchedule.closingStart}–${effectiveSchedule.closingEnd}), fecha: ${date}`;
+          reasons.push(msg);
+          scheduleFailures.push(msg);
         }
       }
     }
   }
+  evaluations.push({
+    condition: '8. Horario y restaurante (isWorkerWithinSchedule en workspaces/{id})',
+    passed: scheduleFailures.length === 0,
+    summary:
+      scheduleFailures.length === 0
+        ? `OK (horaBogotá=${bogotaTime}, enabled=${String(workspaceProbe.data?.shiftSchedule?.enabled ?? 'default(true)')})`
+        : `FALLÓ (${scheduleFailures.join('; ')})`,
+  });
 
   const probeStatusSummary = [
     `item=${itemProbe.errorCode ?? (itemProbe.exists ? 'ok' : 'missing')}`,
@@ -1245,19 +1429,25 @@ export function diagnoseEntryRuleViolations(
       : 'member=manager',
   ].join(', ');
 
+  const checklistLines = evaluations
+    .map((ev) => `- ${ev.condition}: ${ev.summary}`)
+    .join('\n');
+
   const valuesSummary = formatAttemptedValuesSummary(op.attemptedValues);
   const opLabel = op.kind === 'update' ? 'actualización' : 'creación';
   const detail =
     reasons.length > 0
       ? `"${op.itemName}" (${opLabel}): ${reasons.join('; ')}. Valores intentados: ${valuesSummary}.`
-      : `"${op.itemName}" (${opLabel}) fue rechazado por Firebase (${errCode ?? 'permission-denied'}). Estado servidor: [${probeStatusSummary}]. Valores intentados: ${valuesSummary}.`;
-  const rawDetail = `${detail}\nDocumento: ${entryPath}\nEstado servidor: [${probeStatusSummary}]\nFirebase (${errCode ?? 'sin código'}): ${rawEntryText}`;
+      : `"${op.itemName}" (${opLabel}) fue rechazado por las reglas de Firestore (${errCode ?? 'permission-denied'}) aunque las 8 condiciones verificadas en servidor dieron OK (posible límite de expresiones CEL o regla desactualizada en Firebase). Estado servidor: [${probeStatusSummary}]. Valores intentados: ${valuesSummary}.`;
+  const rawDetail = `${detail}\nDocumento: ${entryPath}\nEstado servidor: [${probeStatusSummary}]\nEvaluación por condición de regla:\n${checklistLines}\nFirebase (${errCode ?? 'sin código'}): ${rawEntryText}`;
 
   const errorCode = catalogMismatchDetected
     ? 'catalog-mismatch'
     : workspaceMismatchDetected
       ? 'workspace-mismatch'
-      : errCode;
+      : existingEntryDetected
+        ? 'existing-entry'
+        : errCode;
 
   return {
     error: new DiagnosticSaveError({
@@ -1270,8 +1460,10 @@ export function diagnoseEntryRuleViolations(
       code: errorCode,
     }),
     reasons,
+    evaluations,
     catalogMismatchDetected,
     workspaceMismatchDetected,
+    existingEntryDetected,
   };
 }
 
@@ -2149,10 +2341,12 @@ export async function saveStationReportBatch(params: {
     let diag = await diagnoseSingleOp(op, err);
     let workingOp = op;
 
-    // Single automatic retry for catalog mismatch OR stale client workspace cache
+    // Single automatic retry for catalog mismatch, stale client workspace cache, or pre-existing server entry
     if (
       !canManage &&
-      (diag.code === 'catalog-mismatch' || diag.code === 'workspace-mismatch')
+      (diag.code === 'catalog-mismatch' ||
+        diag.code === 'workspace-mismatch' ||
+        diag.code === 'existing-entry')
     ) {
       if (diag.code === 'workspace-mismatch' && io.fetchServerWorkspace) {
         const freshWs = await io.fetchServerWorkspace(effectiveWorkspace.id);
@@ -2161,11 +2355,20 @@ export async function saveStationReportBatch(params: {
           authorizedEmails = buildNormalizedAuthorizedEmails(freshWs);
         }
       }
-      catalogUpdatedDuringSave = true;
+      if (diag.code === 'existing-entry') {
+        const freshEntries = await io.fetchServerEntries(reportId, [op.itemId]);
+        if (freshEntries[op.itemId]) {
+          mergedExistingEntries[op.itemId] = freshEntries[op.itemId];
+        }
+      } else {
+        catalogUpdatedDuringSave = true;
+      }
       onStatusMessage?.(
         diag.code === 'workspace-mismatch'
           ? 'Actualizando configuración del restaurante…'
-          : 'El jefe actualizó los insumos, actualizando…',
+          : diag.code === 'existing-entry'
+            ? 'Sincronizando entrada existente…'
+            : 'El jefe actualizó los insumos, actualizando…',
       );
       const refreshRes = await refreshSingleOpFromServer(op);
       if (refreshRes.omitted) {

@@ -43,7 +43,10 @@ service cloud.firestore {
     }
 
     function isValidTimeStr(val) {
-      return val is string && val.size() == 5 && val.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$');
+      return val is string
+        && val.size() >= 4
+        && val.size() <= 5
+        && val.matches('^([01]?[0-9]|2[0-3]):[0-5][0-9]$');
     }
 
     function isValidEmailStr(val) {
@@ -92,7 +95,10 @@ service cloud.firestore {
     }
 
     function toDateStr(ts) {
-      return string(ts.year()) + '-' + pad2(ts.month()) + '-' + pad2(ts.day());
+      let y = ts.year();
+      let m = ts.month();
+      let d = ts.day();
+      return string(y) + '-' + pad2(m) + '-' + pad2(d);
     }
 
     function bogotaNow() {
@@ -108,22 +114,31 @@ service cloud.firestore {
     }
 
     function bogotaMinutesNow() {
-      return bogotaNow().hours() * 60 + bogotaNow().minutes();
+      let nowTs = bogotaNow();
+      return nowTs.hours() * 60 + nowTs.minutes();
+    }
+
+    function parseTimePart(part) {
+      return part.size() == 2 && part[0:1] == '0' ? int(part[1:2]) : int(part);
     }
 
     function timeToMinutes(t) {
-      return (t[0:1] == '0' ? int(t[1:2]) : int(t[0:2])) * 60
-        + (t[3:4] == '0' ? int(t[4:5]) : int(t[3:5]));
+      let parts = t.split(':');
+      return parseTimePart(parts[0]) * 60 + parseTimePart(parts[1]);
     }
 
     function inWindowWithGrace(nowMin, startStr, endStr, graceMin) {
-      return startStr != endStr
-        && ((nowMin - timeToMinutes(startStr) + 1440) % 1440)
-           < (((timeToMinutes(endStr) - timeToMinutes(startStr) + 1440) % 1440) + graceMin);
+      let startMin = timeToMinutes(startStr);
+      let endMin = timeToMinutes(endStr);
+      let elapsed = (nowMin - startMin + 1440) % 1440;
+      let span = (endMin - startMin + 1440) % 1440;
+      return startMin != endMin && elapsed < (span + graceMin);
     }
 
     function isScheduleAllowed(s, nowMin) {
-      return !s.enabled
+      return !(s is map)
+        || !('enabled' in s)
+        || s.enabled != true
         || inWindowWithGrace(nowMin, s.openingStart, s.openingEnd, 10)
         || inWindowWithGrace(nowMin, s.closingStart, s.closingEnd, 10);
     }
@@ -137,24 +152,29 @@ service cloud.firestore {
     }
 
     function isWorkspaceWithinSchedule(wsData) {
-      return !('shiftSchedule' in wsData)
-        ? (
-          inWindowWithGrace(bogotaMinutesNow(), '16:00', '18:00', 10)
-          || inWindowWithGrace(bogotaMinutesNow(), '23:00', '02:00', 10)
-        )
-        : isScheduleAllowed(wsData.shiftSchedule, bogotaMinutesNow());
-    }
-
-    function isWorkerWithinSchedule(wsId) {
-      return isWorkspaceWithinSchedule(
-        get(/databases/$(database)/documents/workspaces/$(wsId)).data
+      let nowMin = bogotaMinutesNow();
+      return wsData != null && (
+        !('shiftSchedule' in wsData) || wsData.shiftSchedule == null
+          ? (
+            inWindowWithGrace(nowMin, '16:00', '18:00', 10)
+            || inWindowWithGrace(nowMin, '23:00', '02:00', 10)
+          )
+          : isScheduleAllowed(wsData.shiftSchedule, nowMin)
       );
     }
 
+    function isWorkerWithinSchedule(wsId) {
+      let wsSnap = get(/databases/$(database)/documents/workspaces/$(wsId));
+      return wsSnap != null && isWorkspaceWithinSchedule(wsSnap.data);
+    }
+
     function hasActiveMemberDoc() {
+      let mSnap = get(/databases/$(database)/documents/teamMembers/$(request.auth.uid));
       return isVerifiedUser()
-        && exists(/databases/$(database)/documents/teamMembers/$(request.auth.uid))
-        && get(/databases/$(database)/documents/teamMembers/$(request.auth.uid)).data.active == true;
+        && mSnap != null
+        && mSnap.data != null
+        && 'active' in mSnap.data
+        && mSnap.data.active == true;
     }
 
     function memberDoc() {
@@ -162,8 +182,12 @@ service cloud.firestore {
     }
 
     function validWorkerMember(wsId, station, memberData) {
-      return memberData.active == true
+      return memberData != null
+        && 'active' in memberData
+        && memberData.active == true
+        && 'workspaceId' in memberData
         && memberData.workspaceId == wsId
+        && 'station' in memberData
         && (
           memberData.station == station
           || (memberData.station == 'hamburguesas' && station == 'comida_rapida')
@@ -185,25 +209,42 @@ service cloud.firestore {
     }
 
     function validWorkerReportCreate(wsData, report) {
-      return isWorkspaceWithinSchedule(wsData)
+      return wsData != null
+        && isWorkspaceWithinSchedule(wsData)
+        && 'ownerUid' in wsData
         && report.ownerUid == wsData.ownerUid;
     }
 
     function reportAfterMatchesEntry(reportData, entry) {
-      return reportData.workspaceId == entry.workspaceId
+      return reportData != null
+        && 'workspaceId' in reportData
+        && 'ownerUid' in reportData
+        && 'date' in reportData
+        && 'station' in reportData
+        && reportData.workspaceId == entry.workspaceId
         && reportData.ownerUid == entry.ownerUid
         && reportData.date == entry.date
         && reportData.station == entry.station;
     }
 
     function entryMatchesItem(entry, itemData) {
-      return itemData.workspaceId == entry.workspaceId
+      return itemData != null
+        && 'workspaceId' in itemData
+        && 'station' in itemData
+        && 'name' in itemData
+        && 'unit' in itemData
+        && 'minStock' in itemData
+        && 'targetStock' in itemData
+        && itemData.workspaceId == entry.workspaceId
         && (
           itemData.station == entry.station
           || (itemData.station == 'hamburguesas' && entry.station == 'comida_rapida')
         )
         && itemData.name == entry.itemName
-        && itemData.unit == entry.unit
+        && (
+          itemData.unit == entry.unit
+          || ('unitLabel' in itemData && itemData.unitLabel == entry.unit)
+        )
         && itemData.minStock == entry.minStock
         && itemData.targetStock == entry.targetStock;
     }
@@ -229,18 +270,35 @@ service cloud.firestore {
     function canWorkerUpdateEntry(reportSnap, incomingData, existingData) {
       return isActiveStationWorker(existingData.workspaceId, existingData.station)
         && reportSnap != null
+        && reportSnap.data != null
         && reportSnap.data.status != 'completed'
         && isValidWorkerOperationalDate(existingData.date)
         && isWorkerWithinSchedule(existingData.workspaceId)
-        && incomingData.itemName == existingData.itemName
-        && incomingData.unit == existingData.unit
-        && incomingData.minStock == existingData.minStock
-        && incomingData.targetStock == existingData.targetStock
-        && incomingData.diff(existingData).affectedKeys().hasOnly([
-          'opening', 'added', 'closing', 'hasOpening', 'hasClosing',
-          'notApplicable', 'previousClosing', 'openingStatus',
-          'updatedByUid', 'updatedByName', 'updatedAt'
-        ]);
+        && (
+          (
+            incomingData.itemName == existingData.itemName
+            && incomingData.unit == existingData.unit
+            && incomingData.minStock == existingData.minStock
+            && incomingData.targetStock == existingData.targetStock
+            && incomingData.diff(existingData).affectedKeys().hasOnly([
+              'opening', 'added', 'closing', 'hasOpening', 'hasClosing',
+              'notApplicable', 'previousClosing', 'openingStatus',
+              'updatedByUid', 'updatedByName', 'updatedAt', 'createdAt'
+            ])
+          )
+          || (
+            entryMatchesItem(
+              incomingData,
+              get(/databases/$(database)/documents/items/$(existingData.itemId)).data
+            )
+            && incomingData.diff(existingData).affectedKeys().hasOnly([
+              'opening', 'added', 'closing', 'hasOpening', 'hasClosing',
+              'notApplicable', 'previousClosing', 'openingStatus',
+              'itemName', 'unit', 'minStock', 'targetStock',
+              'updatedByUid', 'updatedByName', 'updatedAt', 'createdAt'
+            ])
+          )
+        );
     }
 
     function isWorkspaceOwnerDoc(docData) {
@@ -251,14 +309,16 @@ service cloud.firestore {
     }
 
     function canManageWorkspace(wsId) {
+      let wsSnap = get(/databases/$(database)/documents/workspaces/$(wsId));
       return isVerifiedUser() && (
         isAdmin()
         || wsId == 'ws_' + request.auth.uid
         || (
-          exists(/databases/$(database)/documents/workspaces/$(wsId))
+          wsSnap != null
+          && wsSnap.data != null
           && (
-            get(/databases/$(database)/documents/workspaces/$(wsId)).data.ownerUid == request.auth.uid
-            || request.auth.token.email in get(/databases/$(database)/documents/workspaces/$(wsId)).data.authorizedEmails
+            wsSnap.data.ownerUid == request.auth.uid
+            || ('authorizedEmails' in wsSnap.data && request.auth.token.email in wsSnap.data.authorizedEmails)
           )
         )
         || (
@@ -281,14 +341,6 @@ service cloud.firestore {
           && memberDoc().station == 'jefe'
           && reportId.matches('^' + memberDoc().workspaceId + '_[0-9]{4}-[0-9]{2}-[0-9]{2}_[a-zA-Z0-9_\\-]+$')
         );
-    }
-
-    function canReportStation(wsId, station) {
-      return canManageWorkspace(wsId) || (
-        hasActiveMemberDoc()
-        && memberDoc().workspaceId == wsId
-        && memberDoc().station == station
-      );
     }
 
     function isValidWorkspace(data) {
@@ -658,10 +710,7 @@ service cloud.firestore {
           resource == null
           && (
             isAdmin()
-            || (
-              hasActiveMemberDoc()
-              && (memberDoc().station == 'jefe' || itemId.matches('^' + memberDoc().station + '_[0-9]+$'))
-            )
+            || hasActiveMemberDoc()
           )
         )
         || (
@@ -845,9 +894,7 @@ service cloud.firestore {
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time
           && canCreateDailyReportEntry(
-            exists(/databases/$(database)/documents/dailyReports/$(reportId))
-              ? get(/databases/$(database)/documents/dailyReports/$(reportId))
-              : getAfter(/databases/$(database)/documents/dailyReports/$(reportId)),
+            getAfter(/databases/$(database)/documents/dailyReports/$(reportId)),
             incoming(),
             itemId
           );
@@ -862,7 +909,7 @@ service cloud.firestore {
           && incoming().itemId == existing().itemId
           && incoming().station == existing().station
           && incoming().date == existing().date
-          && incoming().createdAt == existing().createdAt
+          && (incoming().createdAt == existing().createdAt || incoming().createdAt == request.time)
           && incoming().updatedAt == request.time
           && incoming().updatedByUid == request.auth.uid
           && (

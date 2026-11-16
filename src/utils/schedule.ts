@@ -26,31 +26,32 @@ export interface ShiftScheduleValidation {
   warnings: string[];
 }
 
+const FLEXIBLE_TIME_PATTERN = /^([01]?[0-9]|2[0-3]):([0-5][0-9])$/;
+
+export function normalizeTimeHHMM(raw?: string | null, fallback = '00:00'): string {
+  if (typeof raw !== 'string') return fallback;
+  const trimmed = raw.trim();
+  if (TIME_PATTERN.test(trimmed)) return trimmed;
+  const match = FLEXIBLE_TIME_PATTERN.exec(trimmed);
+  if (match) {
+    return `${match[1].padStart(2, '0')}:${match[2]}`;
+  }
+  return fallback;
+}
+
 export function normalizeShiftSchedule(raw?: Partial<ShiftSchedule> | null): ShiftSchedule {
   if (!raw) return { ...DEFAULT_SHIFT_SCHEDULE };
   return {
     enabled: typeof raw.enabled === 'boolean' ? raw.enabled : DEFAULT_SHIFT_SCHEDULE.enabled,
-    openingStart:
-      raw.openingStart && TIME_PATTERN.test(raw.openingStart)
-        ? raw.openingStart
-        : DEFAULT_SHIFT_SCHEDULE.openingStart,
-    openingEnd:
-      raw.openingEnd && TIME_PATTERN.test(raw.openingEnd)
-        ? raw.openingEnd
-        : DEFAULT_SHIFT_SCHEDULE.openingEnd,
-    closingStart:
-      raw.closingStart && TIME_PATTERN.test(raw.closingStart)
-        ? raw.closingStart
-        : DEFAULT_SHIFT_SCHEDULE.closingStart,
-    closingEnd:
-      raw.closingEnd && TIME_PATTERN.test(raw.closingEnd)
-        ? raw.closingEnd
-        : DEFAULT_SHIFT_SCHEDULE.closingEnd,
+    openingStart: normalizeTimeHHMM(raw.openingStart, DEFAULT_SHIFT_SCHEDULE.openingStart),
+    openingEnd: normalizeTimeHHMM(raw.openingEnd, DEFAULT_SHIFT_SCHEDULE.openingEnd),
+    closingStart: normalizeTimeHHMM(raw.closingStart, DEFAULT_SHIFT_SCHEDULE.closingStart),
+    closingEnd: normalizeTimeHHMM(raw.closingEnd, DEFAULT_SHIFT_SCHEDULE.closingEnd),
   };
 }
 
 export function parseTimeToMinutes(hhmm: string): number {
-  const [hStr, mStr] = hhmm.split(':');
+  const [hStr, mStr] = hhmm.trim().split(':');
   const h = Number(hStr);
   const m = Number(mStr);
   if (!Number.isFinite(h) || !Number.isFinite(m)) return 0;

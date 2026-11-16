@@ -737,6 +737,100 @@ describe('worker batch saving (<=4 items per batch, item-by-item isolation, fina
     expect(diag.reasons.some((r) => r.includes('fuera de horario'))).toBe(true);
     expect(diag.reasons.some((r) => r.includes('teamMembers.station'))).toBe(false);
     expect(diag.error.rawDetail).toContain('Estado servidor:');
+    expect(diag.error.rawDetail).toContain('Evaluación por condición de regla:');
+    expect(diag.evaluations).toHaveLength(8);
+    expect(diag.evaluations.find((e) => e.condition.startsWith('5.'))?.passed).toBe(true);
+    expect(diag.evaluations.find((e) => e.condition.startsWith('6.'))?.passed).toBe(false);
+    expect(diag.evaluations.find((e) => e.condition.startsWith('8.'))?.passed).toBe(false);
+  });
+
+  it('detects non-padded shiftSchedule hours (e.g. "1:00") and unitLabel matching for packs in diagnoseEntryRuleViolations', () => {
+    const workspace = makeWorkspace();
+    const user = makeWorkerUser();
+    const { rows } = makeCatalogAndRows(1, 'closing');
+    rows[0].unit = 'unid';
+    const [op] = prepareStationReportEntries({
+      workspace,
+      userUid: user.uid,
+      reporterName: 'Ana',
+      canManage: false,
+      date: '2026-11-15',
+      station: 'asados',
+      reportId: 'ws_1_2026-11-15_asados',
+      mode: 'closing',
+      rows,
+      mergedExistingEntries: {},
+      authorizedEmails: ['jefe@restaurant.com'],
+      timestampValue: 'SERVER_TS',
+    });
+
+    const diag = diagnoseEntryRuleViolations({
+      entryError: Object.assign(new Error('Missing or insufficient permissions.'), {
+        code: 'permission-denied',
+      }),
+      workspace,
+      user,
+      canManage: false,
+      date: '2026-11-15',
+      station: 'asados',
+      reportId: 'ws_1_2026-11-15_asados',
+      op,
+      now: new Date('2026-11-15T22:40:00Z'), // 17:40 Bogota
+      itemProbe: {
+        exists: true,
+        data: {
+          workspaceId: 'ws_1',
+          station: 'asados',
+          name: op.itemName,
+          unit: 'paq',
+          unitLabel: 'unid',
+          inputType: 'packs',
+          minStock: 2,
+          targetStock: 10,
+        },
+      },
+      reportProbe: {
+        exists: true,
+        data: {
+          workspaceId: 'ws_1',
+          ownerUid: 'owner_1',
+          date: '2026-11-15',
+          station: 'asados',
+          status: 'opening_saved',
+        },
+      },
+      workspaceProbe: {
+        exists: true,
+        data: {
+          ownerUid: 'owner_1',
+          shiftSchedule: {
+            enabled: true,
+            openingStart: '10:00',
+            openingEnd: '15:00',
+            closingStart: '16:00',
+            closingEnd: '1:00', // non-padded hour in server doc
+          },
+        },
+      },
+      entryProbe: {
+        exists: false,
+      },
+      memberProbe: {
+        exists: true,
+        data: {
+          active: true,
+          workspaceId: 'ws_1',
+          station: 'asados',
+        },
+      },
+    });
+
+    // Catalog evaluation passes because unitLabel === 'unid' matches op.createFields.unit === 'unid'
+    expect(diag.evaluations.find((e) => e.condition.startsWith('4.'))?.passed).toBe(true);
+    // Schedule evaluation pinpoints the non-padded "1:00" format on workspaces/{id}
+    expect(diag.evaluations.find((e) => e.condition.startsWith('8.'))?.passed).toBe(false);
+    expect(diag.reasons.some((r) => r.includes('closingEnd tiene formato "1:00"'))).toBe(true);
   });
 });
+
 
