@@ -705,16 +705,12 @@ describe('TAREA 1 (a)-(g): Exact CEL evaluation & expression-budget reproduction
     ).toBe(false);
   });
 
-  it('verifies firestore.rules uses let bindings and split-based timeToMinutes to prevent macro expression explosion', () => {
-    expect(rulesText).toContain("let parts = t.split(':');");
-    expect(rulesText).toContain('function parseTimePart(part)');
-    expect(rulesText).toContain('let nowMin = bogotaMinutesNow();');
+  it('verifies firestore.rules uses single-reference window formula and split-based timeToMinutes to prevent macro expression explosion', () => {
+    expect(rulesText).toContain("int(t.split(':')[0]) * 60 + int(t.split(':')[1])");
     expect(rulesText).toContain(
-      'let wsSnap = get(/databases/$(database)/documents/workspaces/$(wsId));',
+      '((timeToMinutes(endStr) + graceMin - nowMin + 1439) % 1440) < ((timeToMinutes(startStr) - nowMin + 1439) % 1440)',
     );
-    expect(rulesText).toContain(
-      'let mSnap = get(/databases/$(database)/documents/teamMembers/$(request.auth.uid));',
-    );
+    expect(rulesText).toContain('(request.time.hours() * 60 + request.time.minutes() + 1140) % 1440');
     expect(rulesText).toContain("('unitLabel' in itemData && itemData.unitLabel == entry.unit)");
     // Ensure items allow get on resource == null no longer restricts worker to station_N prefix
     expect(rulesText).not.toContain("itemId.matches('^' + memberDoc().station + '_[0-9]+$')");
