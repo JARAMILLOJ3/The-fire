@@ -9,8 +9,10 @@ import type {
   Workspace,
 } from '../../types';
 import {
+  diagnoseEntryRuleViolations,
   DiagnosticSaveError,
   PartialBatchSaveError,
+  prepareStationReportEntries,
   saveStationReportBatch,
   type BatchChunkCommitInput,
   type WorkerSaveIO,
@@ -509,4 +511,232 @@ describe('worker batch saving (<=4 items per batch, item-by-item isolation, fina
       });
     }
   });
+
+  it('sanitizes invalid openingStatus, non-finite previousClosing, and whitespace displayName in prepareStationReportEntries & saveStationReportBatch', async () => {
+    const workspace = makeWorkspace();
+    const user = {
+      uid: 'worker_1',
+      email: 'ana@restaurant.com',
+      emailVerified: true,
+      displayName: '   ',
+    } as unknown as User;
+
+    const dirtyRow = {
+      itemId: 'asados_1',
+      itemName: 'TOCINETA',
+      unit: 'und',
+      minStock: 90,
+      targetStock: 150,
+      opening: 183,
+      added: 61,
+      closing: 152,
+      hasOpening: true,
+      hasClosing: true,
+      notApplicable: false,
+      previousClosing: Number.NaN,
+      openingStatus: '' as unknown as DailyReportEntry['openingStatus'],
+    } satisfies DraftEntryRow;
+
+    const ops = prepareStationReportEntries({
+      workspace,
+      userUid: user.uid,
+      reporterName: '   ',
+      canManage: false,
+      date: '2026-11-15',
+      station: 'asados',
+      reportId: 'ws_1_2026-11-15_asados',
+      mode: 'closing',
+      rows: [dirtyRow],
+      mergedExistingEntries: {},
+      authorizedEmails: ['jefe@restaurant.com'],
+      timestampValue: 'SERVER_TS',
+    });
+
+    expect(ops).toHaveLength(1);
+    expect(ops[0].createFields.updatedByName).toBe('Encargada');
+    expect(ops[0].createFields.previousClosing).toBeUndefined();
+    expect(ops[0].createFields.openingStatus).toBe('manual');
+
+    let committedReporterName = '';
+    const { itemsById } = makeCatalogAndRows(1, 'closing');
+    itemsById.asados_1.name = 'TOCINETA';
+    itemsById.asados_1.minStock = 90;
+    itemsById.asados_1.targetStock = 150;
+
+    await saveStationReportBatch({
+      workspace,
+      user,
+      canManage: false,
+      date: '2026-11-15',
+      station: 'asados',
+      mode: 'closing',
+      notes: '',
+      rows: [dirtyRow],
+      existingReport: undefined,
+      existingEntries: {},
+      expectedUpdatedAtMs: null,
+      now: new Date('2026-11-16T04:30:00Z'),
+      io: {
+        syncClock: vi.fn(async () => {}),
+        getServerTimestampValue: () => 'SERVER_TS',
+        fetchServerItems: vi.fn(async () => ({
+          itemsById,
+          removedOrMovedIds: new Set<string>(),
+          offlineFallback: false,
+        })),
+        fetchServerReport: vi.fn(async () => ({ exists: false, updatedAtMs: null })),
+        fetchServerEntries: vi.fn(async () => ({})),
+        commitChunks: vi.fn(async (chunks: BatchChunkCommitInput[]) => {
+          chunks.forEach((c) => {
+            if (c.reportWrite) {
+              committedReporterName = String(c.reportWrite.payload.reportedByName ?? '');
+            }
+          });
+          return { queuedOffline: false };
+        }),
+      },
+    });
+
+    expect(committedReporterName).toBe('ana');
+  });
+
+  it('syncs stale/empty workspace authorizedEmails & ownerUid from server before committing entries', async () => {
+    const staleWorkspace: Workspace = {
+      id: 'ws_1',
+      name: 'The Fire',
+      ownerUid: '',
+      ownerEmail: '',
+      authorizedEmails: [],
+      seeded: true,
+      shiftSchedule: { ...DEFAULT_SHIFT_SCHEDULE, enabled: false },
+    };
+    const freshServerWorkspace: Workspace = {
+      ...makeWorkspace(),
+      shiftSchedule: { ...DEFAULT_SHIFT_SCHEDULE, enabled: false },
+    };
+    const user = makeWorkerUser();
+    const { itemsById, rows } = makeCatalogAndRows(2, 'closing');
+
+    const createdPayloads: Array<Record<string, unknown>> = [];
+    await saveStationReportBatch({
+      workspace: staleWorkspace,
+      user,
+      canManage: false,
+      date: '2026-11-15',
+      station: 'asados',
+      mode: 'closing',
+      notes: '',
+      rows,
+      existingReport: undefined,
+      existingEntries: {},
+      expectedUpdatedAtMs: null,
+      now: new Date('2026-11-16T00:47:00Z'), // 19:47 Bogota
+      io: {
+        syncClock: vi.fn(async () => {}),
+        getServerTimestampValue: () => 'SERVER_TS',
+        fetchServerWorkspace: vi.fn(async () => freshServerWorkspace),
+        fetchServerItems: vi.fn(async () => ({
+          itemsById,
+          removedOrMovedIds: new Set<string>(),
+          offlineFallback: false,
+        })),
+        fetchServerReport: vi.fn(async () => ({ exists: false, updatedAtMs: null })),
+        fetchServerEntries: vi.fn(async () => ({})),
+        commitChunks: vi.fn(async (chunks: BatchChunkCommitInput[]) => {
+          chunks.forEach((c) => {
+            c.entryOps.forEach((op) => createdPayloads.push(op.createFields));
+          });
+          return { queuedOffline: false };
+        }),
+      },
+    });
+
+    expect(createdPayloads).toHaveLength(2);
+    expect(createdPayloads[0].ownerUid).toBe('owner_1');
+    expect(createdPayloads[0].authorizedEmails).toEqual(['jefe@restaurant.com']);
+  });
+
+  it('diagnoseEntryRuleViolations never swallows read failures and pinpoints rule mismatches', () => {
+    const workspace = makeWorkspace();
+    const user = makeWorkerUser();
+    const { rows } = makeCatalogAndRows(1, 'closing');
+    const [op] = prepareStationReportEntries({
+      workspace,
+      userUid: user.uid,
+      reporterName: 'Ana',
+      canManage: false,
+      date: '2026-11-15',
+      station: 'comida_rapida',
+      reportId: 'ws_1_2026-11-15_comida_rapida',
+      mode: 'closing',
+      rows,
+      mergedExistingEntries: {},
+      authorizedEmails: ['jefe@restaurant.com'],
+      timestampValue: 'SERVER_TS',
+    });
+
+    const diag = diagnoseEntryRuleViolations({
+      entryError: Object.assign(new Error('Missing or insufficient permissions.'), {
+        code: 'permission-denied',
+      }),
+      workspace,
+      user,
+      canManage: false,
+      date: '2026-11-15',
+      station: 'comida_rapida',
+      reportId: 'ws_1_2026-11-15_comida_rapida',
+      op,
+      now: new Date('2026-11-16T00:47:00Z'), // 19:47 Bogota (outside default enabled schedule)
+      itemProbe: {
+        exists: true,
+        data: {
+          workspaceId: 'ws_1',
+          station: 'comida_rapida',
+          name: op.itemName,
+          unit: 'und',
+          minStock: 2,
+          targetStock: 10,
+        },
+      },
+      reportProbe: {
+        exists: true,
+        data: {
+          workspaceId: 'ws_1',
+          ownerUid: 'other_owner',
+          date: '2026-11-15',
+          station: 'comida_rapida',
+          status: 'open',
+        },
+      },
+      workspaceProbe: {
+        exists: true,
+        data: {
+          ownerUid: 'owner_1',
+          shiftSchedule: DEFAULT_SHIFT_SCHEDULE,
+        },
+      },
+      entryProbe: {
+        exists: false,
+        errorCode: 'permission-denied',
+        errorMessage: 'entry get denied',
+      },
+      memberProbe: {
+        exists: true,
+        data: {
+          active: true,
+          workspaceId: 'ws_1',
+          station: 'hamburguesas', // legacy equivalent for comida_rapida should pass
+        },
+      },
+    });
+
+    expect(diag.reasons).toContain('ownerUid del reporte (other_owner) ≠ "owner_1"');
+    expect(diag.reasons).toContain(
+      'no se pudo verificar entrada en servidor (permission-denied: entry get denied)',
+    );
+    expect(diag.reasons.some((r) => r.includes('fuera de horario'))).toBe(true);
+    expect(diag.reasons.some((r) => r.includes('teamMembers.station'))).toBe(false);
+    expect(diag.error.rawDetail).toContain('Estado servidor:');
+  });
 });
+

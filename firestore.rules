@@ -845,7 +845,9 @@ service cloud.firestore {
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time
           && canCreateDailyReportEntry(
-            getAfter(/databases/$(database)/documents/dailyReports/$(reportId)),
+            exists(/databases/$(database)/documents/dailyReports/$(reportId))
+              ? get(/databases/$(database)/documents/dailyReports/$(reportId))
+              : getAfter(/databases/$(database)/documents/dailyReports/$(reportId)),
             incoming(),
             itemId
           );

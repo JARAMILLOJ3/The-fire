@@ -11,8 +11,13 @@ import {
   writeBatch,
 } from 'firebase/firestore';
 import {
+  DATE_PATTERN,
+  DEFAULT_SHIFT_SCHEDULE,
+  ID_PATTERN,
+  MAX_EMAIL_LENGTH,
   MAX_NAME_LENGTH,
   MAX_NOTES_LENGTH,
+  MAX_STOCK_VALUE,
   MAX_TIME_LABEL_LENGTH,
   MAX_UNIT_LENGTH,
   MAX_WORKER_NOTE_LENGTH,
@@ -32,7 +37,9 @@ import type {
 } from '../types';
 import {
   formatBogotaTimeExact,
+  getBogotaNowParts,
   getOperationalDateStr,
+  getPreviousDateStr,
   getServerNow,
   syncServerClockOffset,
 } from '../utils/date';
@@ -599,23 +606,35 @@ export function prepareStationReportEntries(params: {
     const closingVal =
       !row.hasClosing && prev?.hasClosing ? clampNumber(prev.closing) : clampNumber(row.closing);
 
-    const previousClosingVal =
-      typeof row.previousClosing === 'number'
+    const VALID_OPENING_STATUSES = new Set(['confirmed_match', 'adjusted', 'manual']);
+    const normalizeOpeningStatus = (
+      val: unknown,
+    ): DailyReportEntry['openingStatus'] | undefined =>
+      typeof val === 'string' && VALID_OPENING_STATUSES.has(val)
+        ? (val as DailyReportEntry['openingStatus'])
+        : undefined;
+
+    const rawPrevClosing =
+      typeof row.previousClosing === 'number' && Number.isFinite(row.previousClosing)
         ? clampNumber(row.previousClosing)
-        : typeof prev?.previousClosing === 'number'
+        : typeof prev?.previousClosing === 'number' && Number.isFinite(prev.previousClosing)
           ? clampNumber(prev.previousClosing)
           : undefined;
-    const derivedOpeningStatus =
-      notApplicable
-        ? undefined
-        : row.openingStatus ??
-          (hasOpening && previousClosingVal !== undefined
-            ? openingVal === previousClosingVal
-              ? 'confirmed_match'
-              : 'adjusted'
-            : hasOpening
-              ? prev?.openingStatus ?? 'manual'
-              : prev?.openingStatus);
+    const previousClosingVal = rawPrevClosing;
+    const explicitOpeningStatus = normalizeOpeningStatus(row.openingStatus);
+    const prevOpeningStatus = normalizeOpeningStatus(prev?.openingStatus);
+    const derivedOpeningStatus = notApplicable
+      ? undefined
+      : explicitOpeningStatus ??
+        (hasOpening && previousClosingVal !== undefined
+          ? openingVal === previousClosingVal
+            ? 'confirmed_match'
+            : 'adjusted'
+          : hasOpening
+            ? prevOpeningStatus ?? 'manual'
+            : prevOpeningStatus);
+
+    const safeReporterName = clampString(reporterName, MAX_NAME_LENGTH) || 'Encargada';
 
     const updateFields: Record<string, unknown> = {
       opening: openingVal,
@@ -625,7 +644,7 @@ export function prepareStationReportEntries(params: {
       hasClosing,
       notApplicable,
       updatedByUid: userUid,
-      updatedByName: reporterName,
+      updatedByName: safeReporterName,
       updatedAt: timestampValue,
     };
     if (previousClosingVal !== undefined) {
@@ -642,8 +661,16 @@ export function prepareStationReportEntries(params: {
       updateFields.targetStock = clampNumber(row.targetStock);
     }
 
-    const effectiveMinStock = canManage ? clampNumber(row.minStock) : Number(row.minStock);
-    const effectiveTargetStock = canManage ? clampNumber(row.targetStock) : Number(row.targetStock);
+    const effectiveMinStock = canManage
+      ? clampNumber(row.minStock)
+      : Number.isFinite(Number(row.minStock))
+        ? Number(row.minStock)
+        : clampNumber(row.minStock);
+    const effectiveTargetStock = canManage
+      ? clampNumber(row.targetStock)
+      : Number.isFinite(Number(row.targetStock))
+        ? Number(row.targetStock)
+        : clampNumber(row.targetStock);
 
     const createFields: Record<string, unknown> = {
       workspaceId: workspace.id,
@@ -664,7 +691,7 @@ export function prepareStationReportEntries(params: {
       hasClosing,
       notApplicable,
       updatedByUid: userUid,
-      updatedByName: reporterName,
+      updatedByName: safeReporterName,
       createdAt: timestampValue,
       updatedAt: timestampValue,
     };
@@ -804,6 +831,7 @@ export interface SingleEntryDiagnosisInput {
 export interface WorkerSaveIO {
   syncClock: () => Promise<void>;
   getServerTimestampValue: () => unknown;
+  fetchServerWorkspace?: (workspaceId: string) => Promise<Workspace | null>;
   fetchServerItems: (
     workspaceId: string,
     stationId: StationId,
@@ -848,142 +876,430 @@ function extractRawErrorText(error: unknown): string {
   return String(error ?? '');
 }
 
-async function inspectSingleEntryMismatchFromServer(
-  input: SingleEntryDiagnosisInput,
-): Promise<DiagnosticSaveError> {
-  const { entryError, workspace, user, canManage, date, station, reportId, op } = input;
+export interface ServerDocProbe<T> {
+  exists: boolean;
+  data?: T;
+  errorCode?: string;
+  errorMessage?: string;
+}
+
+async function probeServerDoc<T>(
+  ref: ReturnType<typeof doc>,
+): Promise<ServerDocProbe<T>> {
+  try {
+    const snap = await getDocFromServer(ref);
+    if (!snap.exists()) {
+      return { exists: false };
+    }
+    return {
+      exists: true,
+      data: snap.data() as T,
+    };
+  } catch (err) {
+    return {
+      exists: false,
+      errorCode: extractFirebaseCode(err) ?? 'read-error',
+      errorMessage: extractRawErrorText(err),
+    };
+  }
+}
+
+export interface EntryRuleDiagnosisContext {
+  entryError: unknown;
+  workspace: Workspace;
+  user: User;
+  canManage: boolean;
+  date: string;
+  station: StationId;
+  reportId: string;
+  op: PreparedEntryOp;
+  now?: Date;
+  itemProbe: ServerDocProbe<Partial<InventoryItem>>;
+  reportProbe: ServerDocProbe<Partial<DailyReport>>;
+  workspaceProbe: ServerDocProbe<Partial<Workspace>>;
+  entryProbe: ServerDocProbe<Partial<DailyReportEntry>>;
+  memberProbe: ServerDocProbe<Partial<TeamMember>> | null;
+}
+
+export interface EntryRuleDiagnosisResult {
+  error: DiagnosticSaveError;
+  reasons: string[];
+  catalogMismatchDetected: boolean;
+  workspaceMismatchDetected: boolean;
+}
+
+function isValidEmailListForRules(emails: unknown): boolean {
+  if (!Array.isArray(emails) || emails.length < 1 || emails.length > 15) {
+    return false;
+  }
+  return emails.every(
+    (email) =>
+      typeof email === 'string' &&
+      email.length >= 3 &&
+      email.length <= MAX_EMAIL_LENGTH &&
+      EMAIL_REGEX.test(email),
+  );
+}
+
+function isFiniteStockBound(val: unknown): val is number {
+  return typeof val === 'number' && Number.isFinite(val) && val >= 0 && val <= MAX_STOCK_VALUE;
+}
+
+export function diagnoseEntryRuleViolations(
+  ctx: EntryRuleDiagnosisContext,
+): EntryRuleDiagnosisResult {
+  const {
+    entryError,
+    workspace,
+    user,
+    canManage,
+    date,
+    station,
+    reportId,
+    op,
+    now = getServerNow(),
+    itemProbe,
+    reportProbe,
+    workspaceProbe,
+    entryProbe,
+    memberProbe,
+  } = ctx;
+
   const entryPath = `dailyReports/${reportId}/entries/${op.itemId}`;
   const errCode = extractFirebaseCode(entryError);
   const rawEntryText = extractRawErrorText(entryError);
   const reasons: string[] = [];
   let catalogMismatchDetected = false;
+  let workspaceMismatchDetected = false;
 
+  // 1. Auth checks (isVerifiedUser)
   if (!user.emailVerified) {
     reasons.push('tu cuenta de Google no tiene email verificado');
   }
-
-  try {
-    let itemMissingOrDenied = false;
-    const itemPromise = getDocFromServer(doc(db, 'items', op.itemId)).catch((itemErr) => {
-      if (isFirebasePermissionDeniedError(itemErr)) {
-        itemMissingOrDenied = true;
-        return null;
-      }
-      return null;
-    });
-    const reportRef = doc(db, 'dailyReports', reportId);
-    const entryRef = doc(db, 'dailyReports', reportId, 'entries', op.itemId);
-    const memberPromise = !canManage
-      ? getDocFromServer(doc(db, 'teamMembers', user.uid)).catch(() => null)
-      : Promise.resolve(null);
-
-    const [itemSnap, repSnap, wsSnap, entrySnap, memSnap] = await Promise.all([
-      itemPromise,
-      getDocFromServer(reportRef).catch(() => null),
-      getDocFromServer(doc(db, 'workspaces', workspace.id)).catch(() => null),
-      getDocFromServer(entryRef).catch(() => null),
-      memberPromise,
-    ]);
-
-    if (op.kind === 'set' && entrySnap?.exists()) {
-      reasons.push('este insumo ya existía en el reporte del servidor');
-    } else if (op.kind === 'update' && entrySnap && !entrySnap.exists()) {
-      reasons.push('este insumo aún no existe como entrada en el reporte del servidor');
-    }
-
-    if (itemMissingOrDenied) {
-      catalogMismatchDetected = true;
-      reasons.push(`el insumo items/${op.itemId} ya no pertenece a este puesto o fue desasignado en el catálogo`);
-    } else if (itemSnap && !itemSnap.exists()) {
-      catalogMismatchDetected = true;
-      reasons.push(`el insumo items/${op.itemId} no existe en el servidor`);
-    } else if (itemSnap?.exists()) {
-      const it = itemSnap.data() as Partial<InventoryItem>;
-      if (it.workspaceId !== workspace.id) {
-        catalogMismatchDetected = true;
-        reasons.push(`workspaceId del catálogo (${it.workspaceId}) ≠ ${workspace.id}`);
-      }
-      if (it.station !== station && !(it.station === 'hamburguesas' && station === 'comida_rapida')) {
-        catalogMismatchDetected = true;
-        reasons.push(`puesto en catálogo (${it.station}) ≠ ${station}`);
-      }
-      if (it.name !== op.createFields.itemName) {
-        catalogMismatchDetected = true;
-        reasons.push(`nombre en catálogo ("${it.name}") ≠ "${String(op.createFields.itemName)}"`);
-      }
-      if (it.unit !== op.createFields.unit) {
-        catalogMismatchDetected = true;
-        reasons.push(`unidad en catálogo ("${it.unit}") ≠ "${String(op.createFields.unit)}"`);
-      }
-      if (it.minStock !== op.createFields.minStock) {
-        catalogMismatchDetected = true;
-        reasons.push(`minStock en catálogo (${it.minStock}) ≠ ${String(op.createFields.minStock)}`);
-      }
-      if (it.targetStock !== op.createFields.targetStock) {
-        catalogMismatchDetected = true;
-        reasons.push(`targetStock en catálogo (${it.targetStock}) ≠ ${String(op.createFields.targetStock)}`);
-      }
-    }
-
-    if (memSnap) {
-      if (!memSnap.exists()) {
-        reasons.push(`no existe teamMembers/${user.uid}`);
-      } else {
-        const m = memSnap.data() as Partial<TeamMember>;
-        if (!m.active) reasons.push('tu acceso en teamMembers está desactivado (active: false)');
-        if (m.workspaceId !== workspace.id) {
-          reasons.push(`teamMembers.workspaceId (${m.workspaceId}) ≠ ${workspace.id}`);
-        }
-        if (m.station !== station) {
-          reasons.push(`teamMembers.station (${m.station}) ≠ ${station}`);
-        }
-      }
-    }
-
-    if (repSnap?.exists()) {
-      const rep = repSnap.data() as Partial<DailyReport>;
-      if (rep.status === 'completed') {
-        reasons.push(`dailyReports/${reportId} está en estado completed`);
-      }
-      if (rep.ownerUid && rep.ownerUid !== workspace.ownerUid) {
-        reasons.push(`ownerUid del reporte (${rep.ownerUid}) ≠ ${workspace.ownerUid}`);
-      }
-    } else if (repSnap) {
-      reasons.push(`no existe dailyReports/${reportId}`);
-    }
-
-    if (wsSnap?.exists()) {
-      const ws = wsSnap.data() as Partial<Workspace>;
-      if (ws.ownerUid !== workspace.ownerUid) {
-        reasons.push(`ownerUid del restaurante (${ws.ownerUid}) ≠ ${workspace.ownerUid}`);
-      }
-      if (ws.shiftSchedule?.enabled) {
-        reasons.push(
-          `ventana horaria servidor (${ws.shiftSchedule.openingStart}–${ws.shiftSchedule.openingEnd} / ${ws.shiftSchedule.closingStart}–${ws.shiftSchedule.closingEnd}), fecha: ${date}`,
-        );
-      }
-    }
-  } catch {
-    // Ignore secondary read failures
+  if (!user.email || user.email.length > MAX_EMAIL_LENGTH) {
+    reasons.push('tu cuenta de Google no tiene un email válido');
   }
+
+  // 2. Entry schema & path consistency (isValidDailyReportEntry)
+  const expectedReportId = `${workspace.id}_${date}_${station}`;
+  if (reportId !== expectedReportId) {
+    reasons.push(`reportId ("${reportId}") ≠ esperado ("${expectedReportId}")`);
+  }
+  if (!ID_PATTERN.test(reportId)) {
+    reasons.push(`reportId ("${reportId}") contiene caracteres inválidos`);
+  }
+  if (!ID_PATTERN.test(op.itemId)) {
+    reasons.push(`itemId ("${op.itemId}") contiene caracteres inválidos`);
+  }
+  if (!DATE_PATTERN.test(date)) {
+    reasons.push(`fecha ("${date}") no tiene formato YYYY-MM-DD`);
+  }
+
+  const createFields = op.createFields;
+  if (
+    typeof createFields.itemName !== 'string' ||
+    createFields.itemName.length < 1 ||
+    createFields.itemName.length > MAX_NAME_LENGTH
+  ) {
+    reasons.push(`itemName inválido ("${String(createFields.itemName ?? '')}")`);
+  }
+  if (
+    typeof createFields.unit !== 'string' ||
+    createFields.unit.length < 1 ||
+    createFields.unit.length > MAX_UNIT_LENGTH
+  ) {
+    reasons.push(`unidad inválida ("${String(createFields.unit ?? '')}")`);
+  }
+  if (
+    typeof createFields.updatedByName !== 'string' ||
+    createFields.updatedByName.length < 1 ||
+    createFields.updatedByName.length > MAX_NAME_LENGTH
+  ) {
+    reasons.push('nombre de quien reporta vacío o demasiado largo');
+  }
+  if (op.kind === 'set' && !isValidEmailListForRules(createFields.authorizedEmails)) {
+    workspaceMismatchDetected = true;
+    reasons.push('lista authorizedEmails vacía o con correo inválido en el intento');
+  }
+  if (
+    'openingStatus' in createFields &&
+    createFields.openingStatus !== undefined &&
+    createFields.openingStatus !== 'confirmed_match' &&
+    createFields.openingStatus !== 'adjusted' &&
+    createFields.openingStatus !== 'manual'
+  ) {
+    reasons.push(`openingStatus inválido ("${String(createFields.openingStatus)}")`);
+  }
+  if (
+    !isFiniteStockBound(createFields.minStock) ||
+    !isFiniteStockBound(createFields.targetStock) ||
+    !isFiniteStockBound(createFields.opening) ||
+    !isFiniteStockBound(createFields.added) ||
+    !isFiniteStockBound(createFields.closing)
+  ) {
+    reasons.push('algún valor numérico (mínimo/ideal/apertura/surtido/cierre) está fuera de 0..100000');
+  }
+  if (
+    'previousClosing' in createFields &&
+    createFields.previousClosing !== undefined &&
+    !isFiniteStockBound(createFields.previousClosing)
+  ) {
+    reasons.push(`previousClosing fuera de rango (${String(createFields.previousClosing)})`);
+  }
+
+  // 3. Entry existence vs op.kind
+  if (entryProbe.errorCode) {
+    reasons.push(
+      `no se pudo verificar entrada en servidor (${entryProbe.errorCode}: ${entryProbe.errorMessage ?? ''})`,
+    );
+  } else if (op.kind === 'set' && entryProbe.exists) {
+    reasons.push('este insumo ya existía en el reporte del servidor');
+  } else if (op.kind === 'update' && !entryProbe.exists) {
+    reasons.push('este insumo aún no existe como entrada en el reporte del servidor');
+  } else if (op.kind === 'update' && !canManage && entryProbe.exists && entryProbe.data) {
+    const existingEntry = entryProbe.data;
+    if (existingEntry.itemName !== createFields.itemName) {
+      catalogMismatchDetected = true;
+      reasons.push(
+        `nombre en entrada previa ("${existingEntry.itemName}") ≠ "${String(createFields.itemName)}"`,
+      );
+    }
+    if (existingEntry.unit !== createFields.unit) {
+      catalogMismatchDetected = true;
+      reasons.push(
+        `unidad en entrada previa ("${existingEntry.unit}") ≠ "${String(createFields.unit)}"`,
+      );
+    }
+    if (existingEntry.minStock !== createFields.minStock) {
+      catalogMismatchDetected = true;
+      reasons.push(
+        `minStock en entrada previa (${existingEntry.minStock}) ≠ ${String(createFields.minStock)}`,
+      );
+    }
+    if (existingEntry.targetStock !== createFields.targetStock) {
+      catalogMismatchDetected = true;
+      reasons.push(
+        `targetStock en entrada previa (${existingEntry.targetStock}) ≠ ${String(createFields.targetStock)}`,
+      );
+    }
+  }
+
+  // 4. Item catalog check (entryMatchesItem)
+  if (itemProbe.errorCode) {
+    if (itemProbe.errorCode === 'permission-denied') {
+      catalogMismatchDetected = true;
+      reasons.push(
+        `el insumo items/${op.itemId} ya no pertenece a este puesto o fue desasignado en el catálogo`,
+      );
+    } else {
+      reasons.push(
+        `no se pudo leer items/${op.itemId} (${itemProbe.errorCode}: ${itemProbe.errorMessage ?? ''})`,
+      );
+    }
+  } else if (!itemProbe.exists) {
+    catalogMismatchDetected = true;
+    reasons.push(`el insumo items/${op.itemId} no existe en el servidor`);
+  } else if (itemProbe.data) {
+    const it = itemProbe.data;
+    if (it.workspaceId !== workspace.id) {
+      catalogMismatchDetected = true;
+      reasons.push(`workspaceId del catálogo (${it.workspaceId}) ≠ ${workspace.id}`);
+    }
+    if (
+      it.station !== station &&
+      !(it.station === 'hamburguesas' && station === 'comida_rapida')
+    ) {
+      catalogMismatchDetected = true;
+      reasons.push(`puesto en catálogo (${it.station}) ≠ ${station}`);
+    }
+    if (it.name !== createFields.itemName) {
+      catalogMismatchDetected = true;
+      reasons.push(`nombre en catálogo ("${it.name}") ≠ "${String(createFields.itemName)}"`);
+    }
+    if (it.unit !== createFields.unit) {
+      catalogMismatchDetected = true;
+      reasons.push(`unidad en catálogo ("${it.unit}") ≠ "${String(createFields.unit)}"`);
+    }
+    if (it.minStock !== createFields.minStock) {
+      catalogMismatchDetected = true;
+      reasons.push(`minStock en catálogo (${it.minStock}) ≠ ${String(createFields.minStock)}`);
+    }
+    if (it.targetStock !== createFields.targetStock) {
+      catalogMismatchDetected = true;
+      reasons.push(
+        `targetStock en catálogo (${it.targetStock}) ≠ ${String(createFields.targetStock)}`,
+      );
+    }
+  }
+
+  // 5. Team member check (isActiveStationWorker)
+  if (memberProbe) {
+    if (memberProbe.errorCode) {
+      reasons.push(
+        `no se pudo leer teamMembers/${user.uid} (${memberProbe.errorCode}: ${memberProbe.errorMessage ?? ''})`,
+      );
+    } else if (!memberProbe.exists) {
+      reasons.push(`no existe teamMembers/${user.uid}`);
+    } else if (memberProbe.data) {
+      const m = memberProbe.data;
+      if (!m.active) {
+        reasons.push('tu acceso en teamMembers está desactivado (active: false)');
+      }
+      if (m.workspaceId !== workspace.id) {
+        reasons.push(`teamMembers.workspaceId (${m.workspaceId}) ≠ ${workspace.id}`);
+      }
+      if (
+        m.station !== station &&
+        !(m.station === 'hamburguesas' && station === 'comida_rapida')
+      ) {
+        reasons.push(`teamMembers.station (${m.station}) ≠ ${station}`);
+      }
+    }
+  }
+
+  // 6. Parent report check (reportAfterMatchesEntry & status != completed)
+  if (reportProbe.errorCode) {
+    reasons.push(
+      `no se pudo leer dailyReports/${reportId} (${reportProbe.errorCode}: ${reportProbe.errorMessage ?? ''})`,
+    );
+  } else if (!reportProbe.exists) {
+    reasons.push(`no existe dailyReports/${reportId} en el servidor`);
+  } else if (reportProbe.data) {
+    const rep = reportProbe.data;
+    if (rep.status === 'completed') {
+      reasons.push(`dailyReports/${reportId} está en estado completed`);
+    }
+    if (!rep.ownerUid) {
+      reasons.push(`dailyReports/${reportId} no tiene ownerUid`);
+    } else if (rep.ownerUid !== createFields.ownerUid) {
+      workspaceMismatchDetected = true;
+      reasons.push(
+        `ownerUid del reporte (${rep.ownerUid}) ≠ "${String(createFields.ownerUid)}"`,
+      );
+    }
+    if (rep.workspaceId !== workspace.id) {
+      reasons.push(`workspaceId del reporte (${rep.workspaceId}) ≠ ${workspace.id}`);
+    }
+    if (rep.date !== date) {
+      reasons.push(`fecha del reporte (${rep.date}) ≠ ${date}`);
+    }
+    if (rep.station !== station) {
+      reasons.push(`puesto del reporte (${rep.station}) ≠ ${station}`);
+    }
+  }
+
+  // 7. Operational date check for workers (isValidWorkerOperationalDate)
+  if (!canManage) {
+    const serverTodayOp = getOperationalDateStr(now);
+    const serverPrevOp = getPreviousDateStr(serverTodayOp);
+    if (date !== serverTodayOp && date !== serverPrevOp) {
+      reasons.push(
+        `fecha "${date}" fuera de ventana operativa del servidor (permitido: ${serverTodayOp} o ${serverPrevOp})`,
+      );
+    }
+  }
+
+  // 8. Workspace & exact schedule evaluation (isWorkerWithinSchedule)
+  if (workspaceProbe.errorCode) {
+    reasons.push(
+      `no se pudo leer workspaces/${workspace.id} (${workspaceProbe.errorCode}: ${workspaceProbe.errorMessage ?? ''})`,
+    );
+  } else if (!workspaceProbe.exists) {
+    reasons.push(`no existe workspaces/${workspace.id} en el servidor`);
+  } else if (workspaceProbe.data) {
+    const ws = workspaceProbe.data;
+    if (ws.ownerUid !== createFields.ownerUid) {
+      workspaceMismatchDetected = true;
+      reasons.push(
+        `ownerUid del restaurante en servidor (${ws.ownerUid}) ≠ "${String(createFields.ownerUid)}"`,
+      );
+    }
+    if (!canManage) {
+      const effectiveSchedule = ws.shiftSchedule ?? DEFAULT_SHIFT_SCHEDULE;
+      const bogotaTime = getBogotaNowParts(now).hhmm;
+      if (!ws.shiftSchedule) {
+        const evalRes = resolveWorkerScheduleStatus(now, DEFAULT_SHIFT_SCHEDULE);
+        if (evalRes.phase === 'outside') {
+          reasons.push(
+            `workspaces/${workspace.id} no tiene shiftSchedule guardado y la hora servidor (${bogotaTime} Bogotá) está fuera del horario por defecto (${DEFAULT_SHIFT_SCHEDULE.openingStart}–${DEFAULT_SHIFT_SCHEDULE.openingEnd} / ${DEFAULT_SHIFT_SCHEDULE.closingStart}–${DEFAULT_SHIFT_SCHEDULE.closingEnd})`,
+          );
+        }
+      } else if (effectiveSchedule.enabled) {
+        const evalRes = resolveWorkerScheduleStatus(now, effectiveSchedule);
+        if (evalRes.phase === 'outside') {
+          reasons.push(
+            `hora servidor (${bogotaTime} Bogotá) fuera de horario (${effectiveSchedule.openingStart}–${effectiveSchedule.openingEnd} / ${effectiveSchedule.closingStart}–${effectiveSchedule.closingEnd}), fecha: ${date}`,
+          );
+        }
+      }
+    }
+  }
+
+  const probeStatusSummary = [
+    `item=${itemProbe.errorCode ?? (itemProbe.exists ? 'ok' : 'missing')}`,
+    `report=${reportProbe.errorCode ?? (reportProbe.exists ? `ok(${reportProbe.data?.status ?? '?'})` : 'missing')}`,
+    `workspace=${workspaceProbe.errorCode ?? (workspaceProbe.exists ? `ok(sched=${workspaceProbe.data?.shiftSchedule?.enabled ? 'on' : 'off'})` : 'missing')}`,
+    `entry=${entryProbe.errorCode ?? (entryProbe.exists ? 'exists' : 'absent')}`,
+    memberProbe
+      ? `member=${memberProbe.errorCode ?? (memberProbe.exists ? `ok(active=${String(memberProbe.data?.active)},station=${String(memberProbe.data?.station)})` : 'missing')}`
+      : 'member=manager',
+  ].join(', ');
 
   const valuesSummary = formatAttemptedValuesSummary(op.attemptedValues);
   const opLabel = op.kind === 'update' ? 'actualización' : 'creación';
   const detail =
     reasons.length > 0
       ? `"${op.itemName}" (${opLabel}): ${reasons.join('; ')}. Valores intentados: ${valuesSummary}.`
-      : `"${op.itemName}" (${opLabel}) fue rechazado por Firebase (${errCode ?? 'permission-denied'}). Valores intentados: ${valuesSummary}.`;
-  const rawDetail = `${detail}\nDocumento: ${entryPath}\nFirebase (${errCode ?? 'sin código'}): ${rawEntryText}`;
+      : `"${op.itemName}" (${opLabel}) fue rechazado por Firebase (${errCode ?? 'permission-denied'}). Estado servidor: [${probeStatusSummary}]. Valores intentados: ${valuesSummary}.`;
+  const rawDetail = `${detail}\nDocumento: ${entryPath}\nEstado servidor: [${probeStatusSummary}]\nFirebase (${errCode ?? 'sin código'}): ${rawEntryText}`;
 
-  return new DiagnosticSaveError({
-    title: catalogMismatchDetected
-      ? `El catálogo de "${op.itemName}" cambió en el servidor`
-      : `Error al guardar insumo "${op.itemName}"`,
-    detail,
-    rawDetail,
-    failedDocumentPath: entryPath,
-    code: catalogMismatchDetected ? 'catalog-mismatch' : errCode,
+  const errorCode = catalogMismatchDetected
+    ? 'catalog-mismatch'
+    : workspaceMismatchDetected
+      ? 'workspace-mismatch'
+      : errCode;
+
+  return {
+    error: new DiagnosticSaveError({
+      title: catalogMismatchDetected
+        ? `El catálogo de "${op.itemName}" cambió en el servidor`
+        : `Error al guardar insumo "${op.itemName}"`,
+      detail,
+      rawDetail,
+      failedDocumentPath: entryPath,
+      code: errorCode,
+    }),
+    reasons,
+    catalogMismatchDetected,
+    workspaceMismatchDetected,
+  };
+}
+
+async function inspectSingleEntryMismatchFromServer(
+  input: SingleEntryDiagnosisInput,
+): Promise<DiagnosticSaveError> {
+  const { workspace, user, canManage, reportId, op } = input;
+  const [itemProbe, reportProbe, workspaceProbe, entryProbe, memberProbe] = await Promise.all([
+    probeServerDoc<Partial<InventoryItem>>(doc(db, 'items', op.itemId)),
+    probeServerDoc<Partial<DailyReport>>(doc(db, 'dailyReports', reportId)),
+    probeServerDoc<Partial<Workspace>>(doc(db, 'workspaces', workspace.id)),
+    probeServerDoc<Partial<DailyReportEntry>>(
+      doc(db, 'dailyReports', reportId, 'entries', op.itemId),
+    ),
+    !canManage
+      ? probeServerDoc<Partial<TeamMember>>(doc(db, 'teamMembers', user.uid))
+      : Promise.resolve(null),
+  ]);
+
+  const result = diagnoseEntryRuleViolations({
+    ...input,
+    itemProbe,
+    reportProbe,
+    workspaceProbe,
+    entryProbe,
+    memberProbe,
   });
+  return result.error;
 }
 
 function createDefaultWorkerSaveIO(): WorkerSaveIO {
@@ -992,6 +1308,19 @@ function createDefaultWorkerSaveIO(): WorkerSaveIO {
       await syncServerClockOffset();
     },
     getServerTimestampValue: () => serverTimestamp(),
+    fetchServerWorkspace: async (workspaceId) => {
+      const wsRef = doc(db, 'workspaces', workspaceId);
+      try {
+        const snap = await getDocFromServer(wsRef);
+        return snap.exists() ? ({ id: snap.id, ...snap.data() } as Workspace) : null;
+      } catch (err) {
+        if (isFirebaseOfflineError(err)) {
+          const cached = await getDoc(wsRef).catch(() => null);
+          return cached?.exists() ? ({ id: cached.id, ...cached.data() } as Workspace) : null;
+        }
+        return null;
+      }
+    },
     fetchServerItems: (workspaceId, stationId, itemIds) =>
       fetchStationItemsFromServerMap(workspaceId, stationId, itemIds),
     fetchServerReport: async (reportId) => {
@@ -1145,53 +1474,100 @@ function createDefaultWorkerSaveIO(): WorkerSaveIO {
           if (!user.emailVerified) {
             reasons.push('tu cuenta de Google no tiene email verificado');
           }
-          if (!canManage) {
-            try {
-              const [memSnap, wsSnap, repSnap] = await Promise.all([
-                getDocFromServer(doc(db, 'teamMembers', user.uid)),
-                getDocFromServer(doc(db, 'workspaces', workspace.id)),
-                getDocFromServer(reportRef),
-              ]);
-              if (!memSnap.exists()) {
-                reasons.push(`no existe teamMembers/${user.uid}`);
-              } else {
-                const m = memSnap.data() as Partial<TeamMember>;
-                if (!m.active) reasons.push('tu acceso en teamMembers está desactivado (active: false)');
-                if (m.workspaceId !== workspace.id) {
-                  reasons.push(`teamMembers.workspaceId (${m.workspaceId}) no coincide con ${workspace.id}`);
-                }
-                if (m.station !== station) {
-                  reasons.push(`teamMembers.station (${m.station}) no coincide con ${station}`);
-                }
+          if (!liveReportExists && !isValidEmailListForRules(authorizedEmails)) {
+            reasons.push('lista authorizedEmails vacía o con correo inválido en el encabezado');
+          }
+
+          const now = getServerNow();
+          const [memProbe, wsProbe, repProbe] = await Promise.all([
+            !canManage
+              ? probeServerDoc<Partial<TeamMember>>(doc(db, 'teamMembers', user.uid))
+              : Promise.resolve(null),
+            probeServerDoc<Partial<Workspace>>(doc(db, 'workspaces', workspace.id)),
+            probeServerDoc<Partial<DailyReport>>(reportRef),
+          ]);
+
+          if (memProbe) {
+            if (memProbe.errorCode) {
+              reasons.push(
+                `no se pudo leer teamMembers/${user.uid} (${memProbe.errorCode}: ${memProbe.errorMessage ?? ''})`,
+              );
+            } else if (!memProbe.exists) {
+              reasons.push(`no existe teamMembers/${user.uid}`);
+            } else if (memProbe.data) {
+              const m = memProbe.data;
+              if (!m.active) reasons.push('tu acceso en teamMembers está desactivado (active: false)');
+              if (m.workspaceId !== workspace.id) {
+                reasons.push(`teamMembers.workspaceId (${m.workspaceId}) no coincide con ${workspace.id}`);
               }
-              if (wsSnap.exists()) {
-                const ws = wsSnap.data() as Partial<Workspace>;
-                if (ws.ownerUid !== workspace.ownerUid) {
-                  reasons.push('el ownerUid del restaurante cambió en el servidor');
-                }
-                if (ws.shiftSchedule?.enabled) {
+              if (
+                m.station !== station &&
+                !(m.station === 'hamburguesas' && station === 'comida_rapida')
+              ) {
+                reasons.push(`teamMembers.station (${m.station}) no coincide con ${station}`);
+              }
+            }
+          }
+
+          if (!canManage) {
+            const serverTodayOp = getOperationalDateStr(now);
+            const serverPrevOp = getPreviousDateStr(serverTodayOp);
+            if (date !== serverTodayOp && date !== serverPrevOp) {
+              reasons.push(
+                `fecha "${date}" fuera de ventana operativa del servidor (permitido: ${serverTodayOp} o ${serverPrevOp})`,
+              );
+            }
+          }
+
+          if (wsProbe.errorCode) {
+            reasons.push(
+              `no se pudo leer workspaces/${workspace.id} (${wsProbe.errorCode}: ${wsProbe.errorMessage ?? ''})`,
+            );
+          } else if (!wsProbe.exists) {
+            reasons.push(`no existe workspaces/${workspace.id} en el servidor`);
+          } else if (wsProbe.data) {
+            const ws = wsProbe.data;
+            if (ws.ownerUid !== workspace.ownerUid) {
+              reasons.push(
+                `ownerUid del restaurante en servidor (${ws.ownerUid}) ≠ ${workspace.ownerUid}`,
+              );
+            }
+            if (!canManage) {
+              const effSchedule = ws.shiftSchedule ?? DEFAULT_SHIFT_SCHEDULE;
+              const bogotaTime = getBogotaNowParts(now).hhmm;
+              if (!ws.shiftSchedule || effSchedule.enabled) {
+                const evalRes = resolveWorkerScheduleStatus(now, effSchedule);
+                if (evalRes.phase === 'outside') {
                   reasons.push(
-                    `horario servidor habilitado (${ws.shiftSchedule.openingStart}–${ws.shiftSchedule.openingEnd} / ${ws.shiftSchedule.closingStart}–${ws.shiftSchedule.closingEnd}), fecha reporte: ${date}`,
+                    `hora servidor (${bogotaTime} Bogotá) fuera de horario (${effSchedule.openingStart}–${effSchedule.openingEnd} / ${effSchedule.closingStart}–${effSchedule.closingEnd}), fecha reporte: ${date}`,
                   );
                 }
               }
-              if (repSnap.exists()) {
-                const r = repSnap.data() as Partial<DailyReport>;
-                if (r.status === 'completed') {
-                  reasons.push('el reporte ya está marcado como completed');
-                }
-              }
-            } catch {
-              // Ignore secondary diagnostic read errors
             }
           }
+
+          if (repProbe.errorCode) {
+            reasons.push(
+              `no se pudo leer dailyReports/${reportId} (${repProbe.errorCode}: ${repProbe.errorMessage ?? ''})`,
+            );
+          } else if (repProbe.exists && repProbe.data?.status === 'completed') {
+            reasons.push('el reporte ya está marcado como completed');
+          }
+
+          const probeSummary = [
+            `report=${repProbe.errorCode ?? (repProbe.exists ? `ok(${repProbe.data?.status ?? '?'})` : 'absent')}`,
+            `workspace=${wsProbe.errorCode ?? (wsProbe.exists ? `ok(sched=${wsProbe.data?.shiftSchedule?.enabled ? 'on' : 'off'})` : 'missing')}`,
+            memProbe
+              ? `member=${memProbe.errorCode ?? (memProbe.exists ? `ok(active=${String(memProbe.data?.active)},station=${String(memProbe.data?.station)})` : 'missing')}`
+              : 'member=manager',
+          ].join(', ');
 
           const opLabel = liveReportExists ? 'actualización' : 'creación';
           const detail =
             reasons.length > 0
               ? `Documento rechazado: dailyReports/${reportId} (${opLabel}). Motivo: ${reasons.join('; ')}.`
-              : `Documento rechazado: dailyReports/${reportId} (${opLabel}). Verifica el horario permitido, la fecha operativa (${date}) o que el reporte no esté bloqueado.`;
-          const rawDetail = `${detail}\nFirebase (${errCode ?? 'sin código'}): ${extractRawErrorText(reportWriteError) || batchRawText}`;
+              : `Documento rechazado: dailyReports/${reportId} (${opLabel}). Estado servidor: [${probeSummary}].`;
+          const rawDetail = `${detail}\nEstado servidor: [${probeSummary}]\nFirebase (${errCode ?? 'sin código'}): ${extractRawErrorText(reportWriteError) || batchRawText}`;
 
           throw new DiagnosticSaveError({
             title: 'Firebase rechazó el encabezado del reporte',
@@ -1310,6 +1686,7 @@ export async function saveStationReportBatch(params: {
   const io: WorkerSaveIO = {
     syncClock: customIO?.syncClock ?? defaultIO.syncClock,
     getServerTimestampValue: customIO?.getServerTimestampValue ?? defaultIO.getServerTimestampValue,
+    fetchServerWorkspace: customIO?.fetchServerWorkspace ?? (customIO ? undefined : defaultIO.fetchServerWorkspace),
     fetchServerItems: customIO?.fetchServerItems ?? defaultIO.fetchServerItems,
     fetchServerReport: customIO?.fetchServerReport ?? defaultIO.fetchServerReport,
     fetchServerEntries: customIO?.fetchServerEntries ?? defaultIO.fetchServerEntries,
@@ -1318,23 +1695,38 @@ export async function saveStationReportBatch(params: {
     diagnoseChunkFailure: customIO?.diagnoseChunkFailure ?? defaultIO.diagnoseChunkFailure,
   };
 
-  const reportId = `${workspace.id}_${date}_${station}`;
-  const reporterName = clampString(
-    user.displayName || user.email?.split('@')[0] || 'Encargada',
-    MAX_NAME_LENGTH,
-  );
+  let effectiveWorkspace = workspace;
+  const reportId = `${effectiveWorkspace.id}_${date}_${station}`;
+  const reporterName =
+    clampString(
+      (user.displayName ?? '').trim() ||
+        (user.email?.split('@')[0] ?? '').trim() ||
+        'Encargada',
+      MAX_NAME_LENGTH,
+    ) || 'Encargada';
   const cleanNotes = clampString(notes, MAX_NOTES_LENGTH);
-  const authorizedEmails = buildNormalizedAuthorizedEmails(workspace);
+  let authorizedEmails = buildNormalizedAuthorizedEmails(effectiveWorkspace);
 
   let detectedOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
   if (!detectedOffline && !providedNow) {
     await io.syncClock();
   }
+  if (
+    !detectedOffline &&
+    io.fetchServerWorkspace &&
+    (authorizedEmails.length === 0 || !effectiveWorkspace.ownerUid)
+  ) {
+    const serverWs = await io.fetchServerWorkspace(effectiveWorkspace.id);
+    if (serverWs) {
+      effectiveWorkspace = serverWs;
+      authorizedEmails = buildNormalizedAuthorizedEmails(effectiveWorkspace);
+    }
+  }
   const effectiveNow = providedNow ?? getServerNow();
   validateWorkerSubmitPhase({
     canManage,
     mode,
-    schedule: workspace.shiftSchedule,
+    schedule: effectiveWorkspace.shiftSchedule,
     now: effectiveNow,
     reportPath: `dailyReports/${reportId}`,
   });
@@ -1346,7 +1738,7 @@ export async function saveStationReportBatch(params: {
   // Step 1: Read station items directly from the server (never from cache)
   if (!detectedOffline && activeRows.length > 0) {
     const serverCatalog = await io.fetchServerItems(
-      workspace.id,
+      effectiveWorkspace.id,
       station,
       activeRows.map((r) => r.itemId),
     );
@@ -1386,6 +1778,17 @@ export async function saveStationReportBatch(params: {
         serverUpdatedAtMs = serverRep.updatedAtMs;
         serverUpdatedByName = serverRep.data.reportedByName;
         serverReportedByUid = serverRep.data.reportedByUid;
+        if (
+          io.fetchServerWorkspace &&
+          serverRep.data.ownerUid &&
+          serverRep.data.ownerUid !== effectiveWorkspace.ownerUid
+        ) {
+          const serverWs = await io.fetchServerWorkspace(effectiveWorkspace.id);
+          if (serverWs) {
+            effectiveWorkspace = serverWs;
+            authorizedEmails = buildNormalizedAuthorizedEmails(effectiveWorkspace);
+          }
+        }
       } else {
         serverStatus = undefined;
         serverUpdatedAtMs = null;
@@ -1436,7 +1839,7 @@ export async function saveStationReportBatch(params: {
     Object.values(mergedExistingEntries).some((e) => e.hasOpening || e.notApplicable);
 
   const preparedOps = prepareStationReportEntries({
-    workspace,
+    workspace: effectiveWorkspace,
     userUid: user.uid,
     reporterName,
     canManage,
@@ -1473,8 +1876,8 @@ export async function saveStationReportBatch(params: {
           : {
               kind: 'set',
               payload: {
-                workspaceId: workspace.id,
-                ownerUid: workspace.ownerUid,
+                workspaceId: effectiveWorkspace.id,
+                ownerUid: effectiveWorkspace.ownerUid,
                 authorizedEmails,
                 date,
                 station,
@@ -1498,8 +1901,8 @@ export async function saveStationReportBatch(params: {
               ? {
                   kind: 'set',
                   payload: {
-                    workspaceId: workspace.id,
-                    ownerUid: workspace.ownerUid,
+                    workspaceId: effectiveWorkspace.id,
+                    ownerUid: effectiveWorkspace.ownerUid,
                     authorizedEmails,
                     date,
                     station,
@@ -1553,8 +1956,8 @@ export async function saveStationReportBatch(params: {
   onProgress?.({ savedCount, totalCount, phase: 'preparing' });
 
   const buildReportSetPayload = (statusValue: ReportStatus): Record<string, unknown> => ({
-    workspaceId: workspace.id,
-    ownerUid: workspace.ownerUid,
+    workspaceId: effectiveWorkspace.id,
+    ownerUid: effectiveWorkspace.ownerUid,
     authorizedEmails,
     date,
     station,
@@ -1590,7 +1993,7 @@ export async function saveStationReportBatch(params: {
     } catch (reportErr) {
       await io.diagnoseChunkFailure({
         batchError: reportErr,
-        workspace,
+        workspace: effectiveWorkspace,
         user,
         canManage,
         date,
@@ -1621,7 +2024,7 @@ export async function saveStationReportBatch(params: {
     } catch (headerErr) {
       await io.diagnoseChunkFailure({
         batchError: headerErr,
-        workspace,
+        workspace: effectiveWorkspace,
         user,
         canManage,
         date,
@@ -1647,7 +2050,7 @@ export async function saveStationReportBatch(params: {
   ): Promise<DiagnosticSaveError> => {
     const input: SingleEntryDiagnosisInput = {
       entryError,
-      workspace,
+      workspace: effectiveWorkspace,
       user,
       canManage,
       date,
@@ -1662,7 +2065,7 @@ export async function saveStationReportBatch(params: {
       try {
         await customIO.diagnoseChunkFailure({
           batchError: entryError,
-          workspace,
+          workspace: effectiveWorkspace,
           user,
           canManage,
           date,
@@ -1695,7 +2098,7 @@ export async function saveStationReportBatch(params: {
   const refreshSingleOpFromServer = async (
     op: PreparedEntryOp,
   ): Promise<{ refreshedOp: PreparedEntryOp | null; omitted: boolean }> => {
-    const singleCatalog = await io.fetchServerItems(workspace.id, station, [op.itemId]);
+    const singleCatalog = await io.fetchServerItems(effectiveWorkspace.id, station, [op.itemId]);
     if (singleCatalog.offlineFallback) {
       return { refreshedOp: null, omitted: false };
     }
@@ -1716,7 +2119,7 @@ export async function saveStationReportBatch(params: {
       onCatalogSynced?.(reconciled.serverItems);
     }
     const rebuiltOps = prepareStationReportEntries({
-      workspace,
+      workspace: effectiveWorkspace,
       userUid: user.uid,
       reporterName,
       canManage,
@@ -1746,10 +2149,24 @@ export async function saveStationReportBatch(params: {
     let diag = await diagnoseSingleOp(op, err);
     let workingOp = op;
 
-    // Single automatic catalog-mismatch retry for this isolated item
-    if (!canManage && diag.code === 'catalog-mismatch') {
+    // Single automatic retry for catalog mismatch OR stale client workspace cache
+    if (
+      !canManage &&
+      (diag.code === 'catalog-mismatch' || diag.code === 'workspace-mismatch')
+    ) {
+      if (diag.code === 'workspace-mismatch' && io.fetchServerWorkspace) {
+        const freshWs = await io.fetchServerWorkspace(effectiveWorkspace.id);
+        if (freshWs) {
+          effectiveWorkspace = freshWs;
+          authorizedEmails = buildNormalizedAuthorizedEmails(freshWs);
+        }
+      }
       catalogUpdatedDuringSave = true;
-      onStatusMessage?.('El jefe actualizó los insumos, actualizando…');
+      onStatusMessage?.(
+        diag.code === 'workspace-mismatch'
+          ? 'Actualizando configuración del restaurante…'
+          : 'El jefe actualizó los insumos, actualizando…',
+      );
       const refreshRes = await refreshSingleOpFromServer(op);
       if (refreshRes.omitted) {
         return;
