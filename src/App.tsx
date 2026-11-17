@@ -19,6 +19,7 @@ import {
 import { AuthScreen } from './components/AuthScreen';
 import { BrandLogo } from './components/BrandLogo';
 import { LazyViewBoundary, lazyWithRetry } from './components/LazyViewBoundary';
+import { StationShiftView } from './components/StationShiftView';
 import { StationShiftSkeleton } from './components/shift/StationShiftSkeleton';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { useShiftClock } from './hooks/useShiftClock';
@@ -27,19 +28,7 @@ import { useWorkspaceSession } from './hooks/useWorkspaceSession';
 import type { DailyReport, DailyReportEntry, StationId } from './types';
 import { hasCachedWorkerHint } from './utils/workerCache';
 
-const loadStationShiftView = () =>
-  import('./components/StationShiftView').then((m) => ({ default: m.StationShiftView }));
-
-// Preload worker view chunk immediately if opening via QR link or returning worker cache
-if (typeof window !== 'undefined') {
-  const sp = new URLSearchParams(window.location.search);
-  if (sp.get('codigo') || sp.get('puesto') || hasCachedWorkerHint()) {
-    void loadStationShiftView();
-  }
-}
-
-// Lazy-load role-specific views so worker QR sessions skip boss dashboards, QR generators & modals
-const StationShiftView = lazyWithRetry(loadStationShiftView);
+// Lazy-load manager-only views so worker QR sessions skip boss dashboards, QR generators & modals
 const BossDashboard = lazyWithRetry(() =>
   import('./components/BossDashboard').then((m) => ({ default: m.BossDashboard })),
 );
@@ -115,13 +104,6 @@ export default function App() {
       (workspace && !canManage) ||
       (!authReady && hasCachedWorkerHint()),
   );
-
-  // Preload StationShiftView as soon as a worker role is confirmed
-  useEffect(() => {
-    if (workspace && !canManage && role !== 'jefe') {
-      void loadStationShiftView();
-    }
-  }, [workspace, canManage, role]);
 
   const {
     now: serverClockNow,

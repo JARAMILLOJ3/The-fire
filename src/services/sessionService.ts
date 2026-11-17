@@ -17,7 +17,7 @@ import {
   MAX_EMAIL_LENGTH,
   MAX_NAME_LENGTH,
 } from '../constants';
-import { db, handleFirestoreError, OperationType } from '../firebase';
+import { auth, db, handleFirestoreError, OperationType } from '../firebase';
 import type {
   Invite,
   StationId,
@@ -55,6 +55,26 @@ interface LiveLinkFetchResult {
 }
 
 const inFlightLinkFetches = new Map<string, Promise<LiveLinkFetchResult>>();
+const inFlightWorkspaceFetches = new Map<string, Promise<DocumentSnapshot | null>>();
+
+function safeSpeculativeWorkspaceGet(workspaceId: string): Promise<DocumentSnapshot | null> {
+  if (!workspaceId) return Promise.resolve(null);
+  const existing = inFlightWorkspaceFetches.get(workspaceId);
+  if (existing) return existing;
+
+  const promise = (async (): Promise<DocumentSnapshot | null> => {
+    try {
+      perfMetrics.recordRead('workspaces');
+      return await getDoc(doc(db, 'workspaces', workspaceId));
+    } catch {
+      inFlightWorkspaceFetches.delete(workspaceId);
+      return null;
+    }
+  })();
+
+  inFlightWorkspaceFetches.set(workspaceId, promise);
+  return promise;
+}
 
 function fetchLiveStationLink(accessCode: string): Promise<LiveLinkFetchResult> {
   if (!accessCode || accessCode.length < 6) {
@@ -73,6 +93,9 @@ function fetchLiveStationLink(accessCode: string): Promise<LiveLinkFetchResult> 
     const data = { id: snap.id, ...snap.data() } as StationLink;
     if (data.active) {
       writeCachedStationLinkPreview(data);
+      if (auth.currentUser && data.workspaceId) {
+        void safeSpeculativeWorkspaceGet(data.workspaceId);
+      }
     }
     return { exists: true, link: data };
   })().catch((err) => {
@@ -111,15 +134,6 @@ async function checkIsAdminUser(uid: string): Promise<boolean> {
   }
 }
 
-async function safeSpeculativeWorkspaceGet(workspaceId: string): Promise<DocumentSnapshot | null> {
-  try {
-    perfMetrics.recordRead('workspaces');
-    return await getDoc(doc(db, 'workspaces', workspaceId));
-  } catch {
-    return null;
-  }
-}
-
 export async function resolveUserWorkspace(
   user: User,
   linkParams?: { stationId?: string | null; accessCode?: string | null },
@@ -144,23 +158,22 @@ export async function resolveUserWorkspace(
   const memberRef = doc(db, 'teamMembers', user.uid);
 
   // 0. If user arrived via a QR / Share Link (?puesto=...&codigo=...):
-  // Parallelize link lookup (often already prefetched), teamMember lookup, admin check & speculative workspace read.
+  // Parallelize link lookup (often already prefetched), teamMember lookup & speculative workspace read.
   if (rawAccessCode.length >= 6) {
     let linkResult: LiveLinkFetchResult;
     let existingMemberSnap: DocumentSnapshot;
-    let isAdmin: boolean;
     let speculativeWsSnap: DocumentSnapshot | null;
+    const adminPromise = checkIsAdminUser(user.uid);
 
     try {
       perfMetrics.recordRead('teamMembers');
-      [linkResult, existingMemberSnap, isAdmin, speculativeWsSnap] = await Promise.all([
+      [linkResult, existingMemberSnap, speculativeWsSnap] = await Promise.all([
         fetchLiveStationLink(rawAccessCode).catch((error) => {
           handleFirestoreError(error, OperationType.GET, `stationLinks/${rawAccessCode}`);
         }),
         getDoc(memberRef).catch((error) => {
           handleFirestoreError(error, OperationType.GET, `teamMembers/${user.uid}`);
         }),
-        checkIsAdminUser(user.uid),
         speculativeWsId
           ? safeSpeculativeWorkspaceGet(speculativeWsId)
           : Promise.resolve(null),
@@ -190,6 +203,14 @@ export async function resolveUserWorkspace(
       ) {
         return { id: speculativeWsSnap.id, ...speculativeWsSnap.data() } as Workspace;
       }
+      const inFlightWs = inFlightWorkspaceFetches.get(link.workspaceId);
+      if (inFlightWs) {
+        const snap = await inFlightWs;
+        if (snap && snap.exists() && snap.id === link.workspaceId) {
+          return { id: snap.id, ...snap.data() } as Workspace;
+        }
+        inFlightWorkspaceFetches.delete(link.workspaceId);
+      }
       try {
         perfMetrics.recordRead('workspaces');
         const wsSnap = await getDoc(doc(db, 'workspaces', link.workspaceId));
@@ -199,6 +220,19 @@ export async function resolveUserWorkspace(
       }
     };
 
+    const existingMemberData = existingMemberSnap.exists()
+      ? ({ id: existingMemberSnap.id, ...existingMemberSnap.data() } as TeamMember)
+      : null;
+    const isKnownActiveStationWorker = Boolean(
+      existingMemberData &&
+        existingMemberData.workspaceId === link.workspaceId &&
+        existingMemberData.active &&
+        existingMemberData.station === link.stationId &&
+        existingMemberData.station !== 'jefe' &&
+        link.ownerUid !== user.uid,
+    );
+
+    const isAdmin = isKnownActiveStationWorker ? false : await adminPromise;
     const isBoss = link.ownerUid === user.uid || isAdmin;
     if (isBoss) {
       const workspace = await getTargetWorkspace();

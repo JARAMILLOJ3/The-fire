@@ -321,18 +321,22 @@ export async function fetchStationItemsOnce(
   itemIds: string[],
   options?: { fromServer?: boolean },
 ): Promise<InventoryItem[]> {
-  if (itemIds.length === 0) return [];
+  const uniqueIds = Array.from(new Set(itemIds.filter(Boolean)));
+  if (uniqueIds.length === 0) return [];
   if (options?.fromServer) {
-    const { itemsById } = await fetchStationItemsFromServerMap(workspaceId, stationId, itemIds);
+    const { itemsById } = await fetchStationItemsFromServerMap(workspaceId, stationId, uniqueIds);
     const list = Object.values(itemsById);
     list.sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name));
     return list;
   }
 
-  perfMetrics.recordRead('items', itemIds.length);
+  perfMetrics.recordRead('items', uniqueIds.length);
   const snaps = await Promise.all(
-    itemIds.map((itemId) =>
+    uniqueIds.map((itemId) =>
       getDoc(doc(db, 'items', itemId)).catch((err) => {
+        if (isFirebasePermissionDeniedError(err) || isFirebaseOfflineError(err)) {
+          return null;
+        }
         handleFirestoreError(err, OperationType.GET, `items/${itemId}`);
       }),
     ),
@@ -340,10 +344,10 @@ export async function fetchStationItemsOnce(
 
   const list: InventoryItem[] = [];
   snaps.forEach((snap) => {
-    if (!snap.exists()) return;
+    if (!snap || !snap.exists()) return;
     const raw = snap.data() as Omit<InventoryItem, 'id'>;
     const normalizedStation = raw.station === 'hamburguesas' ? 'comida_rapida' : raw.station;
-    if (raw.workspaceId === workspaceId && normalizedStation === stationId) {
+    if (raw.workspaceId === workspaceId && normalizedStation === stationId && raw.active) {
       list.push({
         ...raw,
         id: snap.id,
@@ -359,11 +363,15 @@ export async function fetchReportEntriesOnce(
   reportId: string,
   itemIds: string[],
 ): Promise<Record<string, DailyReportEntry>> {
-  if (!reportId || itemIds.length === 0) return {};
-  perfMetrics.recordRead('todayEntries', itemIds.length);
+  const uniqueIds = Array.from(new Set(itemIds.filter(Boolean)));
+  if (!reportId || uniqueIds.length === 0) return {};
+  perfMetrics.recordRead('todayEntries', uniqueIds.length);
   const snaps = await Promise.all(
-    itemIds.map((itemId) =>
+    uniqueIds.map((itemId) =>
       getDoc(doc(db, 'dailyReports', reportId, 'entries', itemId)).catch((err) => {
+        if (isFirebasePermissionDeniedError(err) || isFirebaseOfflineError(err)) {
+          return null;
+        }
         handleFirestoreError(
           err,
           OperationType.GET,
@@ -374,7 +382,7 @@ export async function fetchReportEntriesOnce(
   );
   const map: Record<string, DailyReportEntry> = {};
   snaps.forEach((snap) => {
-    if (snap.exists()) {
+    if (snap && snap.exists()) {
       const entry = { id: snap.id, ...snap.data() } as DailyReportEntry;
       map[entry.itemId] = entry;
     }
@@ -420,12 +428,18 @@ export async function loadWorkerStationFallback(params: {
       fetchStationItemsOnce(workspaceId, stationId, itemIdsToFetch).then((items) =>
         items.filter((it) => it.active),
       ),
-      getDoc(doc(db, 'dailyReports', reportId)),
+      getDoc(doc(db, 'dailyReports', reportId)).catch((err) => {
+        if (isFirebasePermissionDeniedError(err) || isFirebaseOfflineError(err)) {
+          return null;
+        }
+        throw err;
+      }),
     ]);
 
-    const report = repSnap.exists()
-      ? ({ id: repSnap.id, ...repSnap.data() } as DailyReport)
-      : undefined;
+    const report =
+      repSnap && repSnap.exists()
+        ? ({ id: repSnap.id, ...repSnap.data() } as DailyReport)
+        : undefined;
 
     const entries = report
       ? await fetchReportEntriesOnce(
@@ -451,17 +465,25 @@ export async function fetchStationEntriesWithStatusOnce(
   try {
     perfMetrics.recordRead('yesterdayReport');
     const repSnap = await getDoc(doc(db, 'dailyReports', reportId));
-    if (!repSnap.exists() || itemIds.length === 0) {
+    const uniqueIds = Array.from(new Set(itemIds.filter(Boolean)));
+    if (!repSnap.exists() || uniqueIds.length === 0) {
       return { reportExists: repSnap.exists(), entries: {} };
     }
 
-    perfMetrics.recordRead('yesterdayEntries', itemIds.length);
+    perfMetrics.recordRead('yesterdayEntries', uniqueIds.length);
     const snaps = await Promise.all(
-      itemIds.map((itemId) => getDoc(doc(db, 'dailyReports', reportId, 'entries', itemId))),
+      uniqueIds.map((itemId) =>
+        getDoc(doc(db, 'dailyReports', reportId, 'entries', itemId)).catch((err) => {
+          if (isFirebasePermissionDeniedError(err) || isFirebaseOfflineError(err)) {
+            return null;
+          }
+          throw err;
+        }),
+      ),
     );
     const map: Record<string, DailyReportEntry> = {};
     snaps.forEach((snap) => {
-      if (snap.exists()) {
+      if (snap && snap.exists()) {
         const entry = { id: snap.id, ...snap.data() } as DailyReportEntry;
         map[entry.itemId] = entry;
       }

@@ -8,8 +8,10 @@ import {
   isSnapshotCompatibleWithLink,
   makeSerializedTimestamp,
   readCachedStationLinkPreview,
+  readStationCatalogCache,
   readWorkerSnapshotCache,
   writeCachedStationLinkPreview,
+  writeStationCatalogCache,
   writeWorkerSnapshotCache,
 } from '../workerCache';
 
@@ -161,6 +163,29 @@ describe('workerCache', () => {
     clearWorkerSnapshotCache('worker_uid_1');
     expect(readWorkerSnapshotCache('worker_uid_1', now + 8000)).toBeNull();
     expect(hasCachedWorkerHint(now + 8000)).toBe(false);
+  });
+
+  it('persists station-level catalog cache independently of user uid for fast QR entry', () => {
+    const now = 2_500_000;
+    writeStationCatalogCache(
+      {
+        workspaceId: 'ws_1',
+        role: 'asados',
+        station: sampleStation,
+        items: [sampleItem],
+      },
+      now,
+    );
+
+    const catalog = readStationCatalogCache('ws_1', 'asados', now + 1000);
+    expect(catalog).not.toBeNull();
+    expect(catalog!.station?.name).toBe('Asados');
+    expect(catalog!.items).toHaveLength(1);
+    expect(catalog!.items[0].name).toBe('Churrasco');
+    expect(getTimestampMs(catalog!.station?.updatedAt)).toBe(1700000005000);
+
+    // Expired after 24h
+    expect(readStationCatalogCache('ws_1', 'asados', now + 25 * 60 * 60 * 1000)).toBeNull();
   });
 
   it('checks QR link compatibility before hydrating optimistic worker session', () => {

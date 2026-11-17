@@ -18,7 +18,9 @@ import {
 } from '../utils/stationDataCache';
 import {
   getTimestampMs,
+  readStationCatalogCache,
   readWorkerSnapshotCache,
+  writeStationCatalogCache,
   writeWorkerSnapshotCache,
 } from '../utils/workerCache';
 import { sortWorkerNotesNewestFirst } from '../utils/workerNotes';
@@ -136,6 +138,32 @@ export function useStationData(params: {
   const historicalReportsRef = useRef<Record<string, DailyReport>>({});
   const checkedMissingReportsRef = useRef<Set<string>>(new Set());
 
+  const isWorkspaceConfirmed = Boolean(workspace?.id);
+  const workspaceConfirmedRef = useRef(isWorkspaceConfirmed);
+  workspaceConfirmedRef.current = isWorkspaceConfirmed;
+
+  const optimisticStationFailedRef = useRef(false);
+  const optimisticReportFailedRef = useRef(false);
+  const optimisticNotesFailedRef = useRef(false);
+  const optimisticItemsFailedRef = useRef(false);
+  const [optimisticRetryTick, setOptimisticRetryTick] = useState(0);
+
+  useEffect(() => {
+    if (!isWorkspaceConfirmed) return;
+    if (
+      optimisticStationFailedRef.current ||
+      optimisticReportFailedRef.current ||
+      optimisticNotesFailedRef.current ||
+      optimisticItemsFailedRef.current
+    ) {
+      optimisticStationFailedRef.current = false;
+      optimisticReportFailedRef.current = false;
+      optimisticNotesFailedRef.current = false;
+      optimisticItemsFailedRef.current = false;
+      setOptimisticRetryTick((c) => c + 1);
+    }
+  }, [isWorkspaceConfirmed]);
+
   const workerHydratedKeyRef = useRef<string>('');
   const syncedWorkerItemsKeyRef = useRef<string>('');
   const syncedWorkerEntriesKeyRef = useRef<string>('');
@@ -192,37 +220,49 @@ export function useStationData(params: {
     if (workerHydratedKeyRef.current === hydrateKey) return;
 
     const cached = readWorkerSnapshotCache(userUid);
-    if (!cached || cached.workspace.id !== targetWorkspaceId || cached.role !== targetRole) {
+    if (cached && cached.workspace.id === targetWorkspaceId && cached.role === targetRole) {
+      workerHydratedKeyRef.current = hydrateKey;
+
+      if (cached.station) {
+        setStations([cached.station]);
+        setStationsLoaded(true);
+      }
+      if (cached.items.length > 0 || cached.station) {
+        setItems(cached.items);
+        setItemsLoaded(true);
+      }
+      if (cached.dateStr === effectiveSelectedDate) {
+        if (cached.todayReport) {
+          setLiveReportsById({ [cached.todayReport.id]: cached.todayReport });
+          setEntriesByReportId({ [cached.todayReport.id]: cached.todayEntries });
+          const repUpdatedMs = cached.todayReportUpdatedAtMs;
+          const cachedItemIdsKey = cached.items.map((i) => i.id).join('|');
+          if (repUpdatedMs !== null) {
+            syncedWorkerEntriesKeyRef.current = `${cached.todayReport.id}:${repUpdatedMs}:${cachedItemIdsKey}`;
+          }
+        } else {
+          setLiveReportsById({});
+          setEntriesByReportId({});
+        }
+        setReportsLoaded(true);
+      }
+      if (cached.workerNotes.length > 0) {
+        setWorkerNotes(cached.workerNotes);
+      }
       return;
     }
 
-    workerHydratedKeyRef.current = hydrateKey;
-
-    if (cached.station) {
-      setStations([cached.station]);
-      setStationsLoaded(true);
-    }
-    if (cached.items.length > 0 || cached.station) {
-      setItems(cached.items);
-      setItemsLoaded(true);
-    }
-    if (cached.dateStr === effectiveSelectedDate) {
-      if (cached.todayReport) {
-        setLiveReportsById({ [cached.todayReport.id]: cached.todayReport });
-        setEntriesByReportId({ [cached.todayReport.id]: cached.todayEntries });
-        const repUpdatedMs = cached.todayReportUpdatedAtMs;
-        const cachedItemIdsKey = cached.items.map((i) => i.id).join('|');
-        if (repUpdatedMs !== null) {
-          syncedWorkerEntriesKeyRef.current = `${cached.todayReport.id}:${repUpdatedMs}:${cachedItemIdsKey}`;
-        }
-      } else {
-        setLiveReportsById({});
-        setEntriesByReportId({});
+    const catalogCached = readStationCatalogCache(targetWorkspaceId, targetRole);
+    if (catalogCached) {
+      workerHydratedKeyRef.current = hydrateKey;
+      if (catalogCached.station) {
+        setStations([catalogCached.station]);
+        setStationsLoaded(true);
       }
-      setReportsLoaded(true);
-    }
-    if (cached.workerNotes.length > 0) {
-      setWorkerNotes(cached.workerNotes);
+      if (catalogCached.items.length > 0 || catalogCached.station) {
+        setItems(catalogCached.items);
+        setItemsLoaded(true);
+      }
     }
   }, [authReady, userUid, targetWorkspaceId, isWorkerTarget, targetRole, effectiveSelectedDate]);
 
@@ -298,11 +338,11 @@ export function useStationData(params: {
   useEffect(() => {
     if (!authReady || !userUid || !targetWorkspaceId || !isWorkerTarget) return;
 
-    const stationDocPath = `stations/${targetRole}`;
     const stopMetric = perfMetrics.onListenerStart('stations');
     const unsubStation = onSnapshot(
       doc(db, 'stations', targetRole),
       (snap) => {
+        optimisticStationFailedRef.current = false;
         if (snap.exists()) {
           const st = { id: snap.id, ...snap.data() } as Workstation;
           setStations(st.workspaceId === targetWorkspaceId && st.active ? [st] : []);
@@ -311,25 +351,59 @@ export function useStationData(params: {
         }
         setStationsLoaded(true);
       },
-      (err) => handleFirestoreError(err, OperationType.GET, stationDocPath),
+      (err) => {
+        if (!workspaceConfirmedRef.current) {
+          // Optimistic listener started before teamMembers/{uid} finished creating in resolveUserWorkspace
+          optimisticStationFailedRef.current = true;
+          return;
+        }
+        console.warn('[Firestore] Station listener fallback activated:', err);
+        setStationsLoaded(true);
+        void loadWorkerStationFallback({
+          workspaceId: targetWorkspaceId,
+          stationId: targetRole,
+          dateStr: effectiveSelectedDate,
+        })
+          .then((fb) => {
+            setWorkerFallback(fb);
+            if (fb.station) {
+              setStations([fb.station]);
+            }
+            if (fb.items.length > 0) {
+              setItems(fb.items);
+            }
+            setItemsLoaded(true);
+          })
+          .catch(() => {
+            setItemsLoaded(true);
+          });
+      },
     );
 
     return () => {
       stopMetric();
       unsubStation();
     };
-  }, [authReady, userUid, targetWorkspaceId, isWorkerTarget, targetRole]);
+  }, [
+    authReady,
+    userUid,
+    targetWorkspaceId,
+    isWorkerTarget,
+    targetRole,
+    effectiveSelectedDate,
+    optimisticRetryTick,
+  ]);
 
   // Effect 1C: Worker single-date report listener
   useEffect(() => {
     if (!authReady || !userUid || !targetWorkspaceId || !isWorkerTarget) return;
 
     const reportId = `${targetWorkspaceId}_${effectiveSelectedDate}_${targetRole}`;
-    const reportDocPath = `dailyReports/${reportId}`;
     const stopMetric = perfMetrics.onListenerStart('dailyReports');
     const unsubReport = onSnapshot(
       doc(db, 'dailyReports', reportId),
       (snap) => {
+        optimisticReportFailedRef.current = false;
         if (snap.exists()) {
           const raw = snap.data() as Omit<DailyReport, 'id'>;
           const rep: DailyReport = {
@@ -344,14 +418,29 @@ export function useStationData(params: {
         setReportHasPendingWrites(snap.metadata.hasPendingWrites);
         setReportsLoaded(true);
       },
-      (err) => handleFirestoreError(err, OperationType.GET, reportDocPath),
+      (err) => {
+        if (!workspaceConfirmedRef.current) {
+          optimisticReportFailedRef.current = true;
+          return;
+        }
+        console.warn('[Firestore] Report listener fallback activated:', err);
+        setReportsLoaded(true);
+      },
     );
 
     return () => {
       stopMetric();
       unsubReport();
     };
-  }, [authReady, userUid, targetWorkspaceId, isWorkerTarget, targetRole, effectiveSelectedDate]);
+  }, [
+    authReady,
+    userUid,
+    targetWorkspaceId,
+    isWorkerTarget,
+    targetRole,
+    effectiveSelectedDate,
+    optimisticRetryTick,
+  ]);
 
   const managerWindow = useMemo(
     () =>
@@ -569,7 +658,7 @@ export function useStationData(params: {
     return legacyIds.join('|');
   }, [isWorkerTarget, targetRole, stationsLoaded, workerStationObj]);
 
-  // Effect 1D (Worker): Server-first parallel Promise.all item sync triggered by stations/{role} updates & focus.
+  // Effect 1D (Worker): Fast parallel Promise.all item sync triggered by stations/{role} updates & focus.
   useEffect(() => {
     if (
       !authReady ||
@@ -603,17 +692,28 @@ export function useStationData(params: {
       }
       lastServerFetchMs = nowMs;
 
-      void fetchStationItemsOnce(targetWorkspaceId, targetRole, itemIds, { fromServer: true })
+      // On initial mount (force === false), use default getDoc for fast shared-channel resolution;
+      // on focus/visibility revalidation (force === true), force server check.
+      void fetchStationItemsOnce(targetWorkspaceId, targetRole, itemIds, { fromServer: force })
         .then((fetched) => {
           if (cancelled) return;
+          if (fetched.length === 0 && itemIds.length > 0 && !workspaceConfirmedRef.current) {
+            // Optimistic item read ran before teamMembers/{uid} finished creating; retry once workspace confirms
+            optimisticItemsFailedRef.current = true;
+            return;
+          }
+          optimisticItemsFailedRef.current = false;
           syncedWorkerItemsKeyRef.current = syncKey;
           setItems(fetched);
           setItemsLoaded(true);
         })
         .catch(() => {
-          if (!cancelled) {
-            setItemsLoaded(true);
+          if (cancelled) return;
+          if (!workspaceConfirmedRef.current) {
+            optimisticItemsFailedRef.current = true;
+            return;
           }
+          setItemsLoaded(true);
         });
     };
 
@@ -651,6 +751,7 @@ export function useStationData(params: {
     stationsLoaded,
     workerItemIdsKey,
     workerStationUpdatedAtMs,
+    optimisticRetryTick,
   ]);
 
   const applyServerStationItems = useCallback(
@@ -1145,6 +1246,7 @@ export function useStationData(params: {
     const unsubNotes = onSnapshot(
       notesQuery,
       (snap) => {
+        optimisticNotesFailedRef.current = false;
         const list: WorkerNote[] = [];
         snap.forEach((d) => {
           const raw = d.data() as Omit<WorkerNote, 'id'>;
@@ -1161,14 +1263,29 @@ export function useStationData(params: {
         });
         setWorkerNotes(sortWorkerNotesNewestFirst(list));
       },
-      (err) => handleFirestoreError(err, OperationType.LIST, 'workerNotes'),
+      (err) => {
+        if (!canManage && !workspaceConfirmedRef.current) {
+          optimisticNotesFailedRef.current = true;
+          return;
+        }
+        handleFirestoreError(err, OperationType.LIST, 'workerNotes');
+      },
     );
 
     return () => {
       stopNotesMetric();
       unsubNotes();
     };
-  }, [authReady, userUid, userEmail, targetWorkspaceId, canManage, isWorkspaceOwner, targetRole]);
+  }, [
+    authReady,
+    userUid,
+    userEmail,
+    targetWorkspaceId,
+    canManage,
+    isWorkspaceOwner,
+    targetRole,
+    optimisticRetryTick,
+  ]);
 
   const effectiveEntriesByReportId = useMemo(() => {
     if (canManage || !workerFallback?.report) return entriesByReportId;
@@ -1206,6 +1323,40 @@ export function useStationData(params: {
     return Object.values(consolidatedEntriesByItemId);
   }, [consolidatedEntriesByItemId]);
 
+  // Write-through station catalog cache as soon as station + items are loaded (even before reports finish)
+  useEffect(() => {
+    if (
+      !authReady ||
+      !userUid ||
+      !targetWorkspaceId ||
+      !isWorkerTarget ||
+      !stationsLoaded ||
+      !itemsLoaded
+    ) {
+      return;
+    }
+    const activeStation = effectiveStations.find((st) => st.id === targetRole) ?? null;
+    if (!activeStation && effectiveItems.length === 0) return;
+
+    writeStationCatalogCache({
+      workspaceId: targetWorkspaceId,
+      role: targetRole,
+      station: activeStation,
+      stationUpdatedAtMs: getTimestampMs(activeStation?.updatedAt),
+      items: effectiveItems,
+    });
+  }, [
+    authReady,
+    userUid,
+    targetWorkspaceId,
+    isWorkerTarget,
+    targetRole,
+    stationsLoaded,
+    itemsLoaded,
+    effectiveStations,
+    effectiveItems,
+  ]);
+
   // Write-through snapshot cache update + dev live sync metric for worker sessions
   useEffect(() => {
     if (
@@ -1215,8 +1366,7 @@ export function useStationData(params: {
       canManage ||
       role === 'jefe' ||
       !stationsLoaded ||
-      !itemsLoaded ||
-      !reportsLoaded
+      !itemsLoaded
     ) {
       return;
     }
@@ -1236,14 +1386,20 @@ export function useStationData(params: {
       stationUpdatedAtMs: getTimestampMs(activeStation?.updatedAt),
       items: effectiveItems,
       dateStr: effectiveSelectedDate,
-      todayReport: activeReport,
-      todayReportUpdatedAtMs: getTimestampMs(activeReport?.updatedAt),
-      todayEntries: activeEntries,
+      ...(reportsLoaded
+        ? {
+            todayReport: activeReport,
+            todayReportUpdatedAtMs: getTimestampMs(activeReport?.updatedAt),
+            todayEntries: activeEntries,
+          }
+        : {}),
       workerNotes,
     });
 
-    perfMetrics.mark('liveSyncComplete');
-    perfMetrics.logSummary('worker-live-sync');
+    if (reportsLoaded) {
+      perfMetrics.mark('liveSyncComplete');
+      perfMetrics.logSummary('worker-live-sync');
+    }
   }, [
     authReady,
     userUid,

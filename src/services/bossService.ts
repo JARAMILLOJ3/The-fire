@@ -62,14 +62,20 @@ export function buildStationShareUrl(stationId: string, accessCode: string): str
 export async function seedDefaultWorkstationsAndCatalog(workspace: Workspace): Promise<void> {
   const batch = writeBatch(db);
   const slotCounters: Record<string, number> = {};
+  const assignedIdsByStation: Record<string, string[]> = {};
   DEFAULT_STATIONS.forEach((s) => {
     slotCounters[s.id] = 1;
+    assignedIdsByStation[s.id] = [];
   });
 
   DEFAULT_CATALOG_ITEMS.forEach((tpl, idx) => {
     const slot = slotCounters[tpl.station] ?? 1;
     slotCounters[tpl.station] = slot + 1;
     const itemId = `${tpl.station}_${slot}`;
+    if (!assignedIdsByStation[tpl.station]) {
+      assignedIdsByStation[tpl.station] = [];
+    }
+    assignedIdsByStation[tpl.station].push(itemId);
     batch.set(doc(db, 'items', itemId), {
       workspaceId: workspace.id,
       ownerUid: workspace.ownerUid,
@@ -98,6 +104,7 @@ export async function seedDefaultWorkstationsAndCatalog(workspace: Workspace): P
       description: clampString(st.description, MAX_DESC_LENGTH),
       accessCode,
       nextItemSlot: slotCounters[st.id] ?? 1,
+      assignedItemIds: (assignedIdsByStation[st.id] ?? []).slice(0, 150),
       active: true,
       sortOrder: (idx + 1) * 10,
       createdAt: serverTimestamp(),
@@ -136,8 +143,10 @@ export async function ensureWorkstationsForExistingWorkspace(
 
   const batch = writeBatch(db);
   const slotCounters: Record<string, number> = {};
+  const assignedIdsByStation: Record<string, string[]> = {};
   DEFAULT_STATIONS.forEach((s) => {
     slotCounters[s.id] = 1;
+    assignedIdsByStation[s.id] = [];
   });
 
   const existingKeys = new Set<string>();
@@ -149,6 +158,12 @@ export async function ensureWorkstationsForExistingWorkspace(
         station: 'comida_rapida',
         updatedAt: serverTimestamp(),
       });
+    }
+    if (item.active) {
+      if (!assignedIdsByStation[normalizedSt]) {
+        assignedIdsByStation[normalizedSt] = [];
+      }
+      assignedIdsByStation[normalizedSt].push(item.id);
     }
     existingKeys.add(`${normalizedSt}::${item.name.toLowerCase()}`);
     if (slotCounters[normalizedSt] !== undefined) {
@@ -163,6 +178,10 @@ export async function ensureWorkstationsForExistingWorkspace(
     const slot = slotCounters[tpl.station] ?? 1;
     slotCounters[tpl.station] = slot + 1;
     const itemId = `${tpl.station}_${slot}`;
+    if (!assignedIdsByStation[tpl.station]) {
+      assignedIdsByStation[tpl.station] = [];
+    }
+    assignedIdsByStation[tpl.station].push(itemId);
     batch.set(doc(db, 'items', itemId), {
       workspaceId: workspace.id,
       ownerUid: workspace.ownerUid,
@@ -192,6 +211,7 @@ export async function ensureWorkstationsForExistingWorkspace(
       description: clampString(st.description, MAX_DESC_LENGTH),
       accessCode,
       nextItemSlot: slotCounters[st.id] ?? 1,
+      assignedItemIds: (assignedIdsByStation[st.id] ?? []).slice(0, 150),
       active: true,
       sortOrder: (idx + 1) * 10,
       createdAt: serverTimestamp(),

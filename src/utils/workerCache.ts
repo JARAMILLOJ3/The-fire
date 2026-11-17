@@ -12,10 +12,21 @@ import type {
 
 const LINK_PREVIEW_PREFIX = 'thefire_link_preview:v1:';
 const WORKER_SNAPSHOT_PREFIX = 'thefire_worker_snapshot:v1:';
+const STATION_CATALOG_PREFIX = 'thefire_station_catalog:v1:';
 const LAST_WORKER_UID_KEY = 'thefire_last_worker_uid:v1';
 
 const LINK_PREVIEW_TTL_MS = 15 * 60 * 1000;
 const WORKER_SNAPSHOT_TTL_MS = 24 * 60 * 60 * 1000;
+
+export interface CachedStationCatalog {
+  version: 1;
+  savedAt: number;
+  workspaceId: string;
+  role: TeamStationId;
+  station: Workstation | null;
+  stationUpdatedAtMs: number | null;
+  items: InventoryItem[];
+}
 
 interface SerializedTimestamp {
   __tfTsMs: number;
@@ -334,6 +345,98 @@ export function writeWorkerSnapshotCache(
   } catch {
     // Ignore storage quota errors
   }
+
+  if (next.station || next.items.length > 0) {
+    writeStationCatalogCache(
+      {
+        workspaceId: next.workspace.id,
+        role: next.role,
+        station: next.station,
+        stationUpdatedAtMs: next.stationUpdatedAtMs,
+        items: next.items,
+      },
+      nowMs,
+    );
+  }
+}
+
+export function readStationCatalogCache(
+  workspaceId: string | null | undefined,
+  role: TeamStationId | null | undefined,
+  nowMs: number = Date.now(),
+): CachedStationCatalog | null {
+  if (!workspaceId || !role || role === 'jefe') return null;
+  const store = getSafeStorage('local');
+  if (!store) return null;
+
+  const key = `${STATION_CATALOG_PREFIX}${workspaceId}:${role}`;
+  try {
+    const raw = store.getItem(key);
+    if (!raw) return null;
+    const parsed = deserializeValue(JSON.parse(raw)) as Partial<CachedStationCatalog> | null;
+    if (
+      !parsed ||
+      parsed.version !== 1 ||
+      typeof parsed.savedAt !== 'number' ||
+      parsed.workspaceId !== workspaceId ||
+      parsed.role !== role
+    ) {
+      return null;
+    }
+    if (nowMs - parsed.savedAt > WORKER_SNAPSHOT_TTL_MS) {
+      store.removeItem(key);
+      return null;
+    }
+    return {
+      version: 1,
+      savedAt: parsed.savedAt,
+      workspaceId: parsed.workspaceId,
+      role: parsed.role,
+      station: parsed.station ?? null,
+      stationUpdatedAtMs:
+        typeof parsed.stationUpdatedAtMs === 'number' ? parsed.stationUpdatedAtMs : null,
+      items: Array.isArray(parsed.items) ? parsed.items : [],
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function writeStationCatalogCache(
+  payload: {
+    workspaceId: string;
+    role: TeamStationId;
+    station: Workstation | null;
+    stationUpdatedAtMs?: number | null;
+    items: InventoryItem[];
+  },
+  nowMs: number = Date.now(),
+): void {
+  if (!payload.workspaceId || !payload.role || payload.role === 'jefe') return;
+  const store = getSafeStorage('local');
+  if (!store) return;
+
+  const next: CachedStationCatalog = {
+    version: 1,
+    savedAt: nowMs,
+    workspaceId: payload.workspaceId,
+    role: payload.role,
+    station: payload.station,
+    stationUpdatedAtMs:
+      payload.stationUpdatedAtMs !== undefined
+        ? payload.stationUpdatedAtMs
+        : getTimestampMs(payload.station?.updatedAt),
+    items: payload.items,
+  };
+
+  try {
+    store.setItem(
+      `${STATION_CATALOG_PREFIX}${payload.workspaceId}:${payload.role}`,
+      JSON.stringify(serializeValue(next)),
+    );
+  } catch {
+    // Ignore storage quota errors
+  }
 }
 
 export function clearWorkerSnapshotCache(uid?: string | null): void {
@@ -379,3 +482,4 @@ export function isSnapshotCompatibleWithLink(
   }
   return true;
 }
+
